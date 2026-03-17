@@ -8,9 +8,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/testjson"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
-	"github.com/tidwall/gjson"
 )
 
 func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T) {
@@ -18,16 +18,16 @@ func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T)
 
 	wsReqBody := buildCodexWebsocketRequestBody(body)
 
-	if got := gjson.GetBytes(wsReqBody, "type").String(); got != "response.create" {
+	if got := testjson.GetBytes(wsReqBody, "type").String(); got != "response.create" {
 		t.Fatalf("type = %s, want response.create", got)
 	}
-	if got := gjson.GetBytes(wsReqBody, "previous_response_id").String(); got != "resp-1" {
+	if got := testjson.GetBytes(wsReqBody, "previous_response_id").String(); got != "resp-1" {
 		t.Fatalf("previous_response_id = %s, want resp-1", got)
 	}
-	if gjson.GetBytes(wsReqBody, "input.0.id").String() != "msg-1" {
+	if testjson.GetBytes(wsReqBody, "input.0.id").String() != "msg-1" {
 		t.Fatalf("input item id mismatch")
 	}
-	if got := gjson.GetBytes(wsReqBody, "type").String(); got == "response.append" {
+	if got := testjson.GetBytes(wsReqBody, "type").String(); got == "response.append" {
 		t.Fatalf("unexpected websocket request type: %s", got)
 	}
 }

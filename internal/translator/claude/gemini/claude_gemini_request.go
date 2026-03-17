@@ -1,24 +1,20 @@
-// Package gemini provides request translation functionality for Gemini to Claude Code API compatibility.
-// It handles parsing and transforming Gemini API requests into Claude Code API format,
-// extracting model information, system instructions, message contents, and tool declarations.
-// The package performs JSON data transformation to ensure compatibility
-// between Gemini API format and Claude Code API's expected format.
+// Package gemini provides request translation functionality for Gemini to
+// Claude Code API compatibility using standard JSON trees.
 package gemini
 
 import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 var (
@@ -27,391 +23,517 @@ var (
 	session = ""
 )
 
-// ConvertGeminiRequestToClaude parses and transforms a Gemini API request into Claude Code API format.
-// It extracts the model name, system instruction, message contents, and tool declarations
-// from the raw JSON request and returns them in the format expected by the Claude Code API.
-// The function performs comprehensive transformation including:
-// 1. Model name mapping and generation configuration extraction
-// 2. System instruction conversion to Claude Code format
-// 3. Message content conversion with proper role mapping
-// 4. Tool call and tool result handling with FIFO queue for ID matching
-// 5. Image and file data conversion to Claude Code base64 format
-// 6. Tool declaration and tool choice configuration mapping
-//
-// Parameters:
-//   - modelName: The name of the model to use for the request
-//   - rawJSON: The raw JSON request data from the Gemini API
-//   - stream: A boolean indicating if the request is for a streaming response
-//
-// Returns:
-//   - []byte: The transformed request data in Claude Code API format
+// ConvertGeminiRequestToClaude parses and transforms a Gemini API request into
+// Claude Code API format.
 func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream bool) []byte {
-	rawJSON := inputRawJSON
+	root := jsonutil.ParseObjectBytesOrEmpty(inputRawJSON)
 
+	outRoot := map[string]any{
+		"model":      modelName,
+		"max_tokens": 32000,
+		"messages":   []any{},
+		"metadata": map[string]any{
+			"user_id": geminiClaudeUserID(),
+		},
+		"stream": stream,
+	}
+
+	if generationConfig, ok := jsonutil.Object(root, "generationConfig"); ok {
+		applyGeminiClaudeGenerationConfig(outRoot, modelName, generationConfig)
+	}
+
+	messages := make([]any, 0)
+	if systemInstruction, ok := jsonutil.Object(root, "system_instruction"); ok {
+		if systemMessage, ok := geminiClaudeSystemMessage(systemInstruction); ok {
+			messages = append(messages, systemMessage)
+		}
+	} else if systemInstruction, ok := jsonutil.Object(root, "systemInstruction"); ok {
+		if systemMessage, ok := geminiClaudeSystemMessage(systemInstruction); ok {
+			messages = append(messages, systemMessage)
+		}
+	}
+
+	pendingToolIDs := make([]string, 0)
+	if contents, ok := jsonutil.Array(root, "contents"); ok {
+		for _, contentValue := range contents {
+			content, ok := contentValue.(map[string]any)
+			if !ok {
+				continue
+			}
+
+			role := geminiClaudeRole(content)
+			message := map[string]any{
+				"role":    role,
+				"content": []any{},
+			}
+			contentParts := make([]any, 0)
+
+			if parts, ok := jsonutil.Array(content, "parts"); ok {
+				for _, partValue := range parts {
+					part, ok := partValue.(map[string]any)
+					if !ok {
+						continue
+					}
+
+					if text, ok := jsonutil.String(part, "text"); ok {
+						contentParts = append(contentParts, map[string]any{
+							"type": "text",
+							"text": text,
+						})
+						continue
+					}
+
+					if role == "assistant" {
+						if functionCall, ok := jsonutil.Object(part, "functionCall"); ok {
+							toolID := geminiClaudeToolCallID()
+							pendingToolIDs = append(pendingToolIDs, toolID)
+
+							toolUse := map[string]any{
+								"type":  "tool_use",
+								"id":    toolID,
+								"name":  geminiClaudeString(functionCall, "name"),
+								"input": map[string]any{},
+							}
+							if argsValue, ok := jsonutil.Get(functionCall, "args"); ok {
+								if argsObject, ok := argsValue.(map[string]any); ok {
+									toolUse["input"] = argsObject
+								}
+							}
+							contentParts = append(contentParts, toolUse)
+							continue
+						}
+					}
+
+					if functionResponse, ok := jsonutil.Object(part, "functionResponse"); ok {
+						toolID := geminiClaudeNextToolID(&pendingToolIDs)
+						toolResult := map[string]any{
+							"type":        "tool_result",
+							"tool_use_id": toolID,
+						}
+						if resultValue, ok := jsonutil.Get(functionResponse, "response.result"); ok {
+							toolResult["content"] = geminiClaudeContentString(resultValue)
+						} else if responseValue, ok := jsonutil.Get(functionResponse, "response"); ok {
+							toolResult["content"] = geminiClaudeContentString(responseValue)
+						} else {
+							toolResult["content"] = ""
+						}
+						contentParts = append(contentParts, toolResult)
+						continue
+					}
+
+					if imagePart, ok := geminiClaudeImagePart(part); ok {
+						contentParts = append(contentParts, imagePart)
+						continue
+					}
+
+					if filePart, ok := geminiClaudeFilePart(part); ok {
+						contentParts = append(contentParts, filePart)
+					}
+				}
+			}
+
+			if len(contentParts) == 0 {
+				continue
+			}
+			message["content"] = contentParts
+			messages = append(messages, message)
+		}
+	}
+
+	outRoot["messages"] = messages
+
+	if tools, ok := jsonutil.Array(root, "tools"); ok {
+		anthropicTools := make([]any, 0)
+		for _, toolValue := range tools {
+			tool, ok := toolValue.(map[string]any)
+			if !ok {
+				continue
+			}
+
+			functionDeclarations, ok := jsonutil.Array(tool, "functionDeclarations")
+			if !ok {
+				continue
+			}
+
+			for _, declarationValue := range functionDeclarations {
+				declaration, ok := declarationValue.(map[string]any)
+				if !ok {
+					continue
+				}
+
+				anthropicTool := map[string]any{
+					"name":         geminiClaudeString(declaration, "name"),
+					"description":  geminiClaudeString(declaration, "description"),
+					"input_schema": map[string]any{},
+				}
+
+				if parameters, ok := jsonutil.Get(declaration, "parameters"); ok {
+					if cleaned, ok := geminiClaudeCleanSchema(parameters); ok {
+						anthropicTool["input_schema"] = cleaned
+					}
+				} else if parameters, ok := jsonutil.Get(declaration, "parametersJsonSchema"); ok {
+					if cleaned, ok := geminiClaudeCleanSchema(parameters); ok {
+						anthropicTool["input_schema"] = cleaned
+					}
+				}
+
+				anthropicTools = append(anthropicTools, anthropicTool)
+			}
+		}
+		if len(anthropicTools) > 0 {
+			outRoot["tools"] = anthropicTools
+		}
+	}
+
+	if toolConfig, ok := jsonutil.Object(root, "tool_config"); ok {
+		applyGeminiClaudeToolChoice(outRoot, toolConfig)
+	} else if toolConfig, ok := jsonutil.Object(root, "toolConfig"); ok {
+		applyGeminiClaudeToolChoice(outRoot, toolConfig)
+	}
+
+	return jsonutil.MarshalOrOriginal(inputRawJSON, outRoot)
+}
+
+func geminiClaudeUserID() string {
 	if account == "" {
-		u, _ := uuid.NewRandom()
-		account = u.String()
+		uuidValue, _ := uuid.NewRandom()
+		account = uuidValue.String()
 	}
 	if session == "" {
-		u, _ := uuid.NewRandom()
-		session = u.String()
+		uuidValue, _ := uuid.NewRandom()
+		session = uuidValue.String()
 	}
 	if user == "" {
 		sum := sha256.Sum256([]byte(account + session))
 		user = hex.EncodeToString(sum[:])
 	}
-	userID := fmt.Sprintf("user_%s_account_%s_session_%s", user, account, session)
+	return fmt.Sprintf("user_%s_account_%s_session_%s", user, account, session)
+}
 
-	// Base Claude message payload
-	out := fmt.Sprintf(`{"model":"","max_tokens":32000,"messages":[],"metadata":{"user_id":"%s"}}`, userID)
-
-	root := gjson.ParseBytes(rawJSON)
-
-	// Helper for generating tool call IDs in the form: toolu_<alphanum>
-	// This ensures unique identifiers for tool calls in the Claude Code format
-	genToolCallID := func() string {
-		const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-		var b strings.Builder
-		// 24 chars random suffix for uniqueness
-		for i := 0; i < 24; i++ {
-			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
-			b.WriteByte(letters[n.Int64()])
+func applyGeminiClaudeGenerationConfig(outRoot map[string]any, modelName string, generationConfig map[string]any) {
+	if value, ok := jsonutil.Get(generationConfig, "maxOutputTokens"); ok {
+		outRoot["max_tokens"] = value
+	}
+	if value, ok := jsonutil.Get(generationConfig, "temperature"); ok {
+		outRoot["temperature"] = value
+	} else if value, ok := jsonutil.Get(generationConfig, "topP"); ok {
+		outRoot["top_p"] = value
+	}
+	if stopSequences, ok := jsonutil.Array(generationConfig, "stopSequences"); ok {
+		sequences := make([]string, 0, len(stopSequences))
+		for _, sequenceValue := range stopSequences {
+			if sequence, ok := sequenceValue.(string); ok {
+				sequences = append(sequences, sequence)
+			}
 		}
-		return "toolu_" + b.String()
+		if len(sequences) > 0 {
+			outRoot["stop_sequences"] = sequences
+		}
 	}
 
-	// FIFO queue to store tool call IDs for matching with tool results
-	// Gemini uses sequential pairing across possibly multiple in-flight
-	// functionCalls, so we keep a FIFO queue of generated tool IDs and
-	// consume them in order when functionResponses arrive.
-	var pendingToolIDs []string
+	thinkingConfig, ok := jsonutil.Object(generationConfig, "thinkingConfig")
+	if !ok {
+		return
+	}
 
-	// Model mapping to specify which Claude Code model to use
-	out, _ = sjson.Set(out, "model", modelName)
+	modelInfo := registry.LookupModelInfo(modelName, "claude")
+	supportsAdaptive := modelInfo != nil && modelInfo.Thinking != nil && len(modelInfo.Thinking.Levels) > 0
+	supportsMax := supportsAdaptive && thinking.HasLevel(modelInfo.Thinking.Levels, string(thinking.LevelMax))
 
-	// Generation config extraction from Gemini format
-	if genConfig := root.Get("generationConfig"); genConfig.Exists() {
-		// Max output tokens configuration
-		if maxTokens := genConfig.Get("maxOutputTokens"); maxTokens.Exists() {
-			out, _ = sjson.Set(out, "max_tokens", maxTokens.Int())
+	if thinkingLevel, ok := jsonutil.String(thinkingConfig, "thinkingLevel"); ok {
+		geminiClaudeApplyThinkingLevel(outRoot, thinkingLevel, supportsAdaptive, supportsMax)
+		return
+	}
+	if thinkingLevel, ok := jsonutil.String(thinkingConfig, "thinking_level"); ok {
+		geminiClaudeApplyThinkingLevel(outRoot, thinkingLevel, supportsAdaptive, supportsMax)
+		return
+	}
+
+	if thinkingBudget, ok := jsonutil.Int64(thinkingConfig, "thinkingBudget"); ok {
+		geminiClaudeApplyThinkingBudget(outRoot, int(thinkingBudget), supportsAdaptive, supportsMax)
+		return
+	}
+	if thinkingBudget, ok := jsonutil.Int64(thinkingConfig, "thinking_budget"); ok {
+		geminiClaudeApplyThinkingBudget(outRoot, int(thinkingBudget), supportsAdaptive, supportsMax)
+		return
+	}
+
+	if includeThoughts, ok := jsonutil.Bool(thinkingConfig, "includeThoughts"); ok && includeThoughts {
+		outRoot["thinking"] = map[string]any{"type": "enabled"}
+		return
+	}
+	if includeThoughts, ok := jsonutil.Bool(thinkingConfig, "include_thoughts"); ok && includeThoughts {
+		outRoot["thinking"] = map[string]any{"type": "enabled"}
+	}
+}
+
+func geminiClaudeApplyThinkingLevel(outRoot map[string]any, level string, supportsAdaptive, supportsMax bool) {
+	level = strings.ToLower(strings.TrimSpace(level))
+	if supportsAdaptive {
+		switch level {
+		case "", "none":
+			outRoot["thinking"] = map[string]any{"type": "disabled"}
+			_ = jsonutil.Delete(outRoot, "output_config.effort")
+		default:
+			if mapped, ok := thinking.MapToClaudeEffort(level, supportsMax); ok {
+				level = mapped
+			}
+			outRoot["thinking"] = map[string]any{"type": "adaptive"}
+			_ = jsonutil.Set(outRoot, "output_config.effort", level)
 		}
-		// Temperature setting for controlling response randomness
-		if temp := genConfig.Get("temperature"); temp.Exists() {
-			out, _ = sjson.Set(out, "temperature", temp.Float())
-		} else if topP := genConfig.Get("topP"); topP.Exists() {
-			// Top P setting for nucleus sampling (filtered out if temperature is set)
-			out, _ = sjson.Set(out, "top_p", topP.Float())
-		}
-		// Stop sequences configuration for custom termination conditions
-		if stopSeqs := genConfig.Get("stopSequences"); stopSeqs.Exists() && stopSeqs.IsArray() {
-			var stopSequences []string
-			stopSeqs.ForEach(func(_, value gjson.Result) bool {
-				stopSequences = append(stopSequences, value.String())
-				return true
-			})
-			if len(stopSequences) > 0 {
-				out, _ = sjson.Set(out, "stop_sequences", stopSequences)
+		return
+	}
+
+	switch level {
+	case "", "none":
+		outRoot["thinking"] = map[string]any{"type": "disabled"}
+	case "auto":
+		outRoot["thinking"] = map[string]any{"type": "enabled"}
+	default:
+		if budget, ok := thinking.ConvertLevelToBudget(level); ok {
+			outRoot["thinking"] = map[string]any{
+				"type":          "enabled",
+				"budget_tokens": budget,
 			}
 		}
-		// Include thoughts configuration for reasoning process visibility
-		// Translator only does format conversion, ApplyThinking handles model capability validation.
-		if thinkingConfig := genConfig.Get("thinkingConfig"); thinkingConfig.Exists() && thinkingConfig.IsObject() {
-			mi := registry.LookupModelInfo(modelName, "claude")
-			supportsAdaptive := mi != nil && mi.Thinking != nil && len(mi.Thinking.Levels) > 0
-			supportsMax := supportsAdaptive && thinking.HasLevel(mi.Thinking.Levels, string(thinking.LevelMax))
+	}
+}
 
-			// MapToClaudeEffort normalizes levels (e.g. minimal→low, xhigh→high) to avoid
-			// validation errors since validate treats same-provider unsupported levels as errors.
-			thinkingLevel := thinkingConfig.Get("thinkingLevel")
-			if !thinkingLevel.Exists() {
-				thinkingLevel = thinkingConfig.Get("thinking_level")
-			}
-			if thinkingLevel.Exists() {
-				level := strings.ToLower(strings.TrimSpace(thinkingLevel.String()))
-				if supportsAdaptive {
-					switch level {
-					case "":
-					case "none":
-						out, _ = sjson.Set(out, "thinking.type", "disabled")
-						out, _ = sjson.Delete(out, "thinking.budget_tokens")
-						out, _ = sjson.Delete(out, "output_config.effort")
-					default:
-						if mapped, ok := thinking.MapToClaudeEffort(level, supportsMax); ok {
-							level = mapped
-						}
-						out, _ = sjson.Set(out, "thinking.type", "adaptive")
-						out, _ = sjson.Delete(out, "thinking.budget_tokens")
-						out, _ = sjson.Set(out, "output_config.effort", level)
-					}
-				} else {
-					switch level {
-					case "":
-					case "none":
-						out, _ = sjson.Set(out, "thinking.type", "disabled")
-						out, _ = sjson.Delete(out, "thinking.budget_tokens")
-					case "auto":
-						out, _ = sjson.Set(out, "thinking.type", "enabled")
-						out, _ = sjson.Delete(out, "thinking.budget_tokens")
-					default:
-						if budget, ok := thinking.ConvertLevelToBudget(level); ok {
-							out, _ = sjson.Set(out, "thinking.type", "enabled")
-							out, _ = sjson.Set(out, "thinking.budget_tokens", budget)
-						}
-					}
+func geminiClaudeApplyThinkingBudget(outRoot map[string]any, budget int, supportsAdaptive, supportsMax bool) {
+	if supportsAdaptive {
+		switch budget {
+		case 0:
+			outRoot["thinking"] = map[string]any{"type": "disabled"}
+			_ = jsonutil.Delete(outRoot, "output_config.effort")
+		default:
+			if level, ok := thinking.ConvertBudgetToLevel(budget); ok {
+				if mapped, ok := thinking.MapToClaudeEffort(level, supportsMax); ok {
+					level = mapped
 				}
-			} else {
-				thinkingBudget := thinkingConfig.Get("thinkingBudget")
-				if !thinkingBudget.Exists() {
-					thinkingBudget = thinkingConfig.Get("thinking_budget")
-				}
-				if thinkingBudget.Exists() {
-					budget := int(thinkingBudget.Int())
-					if supportsAdaptive {
-						switch budget {
-						case 0:
-							out, _ = sjson.Set(out, "thinking.type", "disabled")
-							out, _ = sjson.Delete(out, "thinking.budget_tokens")
-							out, _ = sjson.Delete(out, "output_config.effort")
-						default:
-							level, ok := thinking.ConvertBudgetToLevel(budget)
-							if ok {
-								if mapped, okM := thinking.MapToClaudeEffort(level, supportsMax); okM {
-									level = mapped
-								}
-								out, _ = sjson.Set(out, "thinking.type", "adaptive")
-								out, _ = sjson.Delete(out, "thinking.budget_tokens")
-								out, _ = sjson.Set(out, "output_config.effort", level)
-							}
-						}
-					} else {
-						switch budget {
-						case 0:
-							out, _ = sjson.Set(out, "thinking.type", "disabled")
-							out, _ = sjson.Delete(out, "thinking.budget_tokens")
-						case -1:
-							out, _ = sjson.Set(out, "thinking.type", "enabled")
-							out, _ = sjson.Delete(out, "thinking.budget_tokens")
-						default:
-							out, _ = sjson.Set(out, "thinking.type", "enabled")
-							out, _ = sjson.Set(out, "thinking.budget_tokens", budget)
-						}
-					}
-				} else if includeThoughts := thinkingConfig.Get("includeThoughts"); includeThoughts.Exists() && includeThoughts.Type == gjson.True {
-					out, _ = sjson.Set(out, "thinking.type", "enabled")
-				} else if includeThoughts := thinkingConfig.Get("include_thoughts"); includeThoughts.Exists() && includeThoughts.Type == gjson.True {
-					out, _ = sjson.Set(out, "thinking.type", "enabled")
-				}
+				outRoot["thinking"] = map[string]any{"type": "adaptive"}
+				_ = jsonutil.Set(outRoot, "output_config.effort", level)
 			}
+		}
+		return
+	}
+
+	switch budget {
+	case 0:
+		outRoot["thinking"] = map[string]any{"type": "disabled"}
+	case -1:
+		outRoot["thinking"] = map[string]any{"type": "enabled"}
+	default:
+		outRoot["thinking"] = map[string]any{
+			"type":          "enabled",
+			"budget_tokens": budget,
+		}
+	}
+}
+
+func geminiClaudeSystemMessage(systemInstruction map[string]any) (map[string]any, bool) {
+	parts, ok := jsonutil.Array(systemInstruction, "parts")
+	if !ok {
+		return nil, false
+	}
+
+	var systemText strings.Builder
+	for _, partValue := range parts {
+		part, ok := partValue.(map[string]any)
+		if !ok {
+			continue
+		}
+		text, _ := jsonutil.String(part, "text")
+		if text == "" {
+			continue
+		}
+		if systemText.Len() > 0 {
+			systemText.WriteByte('\n')
+		}
+		systemText.WriteString(text)
+	}
+
+	if systemText.Len() == 0 {
+		return nil, false
+	}
+
+	return map[string]any{
+		"role": "user",
+		"content": []any{
+			map[string]any{
+				"type": "text",
+				"text": systemText.String(),
+			},
+		},
+	}, true
+}
+
+func geminiClaudeRole(content map[string]any) string {
+	role, _ := jsonutil.String(content, "role")
+	switch role {
+	case "model":
+		return "assistant"
+	case "function", "tool":
+		return "user"
+	default:
+		return role
+	}
+}
+
+func geminiClaudeToolCallID() string {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	var builder strings.Builder
+	for index := 0; index < 24; index++ {
+		number, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
+		builder.WriteByte(letters[number.Int64()])
+	}
+	return "toolu_" + builder.String()
+}
+
+func geminiClaudeString(root map[string]any, path string) string {
+	value, _ := jsonutil.String(root, path)
+	return value
+}
+
+func geminiClaudeNextToolID(pendingToolIDs *[]string) string {
+	if len(*pendingToolIDs) > 0 {
+		toolID := (*pendingToolIDs)[0]
+		*pendingToolIDs = (*pendingToolIDs)[1:]
+		return toolID
+	}
+	return geminiClaudeToolCallID()
+}
+
+func geminiClaudeContentString(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return typed
+	default:
+		bytes, errMarshal := json.Marshal(typed)
+		if errMarshal != nil {
+			return ""
+		}
+		return string(bytes)
+	}
+}
+
+func geminiClaudeImagePart(part map[string]any) (map[string]any, bool) {
+	inlineData, ok := jsonutil.Object(part, "inline_data")
+	if !ok {
+		inlineData, ok = jsonutil.Object(part, "inlineData")
+		if !ok {
+			return nil, false
 		}
 	}
 
-	// System instruction conversion to Claude Code format
-	if sysInstr := root.Get("system_instruction"); sysInstr.Exists() {
-		if parts := sysInstr.Get("parts"); parts.Exists() && parts.IsArray() {
-			var systemText strings.Builder
-			parts.ForEach(func(_, part gjson.Result) bool {
-				if text := part.Get("text"); text.Exists() {
-					if systemText.Len() > 0 {
-						systemText.WriteString("\n")
-					}
-					systemText.WriteString(text.String())
-				}
-				return true
-			})
-			if systemText.Len() > 0 {
-				// Create system message in Claude Code format
-				systemMessage := `{"role":"user","content":[{"type":"text","text":""}]}`
-				systemMessage, _ = sjson.Set(systemMessage, "content.0.text", systemText.String())
-				out, _ = sjson.SetRaw(out, "messages.-1", systemMessage)
-			}
+	mimeType, _ := jsonutil.String(inlineData, "mime_type")
+	if mimeType == "" {
+		mimeType, _ = jsonutil.String(inlineData, "mimeType")
+	}
+	data, _ := jsonutil.String(inlineData, "data")
+	if mimeType == "" || data == "" {
+		return nil, false
+	}
+
+	return map[string]any{
+		"type": "image",
+		"source": map[string]any{
+			"type":       "base64",
+			"media_type": mimeType,
+			"data":       data,
+		},
+	}, true
+}
+
+func geminiClaudeFilePart(part map[string]any) (map[string]any, bool) {
+	fileData, ok := jsonutil.Object(part, "file_data")
+	if !ok {
+		fileData, ok = jsonutil.Object(part, "fileData")
+		if !ok {
+			return nil, false
 		}
 	}
 
-	// Contents conversion to messages with proper role mapping
-	if contents := root.Get("contents"); contents.Exists() && contents.IsArray() {
-		contents.ForEach(func(_, content gjson.Result) bool {
-			role := content.Get("role").String()
-			// Map Gemini roles to Claude Code roles
-			if role == "model" {
-				role = "assistant"
-			}
-
-			if role == "function" {
-				role = "user"
-			}
-
-			if role == "tool" {
-				role = "user"
-			}
-
-			// Create message structure in Claude Code format
-			msg := `{"role":"","content":[]}`
-			msg, _ = sjson.Set(msg, "role", role)
-
-			if parts := content.Get("parts"); parts.Exists() && parts.IsArray() {
-				parts.ForEach(func(_, part gjson.Result) bool {
-					// Text content conversion
-					if text := part.Get("text"); text.Exists() {
-						textContent := `{"type":"text","text":""}`
-						textContent, _ = sjson.Set(textContent, "text", text.String())
-						msg, _ = sjson.SetRaw(msg, "content.-1", textContent)
-						return true
-					}
-
-					// Function call (from model/assistant) conversion to tool use
-					if fc := part.Get("functionCall"); fc.Exists() && role == "assistant" {
-						toolUse := `{"type":"tool_use","id":"","name":"","input":{}}`
-
-						// Generate a unique tool ID and enqueue it for later matching
-						// with the corresponding functionResponse
-						toolID := genToolCallID()
-						pendingToolIDs = append(pendingToolIDs, toolID)
-						toolUse, _ = sjson.Set(toolUse, "id", toolID)
-
-						if name := fc.Get("name"); name.Exists() {
-							toolUse, _ = sjson.Set(toolUse, "name", name.String())
-						}
-						if args := fc.Get("args"); args.Exists() && args.IsObject() {
-							toolUse, _ = sjson.SetRaw(toolUse, "input", args.Raw)
-						}
-						msg, _ = sjson.SetRaw(msg, "content.-1", toolUse)
-						return true
-					}
-
-					// Function response (from user) conversion to tool result
-					if fr := part.Get("functionResponse"); fr.Exists() {
-						toolResult := `{"type":"tool_result","tool_use_id":"","content":""}`
-
-						// Attach the oldest queued tool_id to pair the response
-						// with its call. If the queue is empty, generate a new id.
-						var toolID string
-						if len(pendingToolIDs) > 0 {
-							toolID = pendingToolIDs[0]
-							// Pop the first element from the queue
-							pendingToolIDs = pendingToolIDs[1:]
-						} else {
-							// Fallback: generate new ID if no pending tool_use found
-							toolID = genToolCallID()
-						}
-						toolResult, _ = sjson.Set(toolResult, "tool_use_id", toolID)
-
-						// Extract result content from the function response
-						if result := fr.Get("response.result"); result.Exists() {
-							toolResult, _ = sjson.Set(toolResult, "content", result.String())
-						} else if response := fr.Get("response"); response.Exists() {
-							toolResult, _ = sjson.Set(toolResult, "content", response.Raw)
-						}
-						msg, _ = sjson.SetRaw(msg, "content.-1", toolResult)
-						return true
-					}
-
-					// Image content (inline_data) conversion to Claude Code format
-					if inlineData := part.Get("inline_data"); inlineData.Exists() {
-						imageContent := `{"type":"image","source":{"type":"base64","media_type":"","data":""}}`
-						if mimeType := inlineData.Get("mime_type"); mimeType.Exists() {
-							imageContent, _ = sjson.Set(imageContent, "source.media_type", mimeType.String())
-						}
-						if data := inlineData.Get("data"); data.Exists() {
-							imageContent, _ = sjson.Set(imageContent, "source.data", data.String())
-						}
-						msg, _ = sjson.SetRaw(msg, "content.-1", imageContent)
-						return true
-					}
-
-					// File data conversion to text content with file info
-					if fileData := part.Get("file_data"); fileData.Exists() {
-						// For file data, we'll convert to text content with file info
-						textContent := `{"type":"text","text":""}`
-						fileInfo := "File: " + fileData.Get("file_uri").String()
-						if mimeType := fileData.Get("mime_type"); mimeType.Exists() {
-							fileInfo += " (Type: " + mimeType.String() + ")"
-						}
-						textContent, _ = sjson.Set(textContent, "text", fileInfo)
-						msg, _ = sjson.SetRaw(msg, "content.-1", textContent)
-						return true
-					}
-
-					return true
-				})
-			}
-
-			// Only add message if it has content
-			if contentArray := gjson.Get(msg, "content"); contentArray.Exists() && len(contentArray.Array()) > 0 {
-				out, _ = sjson.SetRaw(out, "messages.-1", msg)
-			}
-
-			return true
-		})
+	fileURI, _ := jsonutil.String(fileData, "file_uri")
+	if fileURI == "" {
+		fileURI, _ = jsonutil.String(fileData, "fileUri")
+	}
+	fileInfo := "File: " + fileURI
+	if mimeType, ok := jsonutil.String(fileData, "mime_type"); ok && mimeType != "" {
+		fileInfo += " (Type: " + mimeType + ")"
+	} else if mimeType, ok := jsonutil.String(fileData, "mimeType"); ok && mimeType != "" {
+		fileInfo += " (Type: " + mimeType + ")"
 	}
 
-	// Tools mapping: Gemini functionDeclarations -> Claude Code tools
-	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
-		var anthropicTools []interface{}
+	return map[string]any{
+		"type": "text",
+		"text": fileInfo,
+	}, fileURI != ""
+}
 
-		tools.ForEach(func(_, tool gjson.Result) bool {
-			if funcDecls := tool.Get("functionDeclarations"); funcDecls.Exists() && funcDecls.IsArray() {
-				funcDecls.ForEach(func(_, funcDecl gjson.Result) bool {
-					anthropicTool := `{"name":"","description":"","input_schema":{}}`
-
-					if name := funcDecl.Get("name"); name.Exists() {
-						anthropicTool, _ = sjson.Set(anthropicTool, "name", name.String())
-					}
-					if desc := funcDecl.Get("description"); desc.Exists() {
-						anthropicTool, _ = sjson.Set(anthropicTool, "description", desc.String())
-					}
-					if params := funcDecl.Get("parameters"); params.Exists() {
-						// Clean up the parameters schema for Claude Code compatibility
-						cleaned := params.Raw
-						cleaned, _ = sjson.Set(cleaned, "additionalProperties", false)
-						cleaned, _ = sjson.Set(cleaned, "$schema", "http://json-schema.org/draft-07/schema#")
-						anthropicTool, _ = sjson.SetRaw(anthropicTool, "input_schema", cleaned)
-					} else if params = funcDecl.Get("parametersJsonSchema"); params.Exists() {
-						// Clean up the parameters schema for Claude Code compatibility
-						cleaned := params.Raw
-						cleaned, _ = sjson.Set(cleaned, "additionalProperties", false)
-						cleaned, _ = sjson.Set(cleaned, "$schema", "http://json-schema.org/draft-07/schema#")
-						anthropicTool, _ = sjson.SetRaw(anthropicTool, "input_schema", cleaned)
-					}
-
-					anthropicTools = append(anthropicTools, gjson.Parse(anthropicTool).Value())
-					return true
-				})
-			}
-			return true
-		})
-
-		if len(anthropicTools) > 0 {
-			out, _ = sjson.Set(out, "tools", anthropicTools)
-		}
+func geminiClaudeCleanSchema(value any) (map[string]any, bool) {
+	bytes, errMarshal := json.Marshal(value)
+	if errMarshal != nil {
+		return nil, false
 	}
+	parsed, errParse := jsonutil.ParseAnyBytes(bytes)
+	if errParse != nil {
+		return nil, false
+	}
+	object, ok := parsed.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	object["additionalProperties"] = false
+	object["$schema"] = "http://json-schema.org/draft-07/schema#"
+	geminiClaudeLowercaseTypeFields(object)
+	return object, true
+}
 
-	// Tool config mapping from Gemini format to Claude Code format
-	if toolConfig := root.Get("tool_config"); toolConfig.Exists() {
-		if funcCalling := toolConfig.Get("function_calling_config"); funcCalling.Exists() {
-			if mode := funcCalling.Get("mode"); mode.Exists() {
-				switch mode.String() {
-				case "AUTO":
-					out, _ = sjson.SetRaw(out, "tool_choice", `{"type":"auto"}`)
-				case "NONE":
-					out, _ = sjson.SetRaw(out, "tool_choice", `{"type":"none"}`)
-				case "ANY":
-					out, _ = sjson.SetRaw(out, "tool_choice", `{"type":"any"}`)
+func geminiClaudeLowercaseTypeFields(value any) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			if key == "type" {
+				if typeString, ok := child.(string); ok {
+					typed[key] = strings.ToLower(typeString)
 				}
 			}
+			geminiClaudeLowercaseTypeFields(child)
+		}
+	case []any:
+		for _, child := range typed {
+			geminiClaudeLowercaseTypeFields(child)
+		}
+	}
+}
+
+func applyGeminiClaudeToolChoice(outRoot map[string]any, toolConfig map[string]any) {
+	functionCallingConfig, ok := jsonutil.Object(toolConfig, "function_calling_config")
+	if !ok {
+		functionCallingConfig, ok = jsonutil.Object(toolConfig, "functionCallingConfig")
+		if !ok {
+			return
 		}
 	}
 
-	// Stream setting configuration
-	out, _ = sjson.Set(out, "stream", stream)
-
-	// Convert tool parameter types to lowercase for Claude Code compatibility
-	var pathsToLower []string
-	toolsResult := gjson.Get(out, "tools")
-	util.Walk(toolsResult, "", "type", &pathsToLower)
-	for _, p := range pathsToLower {
-		fullPath := fmt.Sprintf("tools.%s", p)
-		out, _ = sjson.Set(out, fullPath, strings.ToLower(gjson.Get(out, fullPath).String()))
+	mode, _ := jsonutil.String(functionCallingConfig, "mode")
+	switch mode {
+	case "AUTO":
+		outRoot["tool_choice"] = map[string]any{"type": "auto"}
+	case "NONE":
+		outRoot["tool_choice"] = map[string]any{"type": "none"}
+	case "ANY":
+		if allowed, ok := jsonutil.Array(functionCallingConfig, "allowedFunctionNames"); ok && len(allowed) == 1 {
+			if functionName, ok := allowed[0].(string); ok && functionName != "" {
+				outRoot["tool_choice"] = map[string]any{
+					"type": "tool",
+					"name": functionName,
+				}
+				return
+			}
+		}
+		outRoot["tool_choice"] = map[string]any{"type": "any"}
 	}
-
-	return []byte(out)
 }

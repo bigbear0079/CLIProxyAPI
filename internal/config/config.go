@@ -278,7 +278,7 @@ type PayloadConfig struct {
 type PayloadFilterRule struct {
 	// Models lists model entries with name pattern and protocol constraint.
 	Models []PayloadModelRule `yaml:"models" json:"models"`
-	// Params lists JSON paths (gjson/sjson syntax) to remove from the payload.
+	// Params lists JSON paths to remove from the payload.
 	Params []string `yaml:"params" json:"params"`
 }
 
@@ -286,7 +286,7 @@ type PayloadFilterRule struct {
 type PayloadRule struct {
 	// Models lists model entries with name pattern and protocol constraint.
 	Models []PayloadModelRule `yaml:"models" json:"models"`
-	// Params maps JSON paths (gjson/sjson syntax) to values written into the payload.
+	// Params maps JSON paths to values written into the payload.
 	// For *-raw rules, values are treated as raw JSON fragments (strings are used as-is).
 	Params map[string]any `yaml:"params" json:"params"`
 }

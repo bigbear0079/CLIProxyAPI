@@ -3,7 +3,7 @@ package claude
 import (
 	"testing"
 
-	"github.com/tidwall/gjson"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/testjson"
 )
 
 func TestConvertClaudeRequestToCLI_ToolChoice_SpecificTool(t *testing.T) {
@@ -32,11 +32,11 @@ func TestConvertClaudeRequestToCLI_ToolChoice_SpecificTool(t *testing.T) {
 
 	output := ConvertClaudeRequestToCLI("gemini-3-flash-preview", inputJSON, false)
 
-	if got := gjson.GetBytes(output, "request.toolConfig.functionCallingConfig.mode").String(); got != "ANY" {
+	if got := testjson.GetBytes(output, "request.toolConfig.functionCallingConfig.mode").String(); got != "ANY" {
 		t.Fatalf("Expected request.toolConfig.functionCallingConfig.mode 'ANY', got '%s'", got)
 	}
-	allowed := gjson.GetBytes(output, "request.toolConfig.functionCallingConfig.allowedFunctionNames").Array()
+	allowed := testjson.GetBytes(output, "request.toolConfig.functionCallingConfig.allowedFunctionNames").Array()
 	if len(allowed) != 1 || allowed[0].String() != "json" {
-		t.Fatalf("Expected allowedFunctionNames ['json'], got %s", gjson.GetBytes(output, "request.toolConfig.functionCallingConfig.allowedFunctionNames").Raw)
+		t.Fatalf("Expected allowedFunctionNames ['json'], got %s", testjson.GetBytes(output, "request.toolConfig.functionCallingConfig.allowedFunctionNames").Raw)
 	}
 }

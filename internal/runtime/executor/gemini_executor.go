@@ -13,14 +13,13 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 const (
@@ -132,7 +131,7 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	body = fixGeminiImageAspectRatio(baseModel, body)
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = setJSONFieldBytes(body, "model", baseModel)
 
 	action := "generateContent"
 	if req.Metadata != nil {
@@ -146,7 +145,7 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		url = url + fmt.Sprintf("?$alt=%s", opts.Alt)
 	}
 
-	body, _ = sjson.DeleteBytes(body, "session_id")
+	body = deleteJSONFieldBytes(body, "session_id")
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -239,7 +238,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	body = fixGeminiImageAspectRatio(baseModel, body)
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = setJSONFieldBytes(body, "model", baseModel)
 
 	baseURL := resolveGeminiBaseURL(auth)
 	url := fmt.Sprintf("%s/%s/models/%s:%s", baseURL, glAPIVersion, baseModel, "streamGenerateContent")
@@ -249,7 +248,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		url = url + fmt.Sprintf("?$alt=%s", opts.Alt)
 	}
 
-	body, _ = sjson.DeleteBytes(body, "session_id")
+	body = deleteJSONFieldBytes(body, "session_id")
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -354,10 +353,10 @@ func (e *GeminiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 
 	translatedReq = fixGeminiImageAspectRatio(baseModel, translatedReq)
 	respCtx := context.WithValue(ctx, "alt", opts.Alt)
-	translatedReq, _ = sjson.DeleteBytes(translatedReq, "tools")
-	translatedReq, _ = sjson.DeleteBytes(translatedReq, "generationConfig")
-	translatedReq, _ = sjson.DeleteBytes(translatedReq, "safetySettings")
-	translatedReq, _ = sjson.SetBytes(translatedReq, "model", baseModel)
+	translatedReq = deleteJSONFieldBytes(translatedReq, "tools")
+	translatedReq = deleteJSONFieldBytes(translatedReq, "generationConfig")
+	translatedReq = deleteJSONFieldBytes(translatedReq, "safetySettings")
+	translatedReq = setJSONFieldBytes(translatedReq, "model", baseModel)
 
 	baseURL := resolveGeminiBaseURL(auth)
 	url := fmt.Sprintf("%s/%s/models/%s:%s", baseURL, glAPIVersion, baseModel, "countTokens")
@@ -413,7 +412,7 @@ func (e *GeminiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: string(data)}
 	}
 
-	count := gjson.GetBytes(data, "totalTokens").Int()
+	count, _ := jsonInt64FieldBytes(data, "totalTokens")
 	translated := sdktranslator.TranslateTokenCount(respCtx, to, from, count, data)
 	return cliproxyexecutor.Response{Payload: []byte(translated), Headers: resp.Header.Clone()}, nil
 }
@@ -507,43 +506,68 @@ func applyGeminiHeaders(req *http.Request, auth *cliproxyauth.Auth) {
 }
 
 func fixGeminiImageAspectRatio(modelName string, rawJSON []byte) []byte {
-	if modelName == "gemini-2.5-flash-image-preview" {
-		aspectRatioResult := gjson.GetBytes(rawJSON, "generationConfig.imageConfig.aspectRatio")
-		if aspectRatioResult.Exists() {
-			contents := gjson.GetBytes(rawJSON, "contents")
-			contentArray := contents.Array()
-			if len(contentArray) > 0 {
-				hasInlineData := false
-			loopContent:
-				for i := 0; i < len(contentArray); i++ {
-					parts := contentArray[i].Get("parts").Array()
-					for j := 0; j < len(parts); j++ {
-						if parts[j].Get("inlineData").Exists() {
-							hasInlineData = true
-							break loopContent
-						}
-					}
+	if modelName != "gemini-2.5-flash-image-preview" {
+		return rawJSON
+	}
+	root, errParse := jsonutil.ParseObjectBytes(rawJSON)
+	if errParse != nil {
+		return rawJSON
+	}
+	aspectRatio := jsonStringField(root, "generationConfig.imageConfig.aspectRatio")
+	if aspectRatio == "" {
+		return rawJSON
+	}
+
+	contentsValue, ok := jsonutil.Get(root, "contents")
+	if ok {
+		contentArray, ok := contentsValue.([]any)
+		if ok && len(contentArray) > 0 {
+			hasInlineData := false
+		loopContent:
+			for i := range contentArray {
+				content, ok := contentArray[i].(map[string]any)
+				if !ok {
+					continue
 				}
-
-				if !hasInlineData {
-					emptyImageBase64ed, _ := util.CreateWhiteImageBase64(aspectRatioResult.String())
-					emptyImagePart := `{"inlineData":{"mime_type":"image/png","data":""}}`
-					emptyImagePart, _ = sjson.Set(emptyImagePart, "inlineData.data", emptyImageBase64ed)
-					newPartsJson := `[]`
-					newPartsJson, _ = sjson.SetRaw(newPartsJson, "-1", `{"text": "Based on the following requirements, create an image within the uploaded picture. The new content *MUST* completely cover the entire area of the original picture, maintaining its exact proportions, and *NO* blank areas should appear."}`)
-					newPartsJson, _ = sjson.SetRaw(newPartsJson, "-1", emptyImagePart)
-
-					parts := contentArray[0].Get("parts").Array()
-					for j := 0; j < len(parts); j++ {
-						newPartsJson, _ = sjson.SetRaw(newPartsJson, "-1", parts[j].Raw)
+				partsValue, ok := content["parts"].([]any)
+				if !ok {
+					continue
+				}
+				for j := range partsValue {
+					part, ok := partsValue[j].(map[string]any)
+					if !ok {
+						continue
 					}
-
-					rawJSON, _ = sjson.SetRawBytes(rawJSON, "contents.0.parts", []byte(newPartsJson))
-					rawJSON, _ = sjson.SetRawBytes(rawJSON, "generationConfig.responseModalities", []byte(`["IMAGE", "TEXT"]`))
+					if _, okInlineData := part["inlineData"]; okInlineData {
+						hasInlineData = true
+						break loopContent
+					}
 				}
 			}
-			rawJSON, _ = sjson.DeleteBytes(rawJSON, "generationConfig.imageConfig")
+
+			if !hasInlineData {
+				emptyImageBase64ed, _ := util.CreateWhiteImageBase64(aspectRatio)
+				if firstContent, ok := contentArray[0].(map[string]any); ok {
+					if partsValue, okParts := firstContent["parts"].([]any); okParts {
+						newParts := []any{
+							map[string]any{
+								"text": "Based on the following requirements, create an image within the uploaded picture. The new content *MUST* completely cover the entire area of the original picture, maintaining its exact proportions, and *NO* blank areas should appear.",
+							},
+							map[string]any{
+								"inlineData": map[string]any{
+									"mime_type": "image/png",
+									"data":      emptyImageBase64ed,
+								},
+							},
+						}
+						newParts = append(newParts, partsValue...)
+						firstContent["parts"] = newParts
+						_ = jsonutil.Set(root, "generationConfig.responseModalities", []any{"IMAGE", "TEXT"})
+					}
+				}
+			}
 		}
 	}
-	return rawJSON
+	_ = jsonutil.Delete(root, "generationConfig.imageConfig")
+	return jsonutil.MarshalOrOriginal(rawJSON, root)
 }

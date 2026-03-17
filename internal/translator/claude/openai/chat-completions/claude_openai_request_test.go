@@ -3,7 +3,7 @@ package chat_completions
 import (
 	"testing"
 
-	"github.com/tidwall/gjson"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/testjson"
 )
 
 func TestConvertOpenAIRequestToClaude_ToolResultTextAndBase64Image(t *testing.T) {
@@ -41,7 +41,7 @@ func TestConvertOpenAIRequestToClaude_ToolResultTextAndBase64Image(t *testing.T)
 	}`
 
 	result := ConvertOpenAIRequestToClaude("claude-sonnet-4-5", []byte(inputJSON), false)
-	resultJSON := gjson.ParseBytes(result)
+	resultJSON := testjson.ParseBytes(result)
 	messages := resultJSON.Get("messages").Array()
 
 	if len(messages) != 2 {
@@ -114,7 +114,7 @@ func TestConvertOpenAIRequestToClaude_ToolResultURLImageOnly(t *testing.T) {
 	}`
 
 	result := ConvertOpenAIRequestToClaude("claude-sonnet-4-5", []byte(inputJSON), false)
-	resultJSON := gjson.ParseBytes(result)
+	resultJSON := testjson.ParseBytes(result)
 	messages := resultJSON.Get("messages").Array()
 
 	if len(messages) != 2 {

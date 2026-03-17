@@ -19,10 +19,9 @@ import (
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/thinking/provider/openai"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/testjson"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // thinkingTestCase represents a common test case structure for both suffix and body tests.
@@ -3260,7 +3259,7 @@ func runThinkingTests(t *testing.T, cases []thinkingTestCase) {
 				true,
 			)
 			if applyTo == "claude" {
-				body, _ = sjson.SetBytes(body, "max_tokens", 200000)
+				body, _ = testjson.SetBytes(body, "max_tokens", 200000)
 			}
 
 			body, err := thinking.ApplyThinking(body, tc.model, tc.from, applyTo, applyTo)
@@ -3279,19 +3278,19 @@ func runThinkingTests(t *testing.T, cases []thinkingTestCase) {
 				var hasThinking bool
 				switch tc.to {
 				case "gemini":
-					hasThinking = gjson.GetBytes(body, "generationConfig.thinkingConfig").Exists()
+					hasThinking = testjson.GetBytes(body, "generationConfig.thinkingConfig").Exists()
 				case "gemini-cli":
-					hasThinking = gjson.GetBytes(body, "request.generationConfig.thinkingConfig").Exists()
+					hasThinking = testjson.GetBytes(body, "request.generationConfig.thinkingConfig").Exists()
 				case "antigravity":
-					hasThinking = gjson.GetBytes(body, "request.generationConfig.thinkingConfig").Exists()
+					hasThinking = testjson.GetBytes(body, "request.generationConfig.thinkingConfig").Exists()
 				case "claude":
-					hasThinking = gjson.GetBytes(body, "thinking").Exists()
+					hasThinking = testjson.GetBytes(body, "thinking").Exists()
 				case "openai":
-					hasThinking = gjson.GetBytes(body, "reasoning_effort").Exists()
+					hasThinking = testjson.GetBytes(body, "reasoning_effort").Exists()
 				case "codex":
-					hasThinking = gjson.GetBytes(body, "reasoning.effort").Exists() || gjson.GetBytes(body, "reasoning").Exists()
+					hasThinking = testjson.GetBytes(body, "reasoning.effort").Exists() || testjson.GetBytes(body, "reasoning").Exists()
 				case "iflow":
-					hasThinking = gjson.GetBytes(body, "chat_template_kwargs.enable_thinking").Exists() || gjson.GetBytes(body, "reasoning_split").Exists()
+					hasThinking = testjson.GetBytes(body, "chat_template_kwargs.enable_thinking").Exists() || testjson.GetBytes(body, "reasoning_split").Exists()
 				}
 				if hasThinking {
 					t.Fatalf("expected no thinking field but found one, body=%s", string(body))
@@ -3300,12 +3299,12 @@ func runThinkingTests(t *testing.T, cases []thinkingTestCase) {
 			}
 
 			assertField := func(fieldPath, expected string) {
-				val := gjson.GetBytes(body, fieldPath)
+				val := testjson.GetBytes(body, fieldPath)
 				if !val.Exists() {
 					t.Fatalf("expected field %s not found, body=%s", fieldPath, string(body))
 				}
 				actualValue := val.String()
-				if val.Type == gjson.Number {
+				if val.Type == testjson.Number {
 					actualValue = fmt.Sprintf("%d", val.Int())
 				}
 				if actualValue != expected {
@@ -3323,7 +3322,7 @@ func runThinkingTests(t *testing.T, cases []thinkingTestCase) {
 				if tc.to == "gemini-cli" || tc.to == "antigravity" {
 					path = "request.generationConfig.thinkingConfig.includeThoughts"
 				}
-				itVal := gjson.GetBytes(body, path)
+				itVal := testjson.GetBytes(body, path)
 				if !itVal.Exists() {
 					t.Fatalf("expected includeThoughts field not found, body=%s", string(body))
 				}
@@ -3337,7 +3336,7 @@ func runThinkingTests(t *testing.T, cases []thinkingTestCase) {
 			if tc.to == "iflow" && tc.expectField == "chat_template_kwargs.enable_thinking" && tc.expectValue == "true" {
 				baseModel := thinking.ParseSuffix(tc.model).ModelName
 				isGLM := strings.HasPrefix(strings.ToLower(baseModel), "glm")
-				ctVal := gjson.GetBytes(body, "chat_template_kwargs.clear_thinking")
+				ctVal := testjson.GetBytes(body, "chat_template_kwargs.clear_thinking")
 				if isGLM {
 					if !ctVal.Exists() {
 						t.Fatalf("expected clear_thinking field not found for GLM model, body=%s", string(body))

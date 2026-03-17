@@ -7,15 +7,13 @@ package gemini
 
 import (
 	"crypto/rand"
-	"fmt"
+	"encoding/json"
 	"math/big"
 	"strconv"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // ConvertGeminiRequestToCodex parses and transforms a Gemini API request into Codex API format.
@@ -36,32 +34,14 @@ import (
 // Returns:
 //   - []byte: The transformed request data in Codex API format
 func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) []byte {
-	rawJSON := inputRawJSON
-	// Base template
-	out := `{"model":"","instructions":"","input":[]}`
-
-	root := gjson.ParseBytes(rawJSON)
-
-	// Pre-compute tool name shortening map from declared functionDeclarations
-	shortMap := map[string]string{}
-	if tools := root.Get("tools"); tools.IsArray() {
-		var names []string
-		tarr := tools.Array()
-		for i := 0; i < len(tarr); i++ {
-			fns := tarr[i].Get("functionDeclarations")
-			if !fns.IsArray() {
-				continue
-			}
-			for _, fn := range fns.Array() {
-				if v := fn.Get("name"); v.Exists() {
-					names = append(names, v.String())
-				}
-			}
-		}
-		if len(names) > 0 {
-			shortMap = buildShortNameMap(names)
-		}
+	root := jsonutil.ParseObjectBytesOrEmpty(inputRawJSON)
+	outRoot := map[string]any{
+		"model":        modelName,
+		"instructions": "",
+		"input":        []any{},
 	}
+
+	shortMap := codexGeminiBuildShortMap(root)
 
 	// helper for generating paired call IDs in the form: call_<alphanum>
 	// Gemini uses sequential pairing across possibly multiple in-flight
@@ -81,97 +61,98 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 		return "call_" + b.String()
 	}
 
-	// Model
-	out, _ = sjson.Set(out, "model", modelName)
+	inputItems := make([]any, 0)
 
 	// System instruction -> as a user message with input_text parts
-	sysParts := root.Get("system_instruction.parts")
-	if sysParts.IsArray() {
-		msg := `{"type":"message","role":"developer","content":[]}`
-		arr := sysParts.Array()
-		for i := 0; i < len(arr); i++ {
-			p := arr[i]
-			if t := p.Get("text"); t.Exists() {
-				part := `{}`
-				part, _ = sjson.Set(part, "type", "input_text")
-				part, _ = sjson.Set(part, "text", t.String())
-				msg, _ = sjson.SetRaw(msg, "content.-1", part)
-			}
+	if systemInstruction, ok := jsonutil.Object(root, "system_instruction"); ok {
+		if message, ok := codexGeminiSystemMessage(systemInstruction); ok {
+			inputItems = append(inputItems, message)
 		}
-		if len(gjson.Get(msg, "content").Array()) > 0 {
-			out, _ = sjson.SetRaw(out, "input.-1", msg)
+	} else if systemInstruction, ok := jsonutil.Object(root, "systemInstruction"); ok {
+		if message, ok := codexGeminiSystemMessage(systemInstruction); ok {
+			inputItems = append(inputItems, message)
 		}
 	}
 
 	// Contents -> messages and function calls/results
-	contents := root.Get("contents")
-	if contents.IsArray() {
-		items := contents.Array()
-		for i := 0; i < len(items); i++ {
-			item := items[i]
-			role := item.Get("role").String()
+	if contents, ok := jsonutil.Array(root, "contents"); ok {
+		for _, itemValue := range contents {
+			item, ok := itemValue.(map[string]any)
+			if !ok {
+				continue
+			}
+
+			role, _ := jsonutil.String(item, "role")
 			if role == "model" {
 				role = "assistant"
 			}
 
-			parts := item.Get("parts")
-			if !parts.IsArray() {
+			parts, ok := jsonutil.Array(item, "parts")
+			if !ok {
 				continue
 			}
-			parr := parts.Array()
-			for j := 0; j < len(parr); j++ {
-				p := parr[j]
+			for _, partValue := range parts {
+				part, ok := partValue.(map[string]any)
+				if !ok {
+					continue
+				}
 				// text part
-				if t := p.Get("text"); t.Exists() {
-					msg := `{"type":"message","role":"","content":[]}`
-					msg, _ = sjson.Set(msg, "role", role)
+				if text, ok := jsonutil.String(part, "text"); ok {
 					partType := "input_text"
 					if role == "assistant" {
 						partType = "output_text"
 					}
-					part := `{}`
-					part, _ = sjson.Set(part, "type", partType)
-					part, _ = sjson.Set(part, "text", t.String())
-					msg, _ = sjson.SetRaw(msg, "content.-1", part)
-					out, _ = sjson.SetRaw(out, "input.-1", msg)
+					inputItems = append(inputItems, map[string]any{
+						"type": "message",
+						"role": role,
+						"content": []any{
+							map[string]any{
+								"type": partType,
+								"text": text,
+							},
+						},
+					})
 					continue
 				}
 
 				// function call from model
-				if fc := p.Get("functionCall"); fc.Exists() {
-					fn := `{"type":"function_call"}`
-					if name := fc.Get("name"); name.Exists() {
-						n := name.String()
+				if functionCall, ok := jsonutil.Object(part, "functionCall"); ok {
+					functionCallItem := map[string]any{
+						"type": "function_call",
+					}
+					if name, ok := jsonutil.String(functionCall, "name"); ok {
+						n := name
 						if short, ok := shortMap[n]; ok {
 							n = short
 						} else {
 							n = shortenNameIfNeeded(n)
 						}
-						fn, _ = sjson.Set(fn, "name", n)
+						functionCallItem["name"] = n
 					}
-					if args := fc.Get("args"); args.Exists() {
-						fn, _ = sjson.Set(fn, "arguments", args.Raw)
+					if args, ok := jsonutil.Get(functionCall, "args"); ok {
+						functionCallItem["arguments"] = codexGeminiJSONText(args)
 					}
 					// generate a paired random call_id and enqueue it so the
 					// corresponding functionResponse can pop the earliest id
 					// to preserve ordering when multiple calls are present.
 					id := genCallID()
-					fn, _ = sjson.Set(fn, "call_id", id)
+					functionCallItem["call_id"] = id
 					pendingCallIDs = append(pendingCallIDs, id)
-					out, _ = sjson.SetRaw(out, "input.-1", fn)
+					inputItems = append(inputItems, functionCallItem)
 					continue
 				}
 
 				// function response from user
-				if fr := p.Get("functionResponse"); fr.Exists() {
-					fno := `{"type":"function_call_output"}`
-					// Prefer a string result if present; otherwise embed the raw response as a string
-					if res := fr.Get("response.result"); res.Exists() {
-						fno, _ = sjson.Set(fno, "output", res.String())
-					} else if resp := fr.Get("response"); resp.Exists() {
-						fno, _ = sjson.Set(fno, "output", resp.Raw)
+				if functionResponse, ok := jsonutil.Object(part, "functionResponse"); ok {
+					functionOutputItem := map[string]any{
+						"type": "function_call_output",
 					}
-					// fno, _ = sjson.Set(fno, "call_id", "call_W6nRJzFXyPM2LFBbfo98qAbq")
+					// Prefer a string result if present; otherwise embed the raw response as a string
+					if result, ok := jsonutil.Get(functionResponse, "response.result"); ok {
+						functionOutputItem["output"] = codexGeminiContentString(result)
+					} else if response, ok := jsonutil.Get(functionResponse, "response"); ok {
+						functionOutputItem["output"] = codexGeminiContentString(response)
+					}
 					// attach the oldest queued call_id to pair the response
 					// with its call. If the queue is empty, generate a new id.
 					var id string
@@ -182,112 +163,228 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 					} else {
 						id = genCallID()
 					}
-					fno, _ = sjson.Set(fno, "call_id", id)
-					out, _ = sjson.SetRaw(out, "input.-1", fno)
+					functionOutputItem["call_id"] = id
+					inputItems = append(inputItems, functionOutputItem)
 					continue
 				}
 			}
 		}
 	}
+	outRoot["input"] = inputItems
 
 	// Tools mapping: Gemini functionDeclarations -> Codex tools
-	tools := root.Get("tools")
-	if tools.IsArray() {
-		out, _ = sjson.SetRaw(out, "tools", `[]`)
-		out, _ = sjson.Set(out, "tool_choice", "auto")
-		tarr := tools.Array()
-		for i := 0; i < len(tarr); i++ {
-			td := tarr[i]
-			fns := td.Get("functionDeclarations")
-			if !fns.IsArray() {
+	if tools, ok := jsonutil.Array(root, "tools"); ok {
+		codexTools := make([]any, 0)
+		for _, toolValue := range tools {
+			tool, ok := toolValue.(map[string]any)
+			if !ok {
 				continue
 			}
-			farr := fns.Array()
-			for j := 0; j < len(farr); j++ {
-				fn := farr[j]
-				tool := `{}`
-				tool, _ = sjson.Set(tool, "type", "function")
-				if v := fn.Get("name"); v.Exists() {
-					name := v.String()
+			functionDeclarations, ok := jsonutil.Array(tool, "functionDeclarations")
+			if !ok {
+				continue
+			}
+			for _, declarationValue := range functionDeclarations {
+				declaration, ok := declarationValue.(map[string]any)
+				if !ok {
+					continue
+				}
+
+				codexTool := map[string]any{
+					"type":   "function",
+					"strict": false,
+				}
+				if name, ok := jsonutil.String(declaration, "name"); ok {
+					name := name
 					if short, ok := shortMap[name]; ok {
 						name = short
 					} else {
 						name = shortenNameIfNeeded(name)
 					}
-					tool, _ = sjson.Set(tool, "name", name)
+					codexTool["name"] = name
 				}
-				if v := fn.Get("description"); v.Exists() {
-					tool, _ = sjson.Set(tool, "description", v.String())
+				if description, ok := jsonutil.String(declaration, "description"); ok {
+					codexTool["description"] = description
 				}
-				if prm := fn.Get("parameters"); prm.Exists() {
-					// Remove optional $schema field if present
-					cleaned := prm.Raw
-					cleaned, _ = sjson.Delete(cleaned, "$schema")
-					cleaned, _ = sjson.Set(cleaned, "additionalProperties", false)
-					tool, _ = sjson.SetRaw(tool, "parameters", cleaned)
-				} else if prm = fn.Get("parametersJsonSchema"); prm.Exists() {
-					// Remove optional $schema field if present
-					cleaned := prm.Raw
-					cleaned, _ = sjson.Delete(cleaned, "$schema")
-					cleaned, _ = sjson.Set(cleaned, "additionalProperties", false)
-					tool, _ = sjson.SetRaw(tool, "parameters", cleaned)
+				if parameters, ok := jsonutil.Get(declaration, "parameters"); ok {
+					if cleaned, ok := codexGeminiCleanSchema(parameters); ok {
+						codexTool["parameters"] = cleaned
+					}
+				} else if parameters, ok := jsonutil.Get(declaration, "parametersJsonSchema"); ok {
+					if cleaned, ok := codexGeminiCleanSchema(parameters); ok {
+						codexTool["parameters"] = cleaned
+					}
 				}
-				tool, _ = sjson.Set(tool, "strict", false)
-				out, _ = sjson.SetRaw(out, "tools.-1", tool)
+				codexTools = append(codexTools, codexTool)
 			}
 		}
+		outRoot["tools"] = codexTools
+		outRoot["tool_choice"] = "auto"
 	}
 
 	// Fixed flags aligning with Codex expectations
-	out, _ = sjson.Set(out, "parallel_tool_calls", true)
+	outRoot["parallel_tool_calls"] = true
 
 	// Convert Gemini thinkingConfig to Codex reasoning.effort.
 	// Note: Google official Python SDK sends snake_case fields (thinking_level/thinking_budget).
-	effortSet := false
-	if genConfig := root.Get("generationConfig"); genConfig.Exists() {
-		if thinkingConfig := genConfig.Get("thinkingConfig"); thinkingConfig.Exists() && thinkingConfig.IsObject() {
-			thinkingLevel := thinkingConfig.Get("thinkingLevel")
-			if !thinkingLevel.Exists() {
-				thinkingLevel = thinkingConfig.Get("thinking_level")
+	reasoningEffort := "medium"
+	if generationConfig, ok := jsonutil.Object(root, "generationConfig"); ok {
+		reasoningEffort = codexGeminiReasoningEffort(generationConfig, reasoningEffort)
+	} else if generationConfig, ok := jsonutil.Object(root, "generation_config"); ok {
+		reasoningEffort = codexGeminiReasoningEffort(generationConfig, reasoningEffort)
+	}
+	outRoot["reasoning"] = map[string]any{
+		"effort":  reasoningEffort,
+		"summary": "auto",
+	}
+	outRoot["stream"] = true
+	outRoot["store"] = false
+	outRoot["include"] = []string{"reasoning.encrypted_content"}
+
+	return jsonutil.MarshalOrOriginal(inputRawJSON, outRoot)
+}
+
+func codexGeminiBuildShortMap(root map[string]any) map[string]string {
+	names := make([]string, 0)
+	if tools, ok := jsonutil.Array(root, "tools"); ok {
+		for _, toolValue := range tools {
+			tool, ok := toolValue.(map[string]any)
+			if !ok {
+				continue
 			}
-			if thinkingLevel.Exists() {
-				effort := strings.ToLower(strings.TrimSpace(thinkingLevel.String()))
-				if effort != "" {
-					out, _ = sjson.Set(out, "reasoning.effort", effort)
-					effortSet = true
+			functionDeclarations, ok := jsonutil.Array(tool, "functionDeclarations")
+			if !ok {
+				continue
+			}
+			for _, declarationValue := range functionDeclarations {
+				declaration, ok := declarationValue.(map[string]any)
+				if !ok {
+					continue
 				}
-			} else {
-				thinkingBudget := thinkingConfig.Get("thinkingBudget")
-				if !thinkingBudget.Exists() {
-					thinkingBudget = thinkingConfig.Get("thinking_budget")
-				}
-				if thinkingBudget.Exists() {
-					if effort, ok := thinking.ConvertBudgetToLevel(int(thinkingBudget.Int())); ok {
-						out, _ = sjson.Set(out, "reasoning.effort", effort)
-						effortSet = true
-					}
+				if name, ok := jsonutil.String(declaration, "name"); ok && name != "" {
+					names = append(names, name)
 				}
 			}
 		}
 	}
-	if !effortSet {
-		// No thinking config, set default effort
-		out, _ = sjson.Set(out, "reasoning.effort", "medium")
+	if len(names) == 0 {
+		return map[string]string{}
 	}
-	out, _ = sjson.Set(out, "reasoning.summary", "auto")
-	out, _ = sjson.Set(out, "stream", true)
-	out, _ = sjson.Set(out, "store", false)
-	out, _ = sjson.Set(out, "include", []string{"reasoning.encrypted_content"})
+	return buildShortNameMap(names)
+}
 
-	var pathsToLower []string
-	toolsResult := gjson.Get(out, "tools")
-	util.Walk(toolsResult, "", "type", &pathsToLower)
-	for _, p := range pathsToLower {
-		fullPath := fmt.Sprintf("tools.%s", p)
-		out, _ = sjson.Set(out, fullPath, strings.ToLower(gjson.Get(out, fullPath).String()))
+func codexGeminiSystemMessage(systemInstruction map[string]any) (map[string]any, bool) {
+	parts, ok := jsonutil.Array(systemInstruction, "parts")
+	if !ok {
+		return nil, false
 	}
 
-	return []byte(out)
+	contentParts := make([]any, 0)
+	for _, partValue := range parts {
+		part, ok := partValue.(map[string]any)
+		if !ok {
+			continue
+		}
+		if text, ok := jsonutil.String(part, "text"); ok {
+			contentParts = append(contentParts, map[string]any{
+				"type": "input_text",
+				"text": text,
+			})
+		}
+	}
+	if len(contentParts) == 0 {
+		return nil, false
+	}
+	return map[string]any{
+		"type":    "message",
+		"role":    "developer",
+		"content": contentParts,
+	}, true
+}
+
+func codexGeminiReasoningEffort(generationConfig map[string]any, defaultEffort string) string {
+	thinkingConfig, ok := jsonutil.Object(generationConfig, "thinkingConfig")
+	if !ok {
+		thinkingConfig, ok = jsonutil.Object(generationConfig, "thinking_config")
+		if !ok {
+			return defaultEffort
+		}
+	}
+
+	if thinkingLevel, ok := jsonutil.String(thinkingConfig, "thinkingLevel"); ok {
+		effort := strings.ToLower(strings.TrimSpace(thinkingLevel))
+		if effort != "" {
+			return effort
+		}
+	}
+	if thinkingLevel, ok := jsonutil.String(thinkingConfig, "thinking_level"); ok {
+		effort := strings.ToLower(strings.TrimSpace(thinkingLevel))
+		if effort != "" {
+			return effort
+		}
+	}
+	if thinkingBudget, ok := jsonutil.Int64(thinkingConfig, "thinkingBudget"); ok {
+		if effort, ok := thinking.ConvertBudgetToLevel(int(thinkingBudget)); ok {
+			return effort
+		}
+	}
+	if thinkingBudget, ok := jsonutil.Int64(thinkingConfig, "thinking_budget"); ok {
+		if effort, ok := thinking.ConvertBudgetToLevel(int(thinkingBudget)); ok {
+			return effort
+		}
+	}
+	return defaultEffort
+}
+
+func codexGeminiJSONText(value any) string {
+	return string(jsonutil.MarshalOrOriginal(nil, value))
+}
+
+func codexGeminiContentString(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return typed
+	case json.Number:
+		return typed.String()
+	case bool:
+		if typed {
+			return "true"
+		}
+		return "false"
+	default:
+		return string(jsonutil.MarshalOrOriginal(nil, typed))
+	}
+}
+
+func codexGeminiCleanSchema(value any) (map[string]any, bool) {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	delete(object, "$schema")
+	object["additionalProperties"] = false
+	codexGeminiLowercaseTypeFields(object)
+	return object, true
+}
+
+func codexGeminiLowercaseTypeFields(value any) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			if key == "type" {
+				if typeString, ok := child.(string); ok {
+					typed[key] = strings.ToLower(typeString)
+				}
+			}
+			codexGeminiLowercaseTypeFields(child)
+		}
+	case []any:
+		for _, child := range typed {
+			codexGeminiLowercaseTypeFields(child)
+		}
+	}
 }
 
 // shortenNameIfNeeded applies the simple shortening rule for a single name.

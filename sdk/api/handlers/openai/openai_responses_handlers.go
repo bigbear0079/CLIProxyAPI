@@ -15,10 +15,9 @@ import (
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // OpenAIResponsesAPIHandler contains the handlers for OpenAIResponses API endpoints.
@@ -83,8 +82,7 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 	}
 
 	// Check if the client requested a streaming response.
-	streamResult := gjson.GetBytes(rawJSON, "stream")
-	if streamResult.Type == gjson.True {
+	if jsonBoolFieldBytes(rawJSON, "stream") {
 		h.handleStreamingResponse(c, rawJSON)
 	} else {
 		h.handleNonStreamingResponse(c, rawJSON)
@@ -104,8 +102,18 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 		return
 	}
 
-	streamResult := gjson.GetBytes(rawJSON, "stream")
-	if streamResult.Type == gjson.True {
+	root, errParse := jsonutil.ParseObjectBytes(rawJSON)
+	if errParse != nil {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("Invalid request: %v", errParse),
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+
+	if jsonBoolField(root, "stream") {
 		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
 				Message: "Streaming not supported for compact responses",
@@ -114,14 +122,14 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 		})
 		return
 	}
-	if streamResult.Exists() {
-		if updated, err := sjson.DeleteBytes(rawJSON, "stream"); err == nil {
-			rawJSON = updated
+	if jsonutil.Exists(root, "stream") {
+		if errDelete := jsonutil.Delete(root, "stream"); errDelete == nil {
+			rawJSON = jsonutil.MarshalOrOriginal(rawJSON, root)
 		}
 	}
 
 	c.Header("Content-Type", "application/json")
-	modelName := gjson.GetBytes(rawJSON, "model").String()
+	modelName := jsonStringField(root, "model")
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "responses/compact")
@@ -146,7 +154,7 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 func (h *OpenAIResponsesAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []byte) {
 	c.Header("Content-Type", "application/json")
 
-	modelName := gjson.GetBytes(rawJSON, "model").String()
+	modelName := jsonStringFieldBytes(rawJSON, "model")
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 
@@ -183,7 +191,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	}
 
 	// New core execution path
-	modelName := gjson.GetBytes(rawJSON, "model").String()
+	modelName := jsonStringFieldBytes(rawJSON, "model")
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 

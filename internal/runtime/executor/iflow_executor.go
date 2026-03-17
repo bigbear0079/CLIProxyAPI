@@ -22,8 +22,6 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 const (
@@ -98,7 +96,7 @@ func (e *IFlowExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = setJSONFieldBytes(body, "model", baseModel)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), "iflow", e.Identifier())
 	if err != nil {
@@ -201,7 +199,7 @@ func (e *IFlowExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = setJSONFieldBytes(body, "model", baseModel)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), "iflow", e.Identifier())
 	if err != nil {
@@ -210,9 +208,10 @@ func (e *IFlowExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	body = preserveReasoningContentInMessages(body)
 	// Ensure tools array exists to avoid provider quirks similar to Qwen's behaviour.
-	toolsResult := gjson.GetBytes(body, "tools")
-	if toolsResult.Exists() && toolsResult.IsArray() && len(toolsResult.Array()) == 0 {
-		body = ensureToolsArray(body)
+	if toolsValue, ok := jsonValueFieldBytes(body, "tools"); ok {
+		if toolsArray, okArray := toolsValue.([]any); okArray && len(toolsArray) == 0 {
+			body = ensureToolsArray(body)
+		}
 	}
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
@@ -521,11 +520,7 @@ func iflowCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 
 func ensureToolsArray(body []byte) []byte {
 	placeholder := `[{"type":"function","function":{"name":"noop","description":"Placeholder tool to stabilise streaming","parameters":{"type":"object"}}}]`
-	updated, err := sjson.SetRawBytes(body, "tools", []byte(placeholder))
-	if err != nil {
-		return body
-	}
-	return updated
+	return setRawJSONFieldBytes(body, "tools", []byte(placeholder))
 }
 
 // preserveReasoningContentInMessages checks if reasoning_content from assistant messages
@@ -536,7 +531,7 @@ func ensureToolsArray(body []byte) []byte {
 // For GLM-4.6/4.7 and MiniMax M2/M2.1, it is recommended to include the full assistant
 // response (including reasoning_content) in message history for better context continuity.
 func preserveReasoningContentInMessages(body []byte) []byte {
-	model := strings.ToLower(gjson.GetBytes(body, "model").String())
+	model := strings.ToLower(jsonStringFieldBytes(body, "model"))
 
 	// Only apply to models that support thinking with history preservation
 	needsPreservation := strings.HasPrefix(model, "glm-4") || strings.HasPrefix(model, "minimax-m2")
@@ -545,24 +540,30 @@ func preserveReasoningContentInMessages(body []byte) []byte {
 		return body
 	}
 
-	messages := gjson.GetBytes(body, "messages")
-	if !messages.Exists() || !messages.IsArray() {
+	messagesValue, ok := jsonValueFieldBytes(body, "messages")
+	if !ok {
+		return body
+	}
+	messages, ok := messagesValue.([]any)
+	if !ok {
 		return body
 	}
 
 	// Check if any assistant message already has reasoning_content preserved
 	hasReasoningContent := false
-	messages.ForEach(func(_, msg gjson.Result) bool {
-		role := msg.Get("role").String()
+	for _, msgValue := range messages {
+		msg, ok := msgValue.(map[string]any)
+		if !ok {
+			continue
+		}
+		role := jsonStringField(msg, "role")
 		if role == "assistant" {
-			rc := msg.Get("reasoning_content")
-			if rc.Exists() && rc.String() != "" {
+			if jsonStringField(msg, "reasoning_content") != "" {
 				hasReasoningContent = true
-				return false // stop iteration
+				break
 			}
 		}
-		return true
-	})
+	}
 
 	// If reasoning content is already present, the messages are properly formatted
 	// No need to modify - the client has correctly preserved reasoning in history

@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -21,8 +22,6 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 const (
@@ -112,9 +111,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				allowIncrementalInputWithPreviousResponseID = websocketUpstreamSupportsIncrementalInput(pinnedAuth.Attributes, pinnedAuth.Metadata)
 			}
 		} else {
-			requestModelName := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
+			requestModelName := strings.TrimSpace(jsonStringFieldBytes(payload, "model"))
 			if requestModelName == "" {
-				requestModelName = strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
+				requestModelName = strings.TrimSpace(jsonStringFieldBytes(lastRequest, "model"))
 			}
 			allowIncrementalInputWithPreviousResponseID = h.websocketUpstreamSupportsIncrementalInputForModel(requestModelName)
 		}
@@ -152,12 +151,8 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			continue
 		}
 		if shouldHandleResponsesWebsocketPrewarmLocally(payload, lastRequest, allowIncrementalInputWithPreviousResponseID) {
-			if updated, errDelete := sjson.DeleteBytes(requestJSON, "generate"); errDelete == nil {
-				requestJSON = updated
-			}
-			if updated, errDelete := sjson.DeleteBytes(updatedLastRequest, "generate"); errDelete == nil {
-				updatedLastRequest = updated
-			}
+			requestJSON = deleteJSONPathBytes(requestJSON, "generate")
+			updatedLastRequest = deleteJSONPathBytes(updatedLastRequest, "generate")
 			lastRequest = updatedLastRequest
 			lastResponseOutput = []byte("[]")
 			if errWrite := writeResponsesWebsocketSyntheticPrewarm(c, conn, requestJSON, &wsBodyLog, passthroughSessionID); errWrite != nil {
@@ -169,7 +164,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 		lastRequest = updatedLastRequest
 
-		modelName := gjson.GetBytes(requestJSON, "model").String()
+		modelName := jsonStringFieldBytes(requestJSON, "model")
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
 		cliCtx = handlers.WithExecutionSessionID(cliCtx, passthroughSessionID)
@@ -222,7 +217,7 @@ func normalizeResponsesWebsocketRequest(rawJSON []byte, lastRequest []byte, last
 }
 
 func normalizeResponsesWebsocketRequestWithMode(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, allowIncrementalInputWithPreviousResponseID bool) ([]byte, []byte, *interfaces.ErrorMessage) {
-	requestType := strings.TrimSpace(gjson.GetBytes(rawJSON, "type").String())
+	requestType := strings.TrimSpace(jsonStringFieldBytes(rawJSON, "type"))
 	switch requestType {
 	case wsRequestTypeCreate:
 		// log.Infof("responses websocket: response.create request")
@@ -242,20 +237,31 @@ func normalizeResponsesWebsocketRequestWithMode(rawJSON []byte, lastRequest []by
 }
 
 func normalizeResponseCreateRequest(rawJSON []byte) ([]byte, []byte, *interfaces.ErrorMessage) {
-	normalized, errDelete := sjson.DeleteBytes(rawJSON, "type")
-	if errDelete != nil {
-		normalized = bytes.Clone(rawJSON)
+	root, errParse := jsonutil.ParseObjectBytes(rawJSON)
+	if errParse != nil {
+		return nil, nil, &interfaces.ErrorMessage{
+			StatusCode: http.StatusBadRequest,
+			Error:      fmt.Errorf("invalid websocket request body: %w", errParse),
+		}
 	}
-	normalized, _ = sjson.SetBytes(normalized, "stream", true)
-	if !gjson.GetBytes(normalized, "input").Exists() {
-		normalized, _ = sjson.SetRawBytes(normalized, "input", []byte("[]"))
+	delete(root, "type")
+	root["stream"] = true
+	if !jsonutil.Exists(root, "input") {
+		root["input"] = []any{}
 	}
 
-	modelName := strings.TrimSpace(gjson.GetBytes(normalized, "model").String())
+	modelName := strings.TrimSpace(jsonStringField(root, "model"))
 	if modelName == "" {
 		return nil, nil, &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadRequest,
 			Error:      fmt.Errorf("missing model in response.create request"),
+		}
+	}
+	normalized, errMarshal := json.Marshal(root)
+	if errMarshal != nil {
+		return nil, nil, &interfaces.ErrorMessage{
+			StatusCode: http.StatusBadRequest,
+			Error:      fmt.Errorf("failed to normalize websocket request: %w", errMarshal),
 		}
 	}
 	return normalized, bytes.Clone(normalized), nil
@@ -269,8 +275,24 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 		}
 	}
 
-	nextInput := gjson.GetBytes(rawJSON, "input")
-	if !nextInput.Exists() || !nextInput.IsArray() {
+	root, errParse := jsonutil.ParseObjectBytes(rawJSON)
+	if errParse != nil {
+		return nil, lastRequest, &interfaces.ErrorMessage{
+			StatusCode: http.StatusBadRequest,
+			Error:      fmt.Errorf("invalid websocket request body: %w", errParse),
+		}
+	}
+	lastRoot, errParseLast := jsonutil.ParseObjectBytes(lastRequest)
+	if errParseLast != nil {
+		return nil, lastRequest, &interfaces.ErrorMessage{
+			StatusCode: http.StatusBadRequest,
+			Error:      fmt.Errorf("invalid previous websocket request: %w", errParseLast),
+		}
+	}
+
+	nextInputValue, okNextInput := jsonutil.Get(root, "input")
+	nextInput, okNextInputCast := nextInputValue.([]any)
+	if !okNextInput || !okNextInputCast {
 		return nil, lastRequest, &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadRequest,
 			Error:      fmt.Errorf("websocket request requires array field: input"),
@@ -280,71 +302,71 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 	// Websocket v2 mode uses response.create with previous_response_id + incremental input.
 	// Do not expand it into a full input transcript; upstream expects the incremental payload.
 	if allowIncrementalInputWithPreviousResponseID {
-		if prev := strings.TrimSpace(gjson.GetBytes(rawJSON, "previous_response_id").String()); prev != "" {
-			normalized, errDelete := sjson.DeleteBytes(rawJSON, "type")
-			if errDelete != nil {
-				normalized = bytes.Clone(rawJSON)
-			}
-			if !gjson.GetBytes(normalized, "model").Exists() {
-				modelName := strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
+		if prev := strings.TrimSpace(jsonStringField(root, "previous_response_id")); prev != "" {
+			delete(root, "type")
+			if !jsonutil.Exists(root, "model") {
+				modelName := strings.TrimSpace(jsonStringField(lastRoot, "model"))
 				if modelName != "" {
-					normalized, _ = sjson.SetBytes(normalized, "model", modelName)
+					root["model"] = modelName
 				}
 			}
-			if !gjson.GetBytes(normalized, "instructions").Exists() {
-				instructions := gjson.GetBytes(lastRequest, "instructions")
-				if instructions.Exists() {
-					normalized, _ = sjson.SetRawBytes(normalized, "instructions", []byte(instructions.Raw))
+			if !jsonutil.Exists(root, "instructions") {
+				if instructions, okInstructions := jsonutil.Get(lastRoot, "instructions"); okInstructions {
+					root["instructions"] = instructions
 				}
 			}
-			normalized, _ = sjson.SetBytes(normalized, "stream", true)
+			root["stream"] = true
+			normalized, errMarshal := json.Marshal(root)
+			if errMarshal != nil {
+				return nil, lastRequest, &interfaces.ErrorMessage{
+					StatusCode: http.StatusBadRequest,
+					Error:      fmt.Errorf("failed to normalize websocket request: %w", errMarshal),
+				}
+			}
 			return normalized, bytes.Clone(normalized), nil
 		}
 	}
 
-	existingInput := gjson.GetBytes(lastRequest, "input")
-	mergedInput, errMerge := mergeJSONArrayRaw(existingInput.Raw, normalizeJSONArrayRaw(lastResponseOutput))
-	if errMerge != nil {
+	existingInputValue, okExistingInput := jsonutil.Get(lastRoot, "input")
+	existingInput, okExistingInputCast := existingInputValue.([]any)
+	if !okExistingInput || !okExistingInputCast {
 		return nil, lastRequest, &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadRequest,
-			Error:      fmt.Errorf("invalid previous response output: %w", errMerge),
+			Error:      fmt.Errorf("previous websocket request requires array field: input"),
 		}
 	}
+	previousOutput, errNormalize := jsonutil.NormalizeJSONArrayBytes(lastResponseOutput)
+	if errNormalize != nil {
+		return nil, lastRequest, &interfaces.ErrorMessage{
+			StatusCode: http.StatusBadRequest,
+			Error:      fmt.Errorf("invalid previous response output: %w", errNormalize),
+		}
+	}
+	mergedInput := jsonutil.MergeArrays(existingInput, previousOutput)
+	mergedInput = jsonutil.MergeArrays(mergedInput, nextInput)
 
-	mergedInput, errMerge = mergeJSONArrayRaw(mergedInput, nextInput.Raw)
-	if errMerge != nil {
-		return nil, lastRequest, &interfaces.ErrorMessage{
-			StatusCode: http.StatusBadRequest,
-			Error:      fmt.Errorf("invalid request input: %w", errMerge),
-		}
-	}
-
-	normalized, errDelete := sjson.DeleteBytes(rawJSON, "type")
-	if errDelete != nil {
-		normalized = bytes.Clone(rawJSON)
-	}
-	normalized, _ = sjson.DeleteBytes(normalized, "previous_response_id")
-	var errSet error
-	normalized, errSet = sjson.SetRawBytes(normalized, "input", []byte(mergedInput))
-	if errSet != nil {
-		return nil, lastRequest, &interfaces.ErrorMessage{
-			StatusCode: http.StatusBadRequest,
-			Error:      fmt.Errorf("failed to merge websocket input: %w", errSet),
-		}
-	}
-	if !gjson.GetBytes(normalized, "model").Exists() {
-		modelName := strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
+	delete(root, "type")
+	delete(root, "previous_response_id")
+	root["input"] = mergedInput
+	if !jsonutil.Exists(root, "model") {
+		modelName := strings.TrimSpace(jsonStringField(lastRoot, "model"))
 		if modelName != "" {
-			normalized, _ = sjson.SetBytes(normalized, "model", modelName)
+			root["model"] = modelName
 		}
 	}
-	if !gjson.GetBytes(normalized, "instructions").Exists() {
-		instructions := gjson.GetBytes(lastRequest, "instructions")
-		if instructions.Exists() {
-			normalized, _ = sjson.SetRawBytes(normalized, "instructions", []byte(instructions.Raw))
+	if !jsonutil.Exists(root, "instructions") {
+		if instructions, okInstructions := jsonutil.Get(lastRoot, "instructions"); okInstructions {
+			root["instructions"] = instructions
 		}
 	}
-	normalized, _ = sjson.SetBytes(normalized, "stream", true)
+	root["stream"] = true
+	normalized, errMarshal := json.Marshal(root)
+	if errMarshal != nil {
+		return nil, lastRequest, &interfaces.ErrorMessage{
+			StatusCode: http.StatusBadRequest,
+			Error:      fmt.Errorf("failed to merge websocket input: %w", errMarshal),
+		}
+	}
 	return normalized, bytes.Clone(normalized), nil
 }
 
@@ -481,11 +503,19 @@ func shouldHandleResponsesWebsocketPrewarmLocally(rawJSON []byte, lastRequest []
 	if allowIncrementalInputWithPreviousResponseID || len(lastRequest) != 0 {
 		return false
 	}
-	if strings.TrimSpace(gjson.GetBytes(rawJSON, "type").String()) != wsRequestTypeCreate {
+	root, errParse := jsonutil.ParseObjectBytes(rawJSON)
+	if errParse != nil {
 		return false
 	}
-	generateResult := gjson.GetBytes(rawJSON, "generate")
-	return generateResult.Exists() && !generateResult.Bool()
+	if strings.TrimSpace(jsonStringField(root, "type")) != wsRequestTypeCreate {
+		return false
+	}
+	generateValue, okGenerate := jsonutil.Get(root, "generate")
+	if !okGenerate {
+		return false
+	}
+	generate, okGenerateCast := generateValue.(bool)
+	return okGenerateCast && !generate
 }
 
 func writeResponsesWebsocketSyntheticPrewarm(
@@ -525,39 +555,53 @@ func writeResponsesWebsocketSyntheticPrewarm(
 func syntheticResponsesWebsocketPrewarmPayloads(requestJSON []byte) ([][]byte, error) {
 	responseID := "resp_prewarm_" + uuid.NewString()
 	createdAt := time.Now().Unix()
-	modelName := strings.TrimSpace(gjson.GetBytes(requestJSON, "model").String())
+	modelName := strings.TrimSpace(jsonStringFieldBytes(requestJSON, "model"))
 
-	createdPayload := []byte(`{"type":"response.created","sequence_number":0,"response":{"id":"","object":"response","created_at":0,"status":"in_progress","background":false,"error":null,"output":[]}}`)
-	var errSet error
-	createdPayload, errSet = sjson.SetBytes(createdPayload, "response.id", responseID)
-	if errSet != nil {
-		return nil, errSet
-	}
-	createdPayload, errSet = sjson.SetBytes(createdPayload, "response.created_at", createdAt)
-	if errSet != nil {
-		return nil, errSet
+	createdPayloadValue := map[string]any{
+		"type":            "response.created",
+		"sequence_number": 0,
+		"response": map[string]any{
+			"id":         responseID,
+			"object":     "response",
+			"created_at": createdAt,
+			"status":     "in_progress",
+			"background": false,
+			"error":      nil,
+			"output":     []any{},
+		},
 	}
 	if modelName != "" {
-		createdPayload, errSet = sjson.SetBytes(createdPayload, "response.model", modelName)
-		if errSet != nil {
-			return nil, errSet
-		}
+		createdPayloadValue["response"].(map[string]any)["model"] = modelName
+	}
+	createdPayload, errMarshalCreated := json.Marshal(createdPayloadValue)
+	if errMarshalCreated != nil {
+		return nil, errMarshalCreated
 	}
 
-	completedPayload := []byte(`{"type":"response.completed","sequence_number":1,"response":{"id":"","object":"response","created_at":0,"status":"completed","background":false,"error":null,"output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
-	completedPayload, errSet = sjson.SetBytes(completedPayload, "response.id", responseID)
-	if errSet != nil {
-		return nil, errSet
-	}
-	completedPayload, errSet = sjson.SetBytes(completedPayload, "response.created_at", createdAt)
-	if errSet != nil {
-		return nil, errSet
+	completedPayloadValue := map[string]any{
+		"type":            "response.completed",
+		"sequence_number": 1,
+		"response": map[string]any{
+			"id":         responseID,
+			"object":     "response",
+			"created_at": createdAt,
+			"status":     "completed",
+			"background": false,
+			"error":      nil,
+			"output":     []any{},
+			"usage": map[string]any{
+				"input_tokens":  0,
+				"output_tokens": 0,
+				"total_tokens":  0,
+			},
+		},
 	}
 	if modelName != "" {
-		completedPayload, errSet = sjson.SetBytes(completedPayload, "response.model", modelName)
-		if errSet != nil {
-			return nil, errSet
-		}
+		completedPayloadValue["response"].(map[string]any)["model"] = modelName
+	}
+	completedPayload, errMarshalCompleted := json.Marshal(completedPayloadValue)
+	if errMarshalCompleted != nil {
+		return nil, errMarshalCompleted
 	}
 
 	return [][]byte{createdPayload, completedPayload}, nil
@@ -591,15 +635,15 @@ func mergeJSONArrayRaw(existingRaw, appendRaw string) (string, error) {
 }
 
 func normalizeJSONArrayRaw(raw []byte) string {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" {
+	array, errNormalize := jsonutil.NormalizeJSONArrayBytes(raw)
+	if errNormalize != nil {
 		return "[]"
 	}
-	result := gjson.Parse(trimmed)
-	if result.Type == gjson.JSON && result.IsArray() {
-		return trimmed
+	normalized, errMarshal := json.Marshal(array)
+	if errMarshal != nil {
+		return "[]"
 	}
-	return "[]"
+	return string(normalized)
 }
 
 func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
@@ -690,10 +734,11 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 
 			payloads := websocketJSONPayloadsFromChunk(chunk)
 			for i := range payloads {
-				eventType := gjson.GetBytes(payloads[i], "type").String()
+				payloadRoot, _ := jsonutil.ParseObjectBytes(payloads[i])
+				eventType := jsonStringField(payloadRoot, "type")
 				if eventType == wsEventTypeCompleted {
 					completed = true
-					completedOutput = responseCompletedOutputFromPayload(payloads[i])
+					completedOutput = responseCompletedOutputFromObject(payloadRoot)
 				}
 				markAPIResponseTimestamp(c)
 				appendWebsocketEvent(wsBodyLog, "response", payloads[i])
@@ -720,11 +765,11 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 }
 
 func responseCompletedOutputFromPayload(payload []byte) []byte {
-	output := gjson.GetBytes(payload, "response.output")
-	if output.Exists() && output.IsArray() {
-		return bytes.Clone([]byte(output.Raw))
+	root, errParse := jsonutil.ParseObjectBytes(payload)
+	if errParse != nil {
+		return []byte("[]")
 	}
-	return []byte("[]")
+	return responseCompletedOutputFromObject(root)
 }
 
 func websocketJSONPayloadsFromChunk(chunk []byte) [][]byte {
@@ -774,62 +819,48 @@ func writeResponsesWebsocketError(conn *websocket.Conn, errMsg *interfaces.Error
 	}
 
 	body := handlers.BuildErrorResponseBody(status, errText)
-	payload := []byte(`{}`)
-	var errSet error
-	payload, errSet = sjson.SetBytes(payload, "type", wsEventTypeError)
-	if errSet != nil {
-		return nil, errSet
-	}
-	payload, errSet = sjson.SetBytes(payload, "status", status)
-	if errSet != nil {
-		return nil, errSet
+	payloadValue := map[string]any{
+		"type":   wsEventTypeError,
+		"status": status,
 	}
 
 	if errMsg != nil && errMsg.Addon != nil {
-		headers := []byte(`{}`)
+		headers := make(map[string]any)
 		hasHeaders := false
 		for key, values := range errMsg.Addon {
 			if len(values) == 0 {
 				continue
 			}
-			headerPath := strings.ReplaceAll(strings.ReplaceAll(key, `\\`, `\\\\`), ".", `\\.`)
-			headers, errSet = sjson.SetBytes(headers, headerPath, values[0])
-			if errSet != nil {
-				return nil, errSet
-			}
+			headers[key] = values[0]
 			hasHeaders = true
 		}
 		if hasHeaders {
-			payload, errSet = sjson.SetRawBytes(payload, "headers", headers)
-			if errSet != nil {
-				return nil, errSet
-			}
+			payloadValue["headers"] = headers
 		}
 	}
 
 	if len(body) > 0 && json.Valid(body) {
-		errorNode := gjson.GetBytes(body, "error")
-		if errorNode.Exists() {
-			payload, errSet = sjson.SetRawBytes(payload, "error", []byte(errorNode.Raw))
-		} else {
-			payload, errSet = sjson.SetRawBytes(payload, "error", body)
-		}
-		if errSet != nil {
-			return nil, errSet
-		}
-	}
-
-	if !gjson.GetBytes(payload, "error").Exists() {
-		payload, errSet = sjson.SetBytes(payload, "error.type", "server_error")
-		if errSet != nil {
-			return nil, errSet
-		}
-		payload, errSet = sjson.SetBytes(payload, "error.message", errText)
-		if errSet != nil {
-			return nil, errSet
+		bodyRoot, errParse := jsonutil.ParseObjectBytes(body)
+		if errParse == nil {
+			if errorNode, okError := bodyRoot["error"]; okError {
+				payloadValue["error"] = errorNode
+			} else {
+				payloadValue["error"] = bodyRoot
+			}
 		}
 	}
 
+	if _, ok := payloadValue["error"]; !ok {
+		payloadValue["error"] = map[string]any{
+			"type":    "server_error",
+			"message": errText,
+		}
+	}
+
+	payload, errMarshal := json.Marshal(payloadValue)
+	if errMarshal != nil {
+		return nil, errMarshal
+	}
 	return payload, conn.WriteMessage(websocket.TextMessage, payload)
 }
 
@@ -905,11 +936,87 @@ func appendWebsocketLogBytes(builder *strings.Builder, value []byte, reserveForS
 }
 
 func websocketPayloadEventType(payload []byte) string {
-	eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
+	eventType := strings.TrimSpace(jsonStringFieldBytes(payload, "type"))
 	if eventType == "" {
 		return "-"
 	}
 	return eventType
+}
+
+func responseCompletedOutputFromObject(root map[string]any) []byte {
+	if root == nil {
+		return []byte("[]")
+	}
+	output, ok := jsonutil.Get(root, "response.output")
+	if !ok {
+		return []byte("[]")
+	}
+	array, ok := output.([]any)
+	if !ok {
+		return []byte("[]")
+	}
+	out, errMarshal := json.Marshal(array)
+	if errMarshal != nil {
+		return []byte("[]")
+	}
+	return out
+}
+
+func jsonStringField(root map[string]any, path string) string {
+	if root == nil {
+		return ""
+	}
+	value, ok := jsonutil.Get(root, path)
+	if !ok || value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case json.Number:
+		return typed.String()
+	default:
+		return fmt.Sprint(typed)
+	}
+}
+
+func jsonBoolField(root map[string]any, path string) bool {
+	if root == nil {
+		return false
+	}
+	value, ok := jsonutil.Get(root, path)
+	if !ok {
+		return false
+	}
+	typed, ok := value.(bool)
+	return ok && typed
+}
+
+func jsonStringFieldBytes(payload []byte, path string) string {
+	root, errParse := jsonutil.ParseObjectBytes(payload)
+	if errParse != nil {
+		return ""
+	}
+	return jsonStringField(root, path)
+}
+
+func jsonBoolFieldBytes(payload []byte, path string) bool {
+	root, errParse := jsonutil.ParseObjectBytes(payload)
+	if errParse != nil {
+		return false
+	}
+	return jsonBoolField(root, path)
+}
+
+func deleteJSONPathBytes(payload []byte, path string) []byte {
+	root, errParse := jsonutil.ParseObjectBytes(payload)
+	if errParse != nil {
+		return payload
+	}
+	if errDelete := jsonutil.Delete(root, path); errDelete != nil {
+		return payload
+	}
+	return jsonutil.MarshalOrOriginal(payload, root)
 }
 
 func websocketPayloadPreview(payload []byte) string {

@@ -1,9 +1,5 @@
-// Package claude provides response translation functionality for Claude Code API compatibility.
-// This package handles the conversion of backend client responses into Claude Code-compatible
-// Server-Sent Events (SSE) format, implementing a sophisticated state machine that manages
-// different response types including text content, thinking processes, and function calls.
-// The translation ensures proper sequencing of SSE events and maintains state across
-// multiple response chunks to provide a seamless streaming experience.
+// Package claude provides response translation functionality for Claude Code
+// API compatibility using standard JSON trees.
 package claude
 
 import (
@@ -15,16 +11,12 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	log "github.com/sirupsen/logrus"
-
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
-// Params holds parameters for response conversion and maintains state across streaming chunks.
-// This structure tracks the current state of the response translation process to ensure
-// proper sequencing of SSE events and transitions between different content types.
+// Params holds parameters for response conversion and maintains state across
+// streaming chunks.
 type Params struct {
 	HasFirstResponse     bool   // Indicates if the initial message_start event has been sent
 	ResponseType         int    // Current response type: 0=none, 1=content, 2=thinking, 3=function
@@ -40,31 +32,20 @@ type Params struct {
 	HasSentFinalEvents   bool   // Indicates if final content/message events have been sent
 	HasToolUse           bool   // Indicates if tool use was observed in the stream
 	HasContent           bool   // Tracks whether any content (text, thinking, or tool use) has been output
+	ModelName            string // Cached model name for signature grouping
 
-	// Signature caching support
 	CurrentThinkingText strings.Builder // Accumulates thinking text for signature caching
 }
 
-// toolUseIDCounter provides a process-wide unique counter for tool use identifiers.
+// toolUseIDCounter provides a process-wide unique counter for tool use
+// identifiers.
 var toolUseIDCounter uint64
 
-// ConvertAntigravityResponseToClaude performs sophisticated streaming response format conversion.
-// This function implements a complex state machine that translates backend client responses
-// into Claude Code-compatible Server-Sent Events (SSE) format. It manages different response types
-// and handles state transitions between content blocks, thinking processes, and function calls.
-//
-// Response type states: 0=none, 1=content, 2=thinking, 3=function
-// The function maintains state across multiple calls to ensure proper SSE event sequencing.
-//
-// Parameters:
-//   - ctx: The context for the request, used for cancellation and timeout handling
-//   - modelName: The name of the model being used for the response (unused in current implementation)
-//   - rawJSON: The raw JSON response from the Gemini CLI API
-//   - param: A pointer to a parameter object for maintaining state between calls
-//
-// Returns:
-//   - []string: A slice of strings, each containing a Claude Code-compatible JSON response
+// ConvertAntigravityResponseToClaude translates backend responses into Claude
+// SSE events.
 func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []string {
+	_ = originalRequestRawJSON
+
 	if *param == nil {
 		*param = &Params{
 			HasFirstResponse: false,
@@ -72,218 +53,253 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 			ResponseIndex:    0,
 		}
 	}
-	modelName := gjson.GetBytes(requestRawJSON, "model").String()
-
 	params := (*param).(*Params)
-
-	if bytes.Equal(rawJSON, []byte("[DONE]")) {
-		output := ""
-		// Only send final events if we have actually output content
-		if params.HasContent {
-			appendFinalEvents(params, &output, true)
-			return []string{
-				output + "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n\n",
-			}
+	if params.ModelName == "" {
+		requestRoot := jsonutil.ParseObjectBytesOrEmpty(requestRawJSON)
+		if modelName, ok := jsonutil.String(requestRoot, "model"); ok {
+			params.ModelName = modelName
 		}
-		return []string{}
 	}
 
-	output := ""
+	if bytes.Equal(rawJSON, []byte("[DONE]")) {
+		if !params.HasContent {
+			return []string{}
+		}
 
-	// Initialize the streaming session with a message_start event
-	// This is only sent for the very first response chunk to establish the streaming session
+		var builder strings.Builder
+		appendFinalEvents(params, &builder, true)
+		builder.WriteString(antigravityClaudeEvent("message_stop", map[string]any{
+			"type": "message_stop",
+		}))
+		return []string{builder.String()}
+	}
+
+	root := jsonutil.ParseObjectBytesOrEmpty(rawJSON)
+	responseRoot, _ := jsonutil.Object(root, "response")
+
+	var builder strings.Builder
 	if !params.HasFirstResponse {
-		output = "event: message_start\n"
-
-		// Create the initial message structure with default values according to Claude Code API specification
-		// This follows the Claude Code API specification for streaming message initialization
-		messageStartTemplate := `{"type": "message_start", "message": {"id": "msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY", "type": "message", "role": "assistant", "content": [], "model": "claude-3-5-sonnet-20241022", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 0, "output_tokens": 0}}}`
-
-		// Use cpaUsageMetadata within the message_start event for Claude.
-		if promptTokenCount := gjson.GetBytes(rawJSON, "response.cpaUsageMetadata.promptTokenCount"); promptTokenCount.Exists() {
-			messageStartTemplate, _ = sjson.Set(messageStartTemplate, "message.usage.input_tokens", promptTokenCount.Int())
+		message := map[string]any{
+			"type": "message_start",
+			"message": map[string]any{
+				"id":            "msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY",
+				"type":          "message",
+				"role":          "assistant",
+				"content":       []any{},
+				"model":         "claude-3-5-sonnet-20241022",
+				"stop_reason":   nil,
+				"stop_sequence": nil,
+				"usage": map[string]any{
+					"input_tokens":  int64(0),
+					"output_tokens": int64(0),
+				},
+			},
 		}
-		if candidatesTokenCount := gjson.GetBytes(rawJSON, "response.cpaUsageMetadata.candidatesTokenCount"); candidatesTokenCount.Exists() {
-			messageStartTemplate, _ = sjson.Set(messageStartTemplate, "message.usage.output_tokens", candidatesTokenCount.Int())
+
+		if promptTokenCount, ok := jsonutil.Int64(responseRoot, "cpaUsageMetadata.promptTokenCount"); ok {
+			message["message"].(map[string]any)["usage"].(map[string]any)["input_tokens"] = promptTokenCount
+		}
+		if candidatesTokenCount, ok := jsonutil.Int64(responseRoot, "cpaUsageMetadata.candidatesTokenCount"); ok {
+			message["message"].(map[string]any)["usage"].(map[string]any)["output_tokens"] = candidatesTokenCount
+		}
+		if modelVersion, ok := jsonutil.String(responseRoot, "modelVersion"); ok {
+			message["message"].(map[string]any)["model"] = modelVersion
+		}
+		if responseID, ok := jsonutil.String(responseRoot, "responseId"); ok {
+			message["message"].(map[string]any)["id"] = responseID
 		}
 
-		// Override default values with actual response metadata if available from the Gemini CLI response
-		if modelVersionResult := gjson.GetBytes(rawJSON, "response.modelVersion"); modelVersionResult.Exists() {
-			messageStartTemplate, _ = sjson.Set(messageStartTemplate, "message.model", modelVersionResult.String())
-		}
-		if responseIDResult := gjson.GetBytes(rawJSON, "response.responseId"); responseIDResult.Exists() {
-			messageStartTemplate, _ = sjson.Set(messageStartTemplate, "message.id", responseIDResult.String())
-		}
-		output = output + fmt.Sprintf("data: %s\n\n\n", messageStartTemplate)
-
+		builder.WriteString(antigravityClaudeEvent("message_start", message))
 		params.HasFirstResponse = true
 	}
 
-	// Process the response parts array from the backend client
-	// Each part can contain text content, thinking content, or function calls
-	partsResult := gjson.GetBytes(rawJSON, "response.candidates.0.content.parts")
-	if partsResult.IsArray() {
-		partResults := partsResult.Array()
-		for i := 0; i < len(partResults); i++ {
-			partResult := partResults[i]
+	if parts, ok := jsonutil.Array(responseRoot, "candidates.0.content.parts"); ok {
+		for _, partValue := range parts {
+			part, ok := partValue.(map[string]any)
+			if !ok {
+				continue
+			}
 
-			// Extract the different types of content from each part
-			partTextResult := partResult.Get("text")
-			functionCallResult := partResult.Get("functionCall")
+			partText, hasText := jsonutil.String(part, "text")
+			functionCall, hasFunctionCall := jsonutil.Object(part, "functionCall")
 
-			// Handle text content (both regular content and thinking)
-			if partTextResult.Exists() {
-				// Process thinking content (internal reasoning)
-				if partResult.Get("thought").Bool() {
-					if thoughtSignature := partResult.Get("thoughtSignature"); thoughtSignature.Exists() && thoughtSignature.String() != "" {
-						// log.Debug("Branch: signature_delta")
+			if hasText {
+				isThought, _ := jsonutil.Bool(part, "thought")
+				if isThought {
+					thoughtSignature, _ := jsonutil.String(part, "thoughtSignature")
+					if thoughtSignature == "" {
+						thoughtSignature, _ = jsonutil.String(part, "thought_signature")
+					}
 
+					if thoughtSignature != "" {
 						if params.CurrentThinkingText.Len() > 0 {
-							cache.CacheSignature(modelName, params.CurrentThinkingText.String(), thoughtSignature.String())
-							// log.Debugf("Cached signature for thinking block (textLen=%d)", params.CurrentThinkingText.Len())
+							cache.CacheSignature(params.ModelName, params.CurrentThinkingText.String(), thoughtSignature)
 							params.CurrentThinkingText.Reset()
 						}
 
-						output = output + "event: content_block_delta\n"
-						data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":""}}`, params.ResponseIndex), "delta.signature", fmt.Sprintf("%s#%s", cache.GetModelGroup(modelName), thoughtSignature.String()))
-						output = output + fmt.Sprintf("data: %s\n\n\n", data)
+						builder.WriteString(antigravityClaudeEvent("content_block_delta", map[string]any{
+							"type":  "content_block_delta",
+							"index": params.ResponseIndex,
+							"delta": map[string]any{
+								"type":      "signature_delta",
+								"signature": fmt.Sprintf("%s#%s", cache.GetModelGroup(params.ModelName), thoughtSignature),
+							},
+						}))
 						params.HasContent = true
-					} else if params.ResponseType == 2 { // Continue existing thinking block if already in thinking state
-						params.CurrentThinkingText.WriteString(partTextResult.String())
-						output = output + "event: content_block_delta\n"
-						data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, params.ResponseIndex), "delta.thinking", partTextResult.String())
-						output = output + fmt.Sprintf("data: %s\n\n\n", data)
+						continue
+					}
+
+					if params.ResponseType == 2 {
+						params.CurrentThinkingText.WriteString(partText)
+						builder.WriteString(antigravityClaudeEvent("content_block_delta", map[string]any{
+							"type":  "content_block_delta",
+							"index": params.ResponseIndex,
+							"delta": map[string]any{
+								"type":     "thinking_delta",
+								"thinking": partText,
+							},
+						}))
 						params.HasContent = true
 					} else {
-						// Transition from another state to thinking
-						// First, close any existing content block
 						if params.ResponseType != 0 {
-							if params.ResponseType == 2 {
-								// output = output + "event: content_block_delta\n"
-								// output = output + fmt.Sprintf(`data: {"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":null}}`, params.ResponseIndex)
-								// output = output + "\n\n\n"
-							}
-							output = output + "event: content_block_stop\n"
-							output = output + fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, params.ResponseIndex)
-							output = output + "\n\n\n"
+							builder.WriteString(antigravityClaudeEvent("content_block_stop", map[string]any{
+								"type":  "content_block_stop",
+								"index": params.ResponseIndex,
+							}))
 							params.ResponseIndex++
 						}
 
-						// Start a new thinking content block
-						output = output + "event: content_block_start\n"
-						output = output + fmt.Sprintf(`data: {"type":"content_block_start","index":%d,"content_block":{"type":"thinking","thinking":""}}`, params.ResponseIndex)
-						output = output + "\n\n\n"
-						output = output + "event: content_block_delta\n"
-						data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, params.ResponseIndex), "delta.thinking", partTextResult.String())
-						output = output + fmt.Sprintf("data: %s\n\n\n", data)
-						params.ResponseType = 2 // Set state to thinking
+						builder.WriteString(antigravityClaudeEvent("content_block_start", map[string]any{
+							"type":  "content_block_start",
+							"index": params.ResponseIndex,
+							"content_block": map[string]any{
+								"type":     "thinking",
+								"thinking": "",
+							},
+						}))
+						builder.WriteString(antigravityClaudeEvent("content_block_delta", map[string]any{
+							"type":  "content_block_delta",
+							"index": params.ResponseIndex,
+							"delta": map[string]any{
+								"type":     "thinking_delta",
+								"thinking": partText,
+							},
+						}))
+						params.ResponseType = 2
 						params.HasContent = true
-						// Start accumulating thinking text for signature caching
 						params.CurrentThinkingText.Reset()
-						params.CurrentThinkingText.WriteString(partTextResult.String())
+						params.CurrentThinkingText.WriteString(partText)
 					}
-				} else {
-					finishReasonResult := gjson.GetBytes(rawJSON, "response.candidates.0.finishReason")
-					if partTextResult.String() != "" || !finishReasonResult.Exists() {
-						// Process regular text content (user-visible output)
-						// Continue existing text block if already in content state
-						if params.ResponseType == 1 {
-							output = output + "event: content_block_delta\n"
-							data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, params.ResponseIndex), "delta.text", partTextResult.String())
-							output = output + fmt.Sprintf("data: %s\n\n\n", data)
+					continue
+				}
+
+				if partText != "" || !jsonutil.Exists(responseRoot, "candidates.0.finishReason") {
+					if params.ResponseType == 1 {
+						builder.WriteString(antigravityClaudeEvent("content_block_delta", map[string]any{
+							"type":  "content_block_delta",
+							"index": params.ResponseIndex,
+							"delta": map[string]any{
+								"type": "text_delta",
+								"text": partText,
+							},
+						}))
+						params.HasContent = true
+					} else {
+						if params.ResponseType != 0 {
+							builder.WriteString(antigravityClaudeEvent("content_block_stop", map[string]any{
+								"type":  "content_block_stop",
+								"index": params.ResponseIndex,
+							}))
+							params.ResponseIndex++
+						}
+
+						if partText != "" {
+							builder.WriteString(antigravityClaudeEvent("content_block_start", map[string]any{
+								"type":  "content_block_start",
+								"index": params.ResponseIndex,
+								"content_block": map[string]any{
+									"type": "text",
+									"text": "",
+								},
+							}))
+							builder.WriteString(antigravityClaudeEvent("content_block_delta", map[string]any{
+								"type":  "content_block_delta",
+								"index": params.ResponseIndex,
+								"delta": map[string]any{
+									"type": "text_delta",
+									"text": partText,
+								},
+							}))
+							params.ResponseType = 1
 							params.HasContent = true
-						} else {
-							// Transition from another state to text content
-							// First, close any existing content block
-							if params.ResponseType != 0 {
-								if params.ResponseType == 2 {
-									// output = output + "event: content_block_delta\n"
-									// output = output + fmt.Sprintf(`data: {"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":null}}`, params.ResponseIndex)
-									// output = output + "\n\n\n"
-								}
-								output = output + "event: content_block_stop\n"
-								output = output + fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, params.ResponseIndex)
-								output = output + "\n\n\n"
-								params.ResponseIndex++
-							}
-							if partTextResult.String() != "" {
-								// Start a new text content block
-								output = output + "event: content_block_start\n"
-								output = output + fmt.Sprintf(`data: {"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, params.ResponseIndex)
-								output = output + "\n\n\n"
-								output = output + "event: content_block_delta\n"
-								data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, params.ResponseIndex), "delta.text", partTextResult.String())
-								output = output + fmt.Sprintf("data: %s\n\n\n", data)
-								params.ResponseType = 1 // Set state to content
-								params.HasContent = true
-							}
 						}
 					}
 				}
-			} else if functionCallResult.Exists() {
-				// Handle function/tool calls from the AI model
-				// This processes tool usage requests and formats them for Claude Code API compatibility
-				params.HasToolUse = true
-				fcName := functionCallResult.Get("name").String()
+				continue
+			}
 
-				// Handle state transitions when switching to function calls
-				// Close any existing function call block first
+			if hasFunctionCall {
+				params.HasToolUse = true
+				fcName, _ := jsonutil.String(functionCall, "name")
+
 				if params.ResponseType == 3 {
-					output = output + "event: content_block_stop\n"
-					output = output + fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, params.ResponseIndex)
-					output = output + "\n\n\n"
+					builder.WriteString(antigravityClaudeEvent("content_block_stop", map[string]any{
+						"type":  "content_block_stop",
+						"index": params.ResponseIndex,
+					}))
 					params.ResponseIndex++
 					params.ResponseType = 0
 				}
 
-				// Special handling for thinking state transition
-				if params.ResponseType == 2 {
-					// output = output + "event: content_block_delta\n"
-					// output = output + fmt.Sprintf(`data: {"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":null}}`, params.ResponseIndex)
-					// output = output + "\n\n\n"
-				}
-
-				// Close any other existing content block
 				if params.ResponseType != 0 {
-					output = output + "event: content_block_stop\n"
-					output = output + fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, params.ResponseIndex)
-					output = output + "\n\n\n"
+					builder.WriteString(antigravityClaudeEvent("content_block_stop", map[string]any{
+						"type":  "content_block_stop",
+						"index": params.ResponseIndex,
+					}))
 					params.ResponseIndex++
 				}
 
-				// Start a new tool use content block
-				// This creates the structure for a function call in Claude Code format
-				output = output + "event: content_block_start\n"
+				builder.WriteString(antigravityClaudeEvent("content_block_start", map[string]any{
+					"type":  "content_block_start",
+					"index": params.ResponseIndex,
+					"content_block": map[string]any{
+						"type":  "tool_use",
+						"id":    util.SanitizeClaudeToolID(fmt.Sprintf("%s-%d-%d", fcName, time.Now().UnixNano(), atomic.AddUint64(&toolUseIDCounter, 1))),
+						"name":  fcName,
+						"input": map[string]any{},
+					},
+				}))
 
-				// Create the tool use block with unique ID and function details
-				data := fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`, params.ResponseIndex)
-				data, _ = sjson.Set(data, "content_block.id", util.SanitizeClaudeToolID(fmt.Sprintf("%s-%d-%d", fcName, time.Now().UnixNano(), atomic.AddUint64(&toolUseIDCounter, 1))))
-				data, _ = sjson.Set(data, "content_block.name", fcName)
-				output = output + fmt.Sprintf("data: %s\n\n\n", data)
-
-				if fcArgsResult := functionCallResult.Get("args"); fcArgsResult.Exists() {
-					output = output + "event: content_block_delta\n"
-					data, _ = sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, params.ResponseIndex), "delta.partial_json", fcArgsResult.Raw)
-					output = output + fmt.Sprintf("data: %s\n\n\n", data)
+				if argsValue, ok := jsonutil.Get(functionCall, "args"); ok {
+					builder.WriteString(antigravityClaudeEvent("content_block_delta", map[string]any{
+						"type":  "content_block_delta",
+						"index": params.ResponseIndex,
+						"delta": map[string]any{
+							"type":         "input_json_delta",
+							"partial_json": string(jsonutil.MarshalOrOriginal(nil, argsValue)),
+						},
+					}))
 				}
+
 				params.ResponseType = 3
 				params.HasContent = true
 			}
 		}
 	}
 
-	if finishReasonResult := gjson.GetBytes(rawJSON, "response.candidates.0.finishReason"); finishReasonResult.Exists() {
+	if finishReason, ok := jsonutil.String(responseRoot, "candidates.0.finishReason"); ok {
 		params.HasFinishReason = true
-		params.FinishReason = finishReasonResult.String()
+		params.FinishReason = finishReason
 	}
 
-	if usageResult := gjson.GetBytes(rawJSON, "response.usageMetadata"); usageResult.Exists() {
+	if usageMetadata, ok := jsonutil.Object(responseRoot, "usageMetadata"); ok {
 		params.HasUsageMetadata = true
-		params.CachedTokenCount = usageResult.Get("cachedContentTokenCount").Int()
-		params.PromptTokenCount = usageResult.Get("promptTokenCount").Int() - params.CachedTokenCount
-		params.CandidatesTokenCount = usageResult.Get("candidatesTokenCount").Int()
-		params.ThoughtsTokenCount = usageResult.Get("thoughtsTokenCount").Int()
-		params.TotalTokenCount = usageResult.Get("totalTokenCount").Int()
+		params.CachedTokenCount, _ = jsonutil.Int64(usageMetadata, "cachedContentTokenCount")
+		promptTokenCount, _ := jsonutil.Int64(usageMetadata, "promptTokenCount")
+		params.PromptTokenCount = promptTokenCount - params.CachedTokenCount
+		params.CandidatesTokenCount, _ = jsonutil.Int64(usageMetadata, "candidatesTokenCount")
+		params.ThoughtsTokenCount, _ = jsonutil.Int64(usageMetadata, "thoughtsTokenCount")
+		params.TotalTokenCount, _ = jsonutil.Int64(usageMetadata, "totalTokenCount")
 		if params.CandidatesTokenCount == 0 && params.TotalTokenCount > 0 {
 			params.CandidatesTokenCount = params.TotalTokenCount - params.PromptTokenCount - params.ThoughtsTokenCount
 			if params.CandidatesTokenCount < 0 {
@@ -293,34 +309,31 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 	}
 
 	if params.HasUsageMetadata && params.HasFinishReason {
-		appendFinalEvents(params, &output, false)
+		appendFinalEvents(params, &builder, false)
 	}
 
-	return []string{output}
+	return []string{builder.String()}
 }
 
-func appendFinalEvents(params *Params, output *string, force bool) {
+func appendFinalEvents(params *Params, builder *strings.Builder, force bool) {
 	if params.HasSentFinalEvents {
 		return
 	}
-
 	if !params.HasUsageMetadata && !force {
 		return
 	}
-
-	// Only send final events if we have actually output content
 	if !params.HasContent {
 		return
 	}
 
 	if params.ResponseType != 0 {
-		*output = *output + "event: content_block_stop\n"
-		*output = *output + fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, params.ResponseIndex)
-		*output = *output + "\n\n\n"
+		builder.WriteString(antigravityClaudeEvent("content_block_stop", map[string]any{
+			"type":  "content_block_stop",
+			"index": params.ResponseIndex,
+		}))
 		params.ResponseType = 0
 	}
 
-	stopReason := resolveStopReason(params)
 	usageOutputTokens := params.CandidatesTokenCount + params.ThoughtsTokenCount
 	if usageOutputTokens == 0 && params.TotalTokenCount > 0 {
 		usageOutputTokens = params.TotalTokenCount - params.PromptTokenCount
@@ -329,19 +342,22 @@ func appendFinalEvents(params *Params, output *string, force bool) {
 		}
 	}
 
-	*output = *output + "event: message_delta\n"
-	*output = *output + "data: "
-	delta := fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":"%s","stop_sequence":null},"usage":{"input_tokens":%d,"output_tokens":%d}}`, stopReason, params.PromptTokenCount, usageOutputTokens)
-	// Add cache_read_input_tokens if cached tokens are present (indicates prompt caching is working)
-	if params.CachedTokenCount > 0 {
-		var err error
-		delta, err = sjson.Set(delta, "usage.cache_read_input_tokens", params.CachedTokenCount)
-		if err != nil {
-			log.Warnf("antigravity claude response: failed to set cache_read_input_tokens: %v", err)
-		}
+	messageDelta := map[string]any{
+		"type": "message_delta",
+		"delta": map[string]any{
+			"stop_reason":   resolveStopReason(params),
+			"stop_sequence": nil,
+		},
+		"usage": map[string]any{
+			"input_tokens":  params.PromptTokenCount,
+			"output_tokens": usageOutputTokens,
+		},
 	}
-	*output = *output + delta + "\n\n\n"
+	if params.CachedTokenCount > 0 {
+		messageDelta["usage"].(map[string]any)["cache_read_input_tokens"] = params.CachedTokenCount
+	}
 
+	builder.WriteString(antigravityClaudeEvent("message_delta", messageDelta))
 	params.HasSentFinalEvents = true
 }
 
@@ -360,26 +376,23 @@ func resolveStopReason(params *Params) string {
 	return "end_turn"
 }
 
-// ConvertAntigravityResponseToClaudeNonStream converts a non-streaming Gemini CLI response to a non-streaming Claude response.
-//
-// Parameters:
-//   - ctx: The context for the request.
-//   - modelName: The name of the model.
-//   - rawJSON: The raw JSON response from the Gemini CLI API.
-//   - param: A pointer to a parameter object for the conversion.
-//
-// Returns:
-//   - string: A Claude-compatible JSON response.
+// ConvertAntigravityResponseToClaudeNonStream converts a non-streaming backend
+// response to a non-streaming Claude response.
 func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) string {
 	_ = originalRequestRawJSON
-	modelName := gjson.GetBytes(requestRawJSON, "model").String()
 
-	root := gjson.ParseBytes(rawJSON)
-	promptTokens := root.Get("response.usageMetadata.promptTokenCount").Int()
-	candidateTokens := root.Get("response.usageMetadata.candidatesTokenCount").Int()
-	thoughtTokens := root.Get("response.usageMetadata.thoughtsTokenCount").Int()
-	totalTokens := root.Get("response.usageMetadata.totalTokenCount").Int()
-	cachedTokens := root.Get("response.usageMetadata.cachedContentTokenCount").Int()
+	requestRoot := jsonutil.ParseObjectBytesOrEmpty(requestRawJSON)
+	modelName, _ := jsonutil.String(requestRoot, "model")
+
+	root := jsonutil.ParseObjectBytesOrEmpty(rawJSON)
+	responseRoot, _ := jsonutil.Object(root, "response")
+
+	promptTokens, _ := jsonutil.Int64(responseRoot, "usageMetadata.promptTokenCount")
+	candidateTokens, _ := jsonutil.Int64(responseRoot, "usageMetadata.candidatesTokenCount")
+	thoughtTokens, _ := jsonutil.Int64(responseRoot, "usageMetadata.thoughtsTokenCount")
+	totalTokens, _ := jsonutil.Int64(responseRoot, "usageMetadata.totalTokenCount")
+	cachedTokens, _ := jsonutil.Int64(responseRoot, "usageMetadata.cachedContentTokenCount")
+
 	outputTokens := candidateTokens + thoughtTokens
 	if outputTokens == 0 && totalTokens > 0 {
 		outputTokens = totalTokens - promptTokens
@@ -388,30 +401,30 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 		}
 	}
 
-	responseJSON := `{"id":"","type":"message","role":"assistant","model":"","content":null,"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}`
-	responseJSON, _ = sjson.Set(responseJSON, "id", root.Get("response.responseId").String())
-	responseJSON, _ = sjson.Set(responseJSON, "model", root.Get("response.modelVersion").String())
-	responseJSON, _ = sjson.Set(responseJSON, "usage.input_tokens", promptTokens)
-	responseJSON, _ = sjson.Set(responseJSON, "usage.output_tokens", outputTokens)
-	// Add cache_read_input_tokens if cached tokens are present (indicates prompt caching is working)
+	outRoot := map[string]any{
+		"id":            "",
+		"type":          "message",
+		"role":          "assistant",
+		"model":         "",
+		"content":       nil,
+		"stop_reason":   nil,
+		"stop_sequence": nil,
+		"usage": map[string]any{
+			"input_tokens":  promptTokens,
+			"output_tokens": outputTokens,
+		},
+	}
+	if responseID, ok := jsonutil.String(responseRoot, "responseId"); ok {
+		outRoot["id"] = responseID
+	}
+	if modelVersion, ok := jsonutil.String(responseRoot, "modelVersion"); ok {
+		outRoot["model"] = modelVersion
+	}
 	if cachedTokens > 0 {
-		var err error
-		responseJSON, err = sjson.Set(responseJSON, "usage.cache_read_input_tokens", cachedTokens)
-		if err != nil {
-			log.Warnf("antigravity claude response: failed to set cache_read_input_tokens: %v", err)
-		}
+		outRoot["usage"].(map[string]any)["cache_read_input_tokens"] = cachedTokens
 	}
 
-	contentArrayInitialized := false
-	ensureContentArray := func() {
-		if contentArrayInitialized {
-			return
-		}
-		responseJSON, _ = sjson.SetRaw(responseJSON, "content", "[]")
-		contentArrayInitialized = true
-	}
-
-	parts := root.Get("response.candidates.0.content.parts")
+	contentBlocks := make([]any, 0)
 	textBuilder := strings.Builder{}
 	thinkingBuilder := strings.Builder{}
 	thinkingSignature := ""
@@ -422,10 +435,10 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 		if textBuilder.Len() == 0 {
 			return
 		}
-		ensureContentArray()
-		block := `{"type":"text","text":""}`
-		block, _ = sjson.Set(block, "text", textBuilder.String())
-		responseJSON, _ = sjson.SetRaw(responseJSON, "content.-1", block)
+		contentBlocks = append(contentBlocks, map[string]any{
+			"type": "text",
+			"text": textBuilder.String(),
+		})
 		textBuilder.Reset()
 	}
 
@@ -433,90 +446,100 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 		if thinkingBuilder.Len() == 0 && thinkingSignature == "" {
 			return
 		}
-		ensureContentArray()
-		block := `{"type":"thinking","thinking":""}`
-		block, _ = sjson.Set(block, "thinking", thinkingBuilder.String())
-		if thinkingSignature != "" {
-			block, _ = sjson.Set(block, "signature", fmt.Sprintf("%s#%s", cache.GetModelGroup(modelName), thinkingSignature))
+		block := map[string]any{
+			"type":     "thinking",
+			"thinking": thinkingBuilder.String(),
 		}
-		responseJSON, _ = sjson.SetRaw(responseJSON, "content.-1", block)
+		if thinkingSignature != "" {
+			block["signature"] = fmt.Sprintf("%s#%s", cache.GetModelGroup(modelName), thinkingSignature)
+		}
+		contentBlocks = append(contentBlocks, block)
 		thinkingBuilder.Reset()
 		thinkingSignature = ""
 	}
 
-	if parts.IsArray() {
-		for _, part := range parts.Array() {
-			isThought := part.Get("thought").Bool()
-			if isThought {
-				sig := part.Get("thoughtSignature")
-				if !sig.Exists() {
-					sig = part.Get("thought_signature")
-				}
-				if sig.Exists() && sig.String() != "" {
-					thinkingSignature = sig.String()
-				}
-			}
-
-			if text := part.Get("text"); text.Exists() && text.String() != "" {
-				if isThought {
-					flushText()
-					thinkingBuilder.WriteString(text.String())
-					continue
-				}
-				flushThinking()
-				textBuilder.WriteString(text.String())
+	if parts, ok := jsonutil.Array(responseRoot, "candidates.0.content.parts"); ok {
+		for _, partValue := range parts {
+			part, ok := partValue.(map[string]any)
+			if !ok {
 				continue
 			}
 
-			if functionCall := part.Get("functionCall"); functionCall.Exists() {
+			isThought, _ := jsonutil.Bool(part, "thought")
+			if isThought {
+				signature, _ := jsonutil.String(part, "thoughtSignature")
+				if signature == "" {
+					signature, _ = jsonutil.String(part, "thought_signature")
+				}
+				if signature != "" {
+					thinkingSignature = signature
+				}
+			}
+
+			if text, ok := jsonutil.String(part, "text"); ok && text != "" {
+				if isThought {
+					flushText()
+					thinkingBuilder.WriteString(text)
+					continue
+				}
+				flushThinking()
+				textBuilder.WriteString(text)
+				continue
+			}
+
+			if functionCall, ok := jsonutil.Object(part, "functionCall"); ok {
 				flushThinking()
 				flushText()
 				hasToolCall = true
 
-				name := functionCall.Get("name").String()
+				name, _ := jsonutil.String(functionCall, "name")
 				toolIDCounter++
-				toolBlock := `{"type":"tool_use","id":"","name":"","input":{}}`
-				toolBlock, _ = sjson.Set(toolBlock, "id", fmt.Sprintf("tool_%d", toolIDCounter))
-				toolBlock, _ = sjson.Set(toolBlock, "name", name)
-
-				if args := functionCall.Get("args"); args.Exists() && args.Raw != "" && gjson.Valid(args.Raw) && args.IsObject() {
-					toolBlock, _ = sjson.SetRaw(toolBlock, "input", args.Raw)
+				toolBlock := map[string]any{
+					"type":  "tool_use",
+					"id":    fmt.Sprintf("tool_%d", toolIDCounter),
+					"name":  name,
+					"input": map[string]any{},
 				}
-
-				ensureContentArray()
-				responseJSON, _ = sjson.SetRaw(responseJSON, "content.-1", toolBlock)
-				continue
+				if argsValue, ok := jsonutil.Get(functionCall, "args"); ok {
+					if argsObject, ok := argsValue.(map[string]any); ok {
+						toolBlock["input"] = argsObject
+					}
+				}
+				contentBlocks = append(contentBlocks, toolBlock)
 			}
 		}
 	}
 
 	flushThinking()
 	flushText()
+	if len(contentBlocks) > 0 {
+		outRoot["content"] = contentBlocks
+	}
 
 	stopReason := "end_turn"
 	if hasToolCall {
 		stopReason = "tool_use"
-	} else {
-		if finish := root.Get("response.candidates.0.finishReason"); finish.Exists() {
-			switch finish.String() {
-			case "MAX_TOKENS":
-				stopReason = "max_tokens"
-			case "STOP", "FINISH_REASON_UNSPECIFIED", "UNKNOWN":
-				stopReason = "end_turn"
-			default:
-				stopReason = "end_turn"
-			}
+	} else if finishReason, ok := jsonutil.String(responseRoot, "candidates.0.finishReason"); ok {
+		switch finishReason {
+		case "MAX_TOKENS":
+			stopReason = "max_tokens"
+		case "STOP", "FINISH_REASON_UNSPECIFIED", "UNKNOWN":
+			stopReason = "end_turn"
+		default:
+			stopReason = "end_turn"
 		}
 	}
-	responseJSON, _ = sjson.Set(responseJSON, "stop_reason", stopReason)
+	outRoot["stop_reason"] = stopReason
 
-	if promptTokens == 0 && outputTokens == 0 {
-		if usageMeta := root.Get("response.usageMetadata"); !usageMeta.Exists() {
-			responseJSON, _ = sjson.Delete(responseJSON, "usage")
-		}
+	if promptTokens == 0 && outputTokens == 0 && !jsonutil.Exists(responseRoot, "usageMetadata") {
+		delete(outRoot, "usage")
 	}
 
-	return responseJSON
+	return string(jsonutil.MarshalOrOriginal(rawJSON, outRoot))
+}
+
+func antigravityClaudeEvent(event string, payload map[string]any) string {
+	return fmt.Sprintf("event: %s\ndata: %s\n\n\n", event, string(jsonutil.MarshalOrOriginal(nil, payload)))
 }
 
 func ClaudeTokenCount(ctx context.Context, count int64) string {

@@ -9,10 +9,9 @@ package antigravity
 import (
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // Applier applies thinking configuration for Antigravity API format.
@@ -46,10 +45,6 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		return body, nil
 	}
 
-	if len(body) == 0 || !gjson.ValidBytes(body) {
-		body = []byte(`{}`)
-	}
-
 	isClaude := strings.Contains(strings.ToLower(modelInfo.ID), "claude")
 
 	// ModeAuto: Always use Budget format with thinkingBudget=-1
@@ -73,10 +68,6 @@ func (a *Applier) applyCompatible(body []byte, config thinking.ThinkingConfig, m
 		return body, nil
 	}
 
-	if len(body) == 0 || !gjson.ValidBytes(body) {
-		body = []byte(`{}`)
-	}
-
 	isClaude := false
 	if modelInfo != nil {
 		isClaude = strings.Contains(strings.ToLower(modelInfo.ID), "claude")
@@ -94,19 +85,22 @@ func (a *Applier) applyCompatible(body []byte, config thinking.ThinkingConfig, m
 }
 
 func (a *Applier) applyLevelFormat(body []byte, config thinking.ThinkingConfig) ([]byte, error) {
+	root := jsonutil.ParseObjectBytesOrEmpty(body)
+	includeThoughts, includeThoughtsSet := readIncludeThoughts(root, "request.generationConfig.thinkingConfig")
+
 	// Remove conflicting fields to avoid both thinkingLevel and thinkingBudget in output
-	result, _ := sjson.DeleteBytes(body, "request.generationConfig.thinkingConfig.thinkingBudget")
-	result, _ = sjson.DeleteBytes(result, "request.generationConfig.thinkingConfig.thinking_budget")
-	result, _ = sjson.DeleteBytes(result, "request.generationConfig.thinkingConfig.thinking_level")
+	_ = jsonutil.Delete(root, "request.generationConfig.thinkingConfig.thinkingBudget")
+	_ = jsonutil.Delete(root, "request.generationConfig.thinkingConfig.thinking_budget")
+	_ = jsonutil.Delete(root, "request.generationConfig.thinkingConfig.thinking_level")
 	// Normalize includeThoughts field name to avoid oneof conflicts in upstream JSON parsing.
-	result, _ = sjson.DeleteBytes(result, "request.generationConfig.thinkingConfig.include_thoughts")
+	_ = jsonutil.Delete(root, "request.generationConfig.thinkingConfig.include_thoughts")
 
 	if config.Mode == thinking.ModeNone {
-		result, _ = sjson.SetBytes(result, "request.generationConfig.thinkingConfig.includeThoughts", false)
+		_ = jsonutil.Set(root, "request.generationConfig.thinkingConfig.includeThoughts", false)
 		if config.Level != "" {
-			result, _ = sjson.SetBytes(result, "request.generationConfig.thinkingConfig.thinkingLevel", string(config.Level))
+			_ = jsonutil.Set(root, "request.generationConfig.thinkingConfig.thinkingLevel", string(config.Level))
 		}
-		return result, nil
+		return jsonutil.MarshalOrOriginal(body, root), nil
 	}
 
 	// Only handle ModeLevel - budget conversion should be done by upper layer
@@ -115,36 +109,37 @@ func (a *Applier) applyLevelFormat(body []byte, config thinking.ThinkingConfig) 
 	}
 
 	level := string(config.Level)
-	result, _ = sjson.SetBytes(result, "request.generationConfig.thinkingConfig.thinkingLevel", level)
+	_ = jsonutil.Set(root, "request.generationConfig.thinkingConfig.thinkingLevel", level)
 
 	// Respect user's explicit includeThoughts setting from original body; default to true if not set
 	// Support both camelCase and snake_case variants
-	includeThoughts := true
-	if inc := gjson.GetBytes(body, "request.generationConfig.thinkingConfig.includeThoughts"); inc.Exists() {
-		includeThoughts = inc.Bool()
-	} else if inc := gjson.GetBytes(body, "request.generationConfig.thinkingConfig.include_thoughts"); inc.Exists() {
-		includeThoughts = inc.Bool()
+	if !includeThoughtsSet {
+		includeThoughts = true
 	}
-	result, _ = sjson.SetBytes(result, "request.generationConfig.thinkingConfig.includeThoughts", includeThoughts)
-	return result, nil
+	_ = jsonutil.Set(root, "request.generationConfig.thinkingConfig.includeThoughts", includeThoughts)
+	return jsonutil.MarshalOrOriginal(body, root), nil
 }
 
 func (a *Applier) applyBudgetFormat(body []byte, config thinking.ThinkingConfig, modelInfo *registry.ModelInfo, isClaude bool) ([]byte, error) {
+	root := jsonutil.ParseObjectBytesOrEmpty(body)
+	includeThoughts, userSetIncludeThoughts := readIncludeThoughts(root, "request.generationConfig.thinkingConfig")
+
 	// Remove conflicting fields to avoid both thinkingLevel and thinkingBudget in output
-	result, _ := sjson.DeleteBytes(body, "request.generationConfig.thinkingConfig.thinkingLevel")
-	result, _ = sjson.DeleteBytes(result, "request.generationConfig.thinkingConfig.thinking_level")
-	result, _ = sjson.DeleteBytes(result, "request.generationConfig.thinkingConfig.thinking_budget")
+	_ = jsonutil.Delete(root, "request.generationConfig.thinkingConfig.thinkingLevel")
+	_ = jsonutil.Delete(root, "request.generationConfig.thinkingConfig.thinking_level")
+	_ = jsonutil.Delete(root, "request.generationConfig.thinkingConfig.thinking_budget")
 	// Normalize includeThoughts field name to avoid oneof conflicts in upstream JSON parsing.
-	result, _ = sjson.DeleteBytes(result, "request.generationConfig.thinkingConfig.include_thoughts")
+	_ = jsonutil.Delete(root, "request.generationConfig.thinkingConfig.include_thoughts")
 
 	budget := config.Budget
 
 	// Apply Claude-specific constraints first to get the final budget value
 	if isClaude && modelInfo != nil {
-		budget, result = a.normalizeClaudeBudget(budget, result, modelInfo)
+		removed := false
+		budget, removed = a.normalizeClaudeBudget(root, budget, modelInfo)
 		// Check if budget was removed entirely
-		if budget == -2 {
-			return result, nil
+		if removed {
+			return jsonutil.MarshalOrOriginal(body, root), nil
 		}
 	}
 
@@ -152,23 +147,13 @@ func (a *Applier) applyBudgetFormat(body []byte, config thinking.ThinkingConfig,
 	// This ensures that when user requests budget=0 (disable thinking output),
 	// the includeThoughts is correctly set to false even if budget is clamped to min.
 	if config.Mode == thinking.ModeNone {
-		result, _ = sjson.SetBytes(result, "request.generationConfig.thinkingConfig.thinkingBudget", budget)
-		result, _ = sjson.SetBytes(result, "request.generationConfig.thinkingConfig.includeThoughts", false)
-		return result, nil
+		_ = jsonutil.Set(root, "request.generationConfig.thinkingConfig.thinkingBudget", budget)
+		_ = jsonutil.Set(root, "request.generationConfig.thinkingConfig.includeThoughts", false)
+		return jsonutil.MarshalOrOriginal(body, root), nil
 	}
 
 	// Determine includeThoughts: respect user's explicit setting from original body if provided
 	// Support both camelCase and snake_case variants
-	var includeThoughts bool
-	var userSetIncludeThoughts bool
-	if inc := gjson.GetBytes(body, "request.generationConfig.thinkingConfig.includeThoughts"); inc.Exists() {
-		includeThoughts = inc.Bool()
-		userSetIncludeThoughts = true
-	} else if inc := gjson.GetBytes(body, "request.generationConfig.thinkingConfig.include_thoughts"); inc.Exists() {
-		includeThoughts = inc.Bool()
-		userSetIncludeThoughts = true
-	}
-
 	if !userSetIncludeThoughts {
 		// No explicit setting, use default logic based on mode
 		switch config.Mode {
@@ -179,9 +164,9 @@ func (a *Applier) applyBudgetFormat(body []byte, config thinking.ThinkingConfig,
 		}
 	}
 
-	result, _ = sjson.SetBytes(result, "request.generationConfig.thinkingConfig.thinkingBudget", budget)
-	result, _ = sjson.SetBytes(result, "request.generationConfig.thinkingConfig.includeThoughts", includeThoughts)
-	return result, nil
+	_ = jsonutil.Set(root, "request.generationConfig.thinkingConfig.thinkingBudget", budget)
+	_ = jsonutil.Set(root, "request.generationConfig.thinkingConfig.includeThoughts", includeThoughts)
+	return jsonutil.MarshalOrOriginal(body, root), nil
 }
 
 // normalizeClaudeBudget applies Claude-specific constraints to thinking budget.
@@ -190,15 +175,14 @@ func (a *Applier) applyBudgetFormat(body []byte, config thinking.ThinkingConfig,
 //   - Ensuring thinking budget < max_tokens
 //   - Removing thinkingConfig if budget < minimum allowed
 //
-// Returns the normalized budget and updated payload.
-// Returns budget=-2 as a sentinel indicating thinkingConfig was removed entirely.
-func (a *Applier) normalizeClaudeBudget(budget int, payload []byte, modelInfo *registry.ModelInfo) (int, []byte) {
+// Returns the normalized budget and whether thinkingConfig was removed entirely.
+func (a *Applier) normalizeClaudeBudget(root map[string]any, budget int, modelInfo *registry.ModelInfo) (int, bool) {
 	if modelInfo == nil {
-		return budget, payload
+		return budget, false
 	}
 
 	// Get effective max tokens
-	effectiveMax, setDefaultMax := a.effectiveMaxTokens(payload, modelInfo)
+	effectiveMax, setDefaultMax := a.effectiveMaxTokens(root, modelInfo)
 	if effectiveMax > 0 && budget >= effectiveMax {
 		budget = effectiveMax - 1
 	}
@@ -210,27 +194,37 @@ func (a *Applier) normalizeClaudeBudget(budget int, payload []byte, modelInfo *r
 	}
 	if minBudget > 0 && budget >= 0 && budget < minBudget {
 		// Budget is below minimum, remove thinking config entirely
-		payload, _ = sjson.DeleteBytes(payload, "request.generationConfig.thinkingConfig")
-		return -2, payload
+		_ = jsonutil.Delete(root, "request.generationConfig.thinkingConfig")
+		return 0, true
 	}
 
 	// Set default max tokens if needed
 	if setDefaultMax && effectiveMax > 0 {
-		payload, _ = sjson.SetBytes(payload, "request.generationConfig.maxOutputTokens", effectiveMax)
+		_ = jsonutil.Set(root, "request.generationConfig.maxOutputTokens", effectiveMax)
 	}
 
-	return budget, payload
+	return budget, false
 }
 
 // effectiveMaxTokens returns the max tokens to cap thinking:
 // prefer request-provided maxOutputTokens; otherwise fall back to model default.
 // The boolean indicates whether the value came from the model default (and thus should be written back).
-func (a *Applier) effectiveMaxTokens(payload []byte, modelInfo *registry.ModelInfo) (max int, fromModel bool) {
-	if maxTok := gjson.GetBytes(payload, "request.generationConfig.maxOutputTokens"); maxTok.Exists() && maxTok.Int() > 0 {
-		return int(maxTok.Int()), false
+func (a *Applier) effectiveMaxTokens(root map[string]any, modelInfo *registry.ModelInfo) (max int, fromModel bool) {
+	if maxTok, ok := jsonutil.Int64(root, "request.generationConfig.maxOutputTokens"); ok && maxTok > 0 {
+		return int(maxTok), false
 	}
 	if modelInfo != nil && modelInfo.MaxCompletionTokens > 0 {
 		return modelInfo.MaxCompletionTokens, true
 	}
 	return 0, false
+}
+
+func readIncludeThoughts(root map[string]any, basePath string) (bool, bool) {
+	if includeThoughts, ok := jsonutil.Bool(root, basePath+".includeThoughts"); ok {
+		return includeThoughts, true
+	}
+	if includeThoughts, ok := jsonutil.Bool(root, basePath+".include_thoughts"); ok {
+		return includeThoughts, true
+	}
+	return false, false
 }

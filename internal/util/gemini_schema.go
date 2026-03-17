@@ -2,16 +2,16 @@
 package util
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 )
 
-var gjsonPathKeyReplacer = strings.NewReplacer(".", "\\.", "*", "\\*", "?", "\\?")
+var jsonPathKeyReplacer = strings.NewReplacer(".", "\\.", "*", "\\*", "?", "\\?")
 
 const placeholderReasonDescription = "Brief explanation of why you are calling this tool"
 
@@ -30,39 +30,45 @@ func CleanJSONSchemaForGemini(jsonStr string) string {
 
 // cleanJSONSchema performs the core cleaning operations on the JSON schema.
 func cleanJSONSchema(jsonStr string, addPlaceholder bool) string {
+	root, errParse := jsonutil.ParseAnyBytes([]byte(jsonStr))
+	if errParse != nil {
+		return jsonStr
+	}
+
 	// Phase 1: Convert and add hints
-	jsonStr = convertRefsToHints(jsonStr)
-	jsonStr = convertConstToEnum(jsonStr)
-	jsonStr = convertEnumValuesToStrings(jsonStr)
-	jsonStr = addEnumHints(jsonStr)
-	jsonStr = addAdditionalPropertiesHints(jsonStr)
-	jsonStr = moveConstraintsToDescription(jsonStr)
+	root = convertRefsToHints(root)
+	root = convertConstToEnum(root)
+	root = convertEnumValuesToStrings(root)
+	root = addEnumHints(root)
+	root = addAdditionalPropertiesHints(root)
+	root = moveConstraintsToDescription(root)
 
 	// Phase 2: Flatten complex structures
-	jsonStr = mergeAllOf(jsonStr)
-	jsonStr = flattenAnyOfOneOf(jsonStr)
-	jsonStr = flattenTypeArrays(jsonStr)
+	root = mergeAllOf(root)
+	root = flattenAnyOfOneOf(root)
+	root = flattenTypeArrays(root)
 
 	// Phase 3: Cleanup
-	jsonStr = removeUnsupportedKeywords(jsonStr)
+	root = removeUnsupportedKeywords(root)
 	if !addPlaceholder {
 		// Gemini schema cleanup: remove nullable/title and placeholder-only fields.
-		jsonStr = removeKeywords(jsonStr, []string{"nullable", "title"})
-		jsonStr = removePlaceholderFields(jsonStr)
+		root = removeKeywords(root, []string{"nullable", "title"})
+		root = removePlaceholderFields(root)
 	}
-	jsonStr = cleanupRequiredFields(jsonStr)
+	root = cleanupRequiredFields(root)
+
 	// Phase 4: Add placeholder for empty object schemas (Claude VALIDATED mode requirement)
 	if addPlaceholder {
-		jsonStr = addEmptySchemaPlaceholder(jsonStr)
+		root = addEmptySchemaPlaceholder(root)
 	}
 
-	return jsonStr
+	return string(jsonutil.MarshalOrOriginal([]byte(jsonStr), root))
 }
 
 // removeKeywords removes all occurrences of specified keywords from the JSON schema.
-func removeKeywords(jsonStr string, keywords []string) string {
+func removeKeywords(root any, keywords []string) any {
 	deletePaths := make([]string, 0)
-	pathsByField := findPathsByFields(jsonStr, keywords)
+	pathsByField := findPathsByFields(root, keywords)
 	for _, key := range keywords {
 		for _, p := range pathsByField[key] {
 			if isPropertyDefinition(trimSuffix(p, "."+key)) {
@@ -73,83 +79,87 @@ func removeKeywords(jsonStr string, keywords []string) string {
 	}
 	sortByDepth(deletePaths)
 	for _, p := range deletePaths {
-		jsonStr, _ = sjson.Delete(jsonStr, p)
+		root = deleteAt(root, p)
 	}
-	return jsonStr
+	return root
 }
 
 // removePlaceholderFields removes placeholder-only properties ("_" and "reason") and their required entries.
-func removePlaceholderFields(jsonStr string) string {
+func removePlaceholderFields(root any) any {
 	// Remove "_" placeholder properties.
-	paths := findPaths(jsonStr, "_")
+	paths := findPaths(root, "_")
 	sortByDepth(paths)
 	for _, p := range paths {
 		if !strings.HasSuffix(p, ".properties._") {
 			continue
 		}
-		jsonStr, _ = sjson.Delete(jsonStr, p)
+		root = deleteAt(root, p)
 		parentPath := trimSuffix(p, ".properties._")
 		reqPath := joinPath(parentPath, "required")
-		req := gjson.Get(jsonStr, reqPath)
-		if req.IsArray() {
-			var filtered []string
-			for _, r := range req.Array() {
-				if r.String() != "_" {
-					filtered = append(filtered, r.String())
-				}
+		req := getStrings(root, reqPath)
+		if len(req) == 0 {
+			continue
+		}
+
+		filtered := make([]string, 0, len(req))
+		for _, required := range req {
+			if required != "_" {
+				filtered = append(filtered, required)
 			}
-			if len(filtered) == 0 {
-				jsonStr, _ = sjson.Delete(jsonStr, reqPath)
-			} else {
-				jsonStr, _ = sjson.Set(jsonStr, reqPath, filtered)
-			}
+		}
+		if len(filtered) == 0 {
+			root = deleteAt(root, reqPath)
+		} else {
+			root = setValueAt(root, reqPath, toAnyStrings(filtered))
 		}
 	}
 
 	// Remove placeholder-only "reason" objects.
-	reasonPaths := findPaths(jsonStr, "reason")
+	reasonPaths := findPaths(root, "reason")
 	sortByDepth(reasonPaths)
 	for _, p := range reasonPaths {
 		if !strings.HasSuffix(p, ".properties.reason") {
 			continue
 		}
 		parentPath := trimSuffix(p, ".properties.reason")
-		props := gjson.Get(jsonStr, joinPath(parentPath, "properties"))
-		if !props.IsObject() || len(props.Map()) != 1 {
+		props, okProps := jsonutil.Object(root, joinPath(parentPath, "properties"))
+		if !okProps || len(props) != 1 {
 			continue
 		}
-		desc := gjson.Get(jsonStr, p+".description").String()
+		desc, _ := jsonutil.String(root, p+".description")
 		if desc != placeholderReasonDescription {
 			continue
 		}
-		jsonStr, _ = sjson.Delete(jsonStr, p)
+		root = deleteAt(root, p)
 		reqPath := joinPath(parentPath, "required")
-		req := gjson.Get(jsonStr, reqPath)
-		if req.IsArray() {
-			var filtered []string
-			for _, r := range req.Array() {
-				if r.String() != "reason" {
-					filtered = append(filtered, r.String())
-				}
+		req := getStrings(root, reqPath)
+		if len(req) == 0 {
+			continue
+		}
+
+		filtered := make([]string, 0, len(req))
+		for _, required := range req {
+			if required != "reason" {
+				filtered = append(filtered, required)
 			}
-			if len(filtered) == 0 {
-				jsonStr, _ = sjson.Delete(jsonStr, reqPath)
-			} else {
-				jsonStr, _ = sjson.Set(jsonStr, reqPath, filtered)
-			}
+		}
+		if len(filtered) == 0 {
+			root = deleteAt(root, reqPath)
+		} else {
+			root = setValueAt(root, reqPath, toAnyStrings(filtered))
 		}
 	}
 
-	return jsonStr
+	return root
 }
 
 // convertRefsToHints converts $ref to description hints (Lazy Hint strategy).
-func convertRefsToHints(jsonStr string) string {
-	paths := findPaths(jsonStr, "$ref")
+func convertRefsToHints(root any) any {
+	paths := findPaths(root, "$ref")
 	sortByDepth(paths)
 
 	for _, p := range paths {
-		refVal := gjson.Get(jsonStr, p).String()
+		refVal, _ := jsonutil.String(root, p)
 		defName := refVal
 		if idx := strings.LastIndex(refVal, "/"); idx >= 0 {
 			defName = refVal[idx+1:]
@@ -157,81 +167,86 @@ func convertRefsToHints(jsonStr string) string {
 
 		parentPath := trimSuffix(p, ".$ref")
 		hint := fmt.Sprintf("See: %s", defName)
-		if existing := gjson.Get(jsonStr, descriptionPath(parentPath)).String(); existing != "" {
+		if existing, okExisting := jsonutil.String(root, descriptionPath(parentPath)); okExisting && existing != "" {
 			hint = fmt.Sprintf("%s (%s)", existing, hint)
 		}
 
-		replacement := `{"type":"object","description":""}`
-		replacement, _ = sjson.Set(replacement, "description", hint)
-		jsonStr = setRawAt(jsonStr, parentPath, replacement)
+		root = setValueAt(root, parentPath, map[string]any{
+			"type":        "object",
+			"description": hint,
+		})
 	}
-	return jsonStr
+	return root
 }
 
-func convertConstToEnum(jsonStr string) string {
-	for _, p := range findPaths(jsonStr, "const") {
-		val := gjson.Get(jsonStr, p)
-		if !val.Exists() {
+func convertConstToEnum(root any) any {
+	for _, p := range findPaths(root, "const") {
+		val, ok := jsonutil.Get(root, p)
+		if !ok {
 			continue
 		}
 		enumPath := trimSuffix(p, ".const") + ".enum"
-		if !gjson.Get(jsonStr, enumPath).Exists() {
-			jsonStr, _ = sjson.Set(jsonStr, enumPath, []interface{}{val.Value()})
+		if !jsonutil.Exists(root, enumPath) {
+			root = setValueAt(root, enumPath, []any{val})
 		}
 	}
-	return jsonStr
+	return root
 }
 
 // convertEnumValuesToStrings ensures all enum values are strings and the schema type is set to string.
 // Gemini API requires enum values to be of type string, not numbers or booleans.
-func convertEnumValuesToStrings(jsonStr string) string {
-	for _, p := range findPaths(jsonStr, "enum") {
-		arr := gjson.Get(jsonStr, p)
-		if !arr.IsArray() {
+func convertEnumValuesToStrings(root any) any {
+	for _, p := range findPaths(root, "enum") {
+		arr, ok := jsonutil.Array(root, p)
+		if !ok {
 			continue
 		}
 
-		var stringVals []string
-		for _, item := range arr.Array() {
-			stringVals = append(stringVals, item.String())
+		stringVals := make([]string, 0, len(arr))
+		for _, item := range arr {
+			stringVals = append(stringVals, jsonValueString(item))
 		}
 
 		// Always update enum values to strings and set type to "string"
 		// This ensures compatibility with Antigravity Gemini which only allows enum for STRING type
-		jsonStr, _ = sjson.Set(jsonStr, p, stringVals)
+		root = setValueAt(root, p, toAnyStrings(stringVals))
 		parentPath := trimSuffix(p, ".enum")
-		jsonStr, _ = sjson.Set(jsonStr, joinPath(parentPath, "type"), "string")
+		root = setValueAt(root, joinPath(parentPath, "type"), "string")
 	}
-	return jsonStr
+	return root
 }
 
-func addEnumHints(jsonStr string) string {
-	for _, p := range findPaths(jsonStr, "enum") {
-		arr := gjson.Get(jsonStr, p)
-		if !arr.IsArray() {
+func addEnumHints(root any) any {
+	for _, p := range findPaths(root, "enum") {
+		arr, ok := jsonutil.Array(root, p)
+		if !ok {
 			continue
 		}
-		items := arr.Array()
-		if len(items) <= 1 || len(items) > 10 {
+		if len(arr) <= 1 || len(arr) > 10 {
 			continue
 		}
 
-		var vals []string
-		for _, item := range items {
-			vals = append(vals, item.String())
+		vals := make([]string, 0, len(arr))
+		for _, item := range arr {
+			vals = append(vals, jsonValueString(item))
 		}
-		jsonStr = appendHint(jsonStr, trimSuffix(p, ".enum"), "Allowed: "+strings.Join(vals, ", "))
+		root = appendHint(root, trimSuffix(p, ".enum"), "Allowed: "+strings.Join(vals, ", "))
 	}
-	return jsonStr
+	return root
 }
 
-func addAdditionalPropertiesHints(jsonStr string) string {
-	for _, p := range findPaths(jsonStr, "additionalProperties") {
-		if gjson.Get(jsonStr, p).Type == gjson.False {
-			jsonStr = appendHint(jsonStr, trimSuffix(p, ".additionalProperties"), "No extra properties allowed")
+func addAdditionalPropertiesHints(root any) any {
+	for _, p := range findPaths(root, "additionalProperties") {
+		value, ok := jsonutil.Get(root, p)
+		if !ok {
+			continue
+		}
+		boolean, okBool := value.(bool)
+		if okBool && !boolean {
+			root = appendHint(root, trimSuffix(p, ".additionalProperties"), "No extra properties allowed")
 		}
 	}
-	return jsonStr
+	return root
 }
 
 var unsupportedConstraints = []string{
@@ -240,76 +255,82 @@ var unsupportedConstraints = []string{
 	"default", "examples", // Claude rejects these in VALIDATED mode
 }
 
-func moveConstraintsToDescription(jsonStr string) string {
-	pathsByField := findPathsByFields(jsonStr, unsupportedConstraints)
+func moveConstraintsToDescription(root any) any {
+	pathsByField := findPathsByFields(root, unsupportedConstraints)
 	for _, key := range unsupportedConstraints {
 		for _, p := range pathsByField[key] {
-			val := gjson.Get(jsonStr, p)
-			if !val.Exists() || val.IsObject() || val.IsArray() {
+			val, ok := jsonutil.Get(root, p)
+			if !ok || isJSONObject(val) || isJSONArray(val) {
 				continue
 			}
 			parentPath := trimSuffix(p, "."+key)
 			if isPropertyDefinition(parentPath) {
 				continue
 			}
-			jsonStr = appendHint(jsonStr, parentPath, fmt.Sprintf("%s: %s", key, val.String()))
+			root = appendHint(root, parentPath, fmt.Sprintf("%s: %s", key, jsonValueString(val)))
 		}
 	}
-	return jsonStr
+	return root
 }
 
-func mergeAllOf(jsonStr string) string {
-	paths := findPaths(jsonStr, "allOf")
+func mergeAllOf(root any) any {
+	paths := findPaths(root, "allOf")
 	sortByDepth(paths)
 
 	for _, p := range paths {
-		allOf := gjson.Get(jsonStr, p)
-		if !allOf.IsArray() {
+		allOf, ok := jsonutil.Array(root, p)
+		if !ok {
 			continue
 		}
 		parentPath := trimSuffix(p, ".allOf")
 
-		for _, item := range allOf.Array() {
-			if props := item.Get("properties"); props.IsObject() {
-				props.ForEach(func(key, value gjson.Result) bool {
-					destPath := joinPath(parentPath, "properties."+escapeGJSONPathKey(key.String()))
-					jsonStr, _ = sjson.SetRaw(jsonStr, destPath, value.Raw)
-					return true
-				})
+		for _, item := range allOf {
+			itemObj, okItem := item.(map[string]any)
+			if !okItem {
+				continue
 			}
-			if req := item.Get("required"); req.IsArray() {
+
+			if props, okProps := itemObj["properties"].(map[string]any); okProps {
+				for key, value := range props {
+					destPath := joinPath(parentPath, "properties."+escapeGJSONPathKey(key))
+					root = setValueAt(root, destPath, value)
+				}
+			}
+
+			if req, okReq := itemObj["required"].([]any); okReq {
 				reqPath := joinPath(parentPath, "required")
-				current := getStrings(jsonStr, reqPath)
-				for _, r := range req.Array() {
-					if s := r.String(); !contains(current, s) {
+				current := getStrings(root, reqPath)
+				for _, required := range req {
+					s := jsonValueString(required)
+					if s != "" && !contains(current, s) {
 						current = append(current, s)
 					}
 				}
-				jsonStr, _ = sjson.Set(jsonStr, reqPath, current)
+				root = setValueAt(root, reqPath, toAnyStrings(current))
 			}
 		}
-		jsonStr, _ = sjson.Delete(jsonStr, p)
+
+		root = deleteAt(root, p)
 	}
-	return jsonStr
+	return root
 }
 
-func flattenAnyOfOneOf(jsonStr string) string {
+func flattenAnyOfOneOf(root any) any {
 	for _, key := range []string{"anyOf", "oneOf"} {
-		paths := findPaths(jsonStr, key)
+		paths := findPaths(root, key)
 		sortByDepth(paths)
 
 		for _, p := range paths {
-			arr := gjson.Get(jsonStr, p)
-			if !arr.IsArray() || len(arr.Array()) == 0 {
+			arr, ok := jsonutil.Array(root, p)
+			if !ok || len(arr) == 0 {
 				continue
 			}
 
 			parentPath := trimSuffix(p, "."+key)
-			parentDesc := gjson.Get(jsonStr, descriptionPath(parentPath)).String()
+			parentDesc, _ := jsonutil.String(root, descriptionPath(parentPath))
 
-			items := arr.Array()
-			bestIdx, allTypes := selectBest(items)
-			selected := items[bestIdx].Raw
+			bestIdx, allTypes := selectBest(arr)
+			selected := arr[bestIdx]
 
 			if parentDesc != "" {
 				selected = mergeDescriptionRaw(selected, parentDesc)
@@ -320,22 +341,22 @@ func flattenAnyOfOneOf(jsonStr string) string {
 				selected = appendHintRaw(selected, hint)
 			}
 
-			jsonStr = setRawAt(jsonStr, parentPath, selected)
+			root = setValueAt(root, parentPath, selected)
 		}
 	}
-	return jsonStr
+	return root
 }
 
-func selectBest(items []gjson.Result) (bestIdx int, types []string) {
+func selectBest(items []any) (bestIdx int, types []string) {
 	bestScore := -1
 	for i, item := range items {
-		t := item.Get("type").String()
+		t, _ := jsonutil.String(item, "type")
 		score := 0
 
 		switch {
-		case t == "object" || item.Get("properties").Exists():
+		case t == "object" || jsonutil.Exists(item, "properties"):
 			score, t = 3, orDefault(t, "object")
-		case t == "array" || item.Get("items").Exists():
+		case t == "array" || jsonutil.Exists(item, "items"):
 			score, t = 2, orDefault(t, "array")
 		case t != "" && t != "null":
 			score = 1
@@ -353,22 +374,22 @@ func selectBest(items []gjson.Result) (bestIdx int, types []string) {
 	return
 }
 
-func flattenTypeArrays(jsonStr string) string {
-	paths := findPaths(jsonStr, "type")
+func flattenTypeArrays(root any) any {
+	paths := findPaths(root, "type")
 	sortByDepth(paths)
 
 	nullableFields := make(map[string][]string)
 
 	for _, p := range paths {
-		res := gjson.Get(jsonStr, p)
-		if !res.IsArray() || len(res.Array()) == 0 {
+		res, ok := jsonutil.Array(root, p)
+		if !ok || len(res) == 0 {
 			continue
 		}
 
 		hasNull := false
-		var nonNullTypes []string
-		for _, item := range res.Array() {
-			s := item.String()
+		nonNullTypes := make([]string, 0, len(res))
+		for _, item := range res {
+			s := jsonValueString(item)
 			if s == "null" {
 				hasNull = true
 			} else if s != "" {
@@ -381,12 +402,12 @@ func flattenTypeArrays(jsonStr string) string {
 			firstType = nonNullTypes[0]
 		}
 
-		jsonStr, _ = sjson.Set(jsonStr, p, firstType)
+		root = setValueAt(root, p, firstType)
 
 		parentPath := trimSuffix(p, ".type")
 		if len(nonNullTypes) > 1 {
 			hint := "Accepts: " + strings.Join(nonNullTypes, " | ")
-			jsonStr = appendHint(jsonStr, parentPath, hint)
+			root = appendHint(root, parentPath, hint)
 		}
 
 		if hasNull {
@@ -398,35 +419,35 @@ func flattenTypeArrays(jsonStr string) string {
 				nullableFields[objectPath] = append(nullableFields[objectPath], fieldName)
 
 				propPath := joinPath(objectPath, "properties."+fieldNameEscaped)
-				jsonStr = appendHint(jsonStr, propPath, "(nullable)")
+				root = appendHint(root, propPath, "(nullable)")
 			}
 		}
 	}
 
 	for objectPath, fields := range nullableFields {
 		reqPath := joinPath(objectPath, "required")
-		req := gjson.Get(jsonStr, reqPath)
-		if !req.IsArray() {
+		req := getStrings(root, reqPath)
+		if len(req) == 0 {
 			continue
 		}
 
-		var filtered []string
-		for _, r := range req.Array() {
-			if !contains(fields, r.String()) {
-				filtered = append(filtered, r.String())
+		filtered := make([]string, 0, len(req))
+		for _, required := range req {
+			if !contains(fields, required) {
+				filtered = append(filtered, required)
 			}
 		}
 
 		if len(filtered) == 0 {
-			jsonStr, _ = sjson.Delete(jsonStr, reqPath)
+			root = deleteAt(root, reqPath)
 		} else {
-			jsonStr, _ = sjson.Set(jsonStr, reqPath, filtered)
+			root = setValueAt(root, reqPath, toAnyStrings(filtered))
 		}
 	}
-	return jsonStr
+	return root
 }
 
-func removeUnsupportedKeywords(jsonStr string) string {
+func removeUnsupportedKeywords(root any) any {
 	keywords := append(unsupportedConstraints,
 		"$schema", "$defs", "definitions", "const", "$ref", "$id", "additionalProperties",
 		"propertyNames", "patternProperties", // Gemini doesn't support these schema keywords
@@ -434,7 +455,7 @@ func removeUnsupportedKeywords(jsonStr string) string {
 	)
 
 	deletePaths := make([]string, 0)
-	pathsByField := findPathsByFields(jsonStr, keywords)
+	pathsByField := findPathsByFields(root, keywords)
 	for _, key := range keywords {
 		for _, p := range pathsByField[key] {
 			if isPropertyDefinition(trimSuffix(p, "."+key)) {
@@ -445,98 +466,99 @@ func removeUnsupportedKeywords(jsonStr string) string {
 	}
 	sortByDepth(deletePaths)
 	for _, p := range deletePaths {
-		jsonStr, _ = sjson.Delete(jsonStr, p)
+		root = deleteAt(root, p)
 	}
-	// Remove x-* extension fields (e.g., x-google-enum-descriptions) that are not supported by Gemini API
-	jsonStr = removeExtensionFields(jsonStr)
-	return jsonStr
+
+	// Remove x-* extension fields (e.g., x-google-enum-descriptions) that are not supported by Gemini API.
+	root = removeExtensionFieldsValue(root)
+	return root
 }
 
 // removeExtensionFields removes all x-* extension fields from the JSON schema.
 // These are OpenAPI/JSON Schema extension fields that Google APIs don't recognize.
 func removeExtensionFields(jsonStr string) string {
-	var paths []string
-	walkForExtensions(gjson.Parse(jsonStr), "", &paths)
-	// walkForExtensions returns paths in a way that deeper paths are added before their ancestors
-	// when they are not deleted wholesale, but since we skip children of deleted x-* nodes,
-	// any collected path is safe to delete. We still use DeleteBytes for efficiency.
-
-	b := []byte(jsonStr)
-	for _, p := range paths {
-		b, _ = sjson.DeleteBytes(b, p)
+	root, errParse := jsonutil.ParseAnyBytes([]byte(jsonStr))
+	if errParse != nil {
+		return jsonStr
 	}
-	return string(b)
+	root = removeExtensionFieldsValue(root)
+	return string(jsonutil.MarshalOrOriginal([]byte(jsonStr), root))
 }
 
-func walkForExtensions(value gjson.Result, path string, paths *[]string) {
-	if value.IsArray() {
-		arr := value.Array()
-		for i := len(arr) - 1; i >= 0; i-- {
-			walkForExtensions(arr[i], joinPath(path, strconv.Itoa(i)), paths)
-		}
-		return
+func removeExtensionFieldsValue(root any) any {
+	var paths []string
+	walkForExtensions(root, "", &paths)
+	sortByDepth(paths)
+	for _, p := range paths {
+		root = deleteAt(root, p)
 	}
+	return root
+}
 
-	if value.IsObject() {
-		value.ForEach(func(key, val gjson.Result) bool {
-			keyStr := key.String()
+func walkForExtensions(value any, path string, paths *[]string) {
+	switch typed := value.(type) {
+	case []any:
+		for index := len(typed) - 1; index >= 0; index-- {
+			childPath := joinPath(path, strconv.Itoa(index))
+			walkForExtensions(typed[index], childPath, paths)
+		}
+	case map[string]any:
+		for keyStr, val := range typed {
 			safeKey := escapeGJSONPathKey(keyStr)
 			childPath := joinPath(path, safeKey)
 
-			// If it's an extension field, we delete it and don't need to look at its children.
+			// If it's an extension field, delete it and skip its children.
 			if strings.HasPrefix(keyStr, "x-") && !isPropertyDefinition(path) {
 				*paths = append(*paths, childPath)
-				return true
+				continue
 			}
 
 			walkForExtensions(val, childPath, paths)
-			return true
-		})
+		}
 	}
 }
 
-func cleanupRequiredFields(jsonStr string) string {
-	for _, p := range findPaths(jsonStr, "required") {
+func cleanupRequiredFields(root any) any {
+	for _, p := range findPaths(root, "required") {
 		parentPath := trimSuffix(p, ".required")
 		propsPath := joinPath(parentPath, "properties")
 
-		req := gjson.Get(jsonStr, p)
-		props := gjson.Get(jsonStr, propsPath)
-		if !req.IsArray() || !props.IsObject() {
+		req := getStrings(root, p)
+		props, okProps := jsonutil.Object(root, propsPath)
+		if len(req) == 0 || !okProps {
 			continue
 		}
 
-		var valid []string
-		for _, r := range req.Array() {
-			key := r.String()
-			if props.Get(escapeGJSONPathKey(key)).Exists() {
+		valid := make([]string, 0, len(req))
+		for _, key := range req {
+			if _, exists := props[key]; exists {
 				valid = append(valid, key)
 			}
 		}
 
-		if len(valid) != len(req.Array()) {
+		if len(valid) != len(req) {
 			if len(valid) == 0 {
-				jsonStr, _ = sjson.Delete(jsonStr, p)
+				root = deleteAt(root, p)
 			} else {
-				jsonStr, _ = sjson.Set(jsonStr, p, valid)
+				root = setValueAt(root, p, toAnyStrings(valid))
 			}
 		}
 	}
-	return jsonStr
+	return root
 }
 
 // addEmptySchemaPlaceholder adds a placeholder "reason" property to empty object schemas.
 // Claude VALIDATED mode requires at least one required property in tool schemas.
-func addEmptySchemaPlaceholder(jsonStr string) string {
+func addEmptySchemaPlaceholder(root any) any {
 	// Find all "type" fields
-	paths := findPaths(jsonStr, "type")
+	paths := findPaths(root, "type")
 
 	// Process from deepest to shallowest (to handle nested objects properly)
 	sortByDepth(paths)
 
 	for _, p := range paths {
-		typeVal := gjson.Get(jsonStr, p)
-		if typeVal.String() != "object" {
+		typeVal, _ := jsonutil.String(root, p)
+		if typeVal != "object" {
 			continue
 		}
 
@@ -545,16 +567,17 @@ func addEmptySchemaPlaceholder(jsonStr string) string {
 
 		// Check if properties exists and is empty or missing
 		propsPath := joinPath(parentPath, "properties")
-		propsVal := gjson.Get(jsonStr, propsPath)
+		propsVal, existsProps := jsonutil.Get(root, propsPath)
+		propsObj, okProps := propsVal.(map[string]any)
 		reqPath := joinPath(parentPath, "required")
-		reqVal := gjson.Get(jsonStr, reqPath)
-		hasRequiredProperties := reqVal.IsArray() && len(reqVal.Array()) > 0
+		reqVal, okReq := jsonutil.Array(root, reqPath)
+		hasRequiredProperties := okReq && len(reqVal) > 0
 
 		needsPlaceholder := false
-		if !propsVal.Exists() {
+		if !existsProps {
 			// No properties field at all
 			needsPlaceholder = true
-		} else if propsVal.IsObject() && len(propsVal.Map()) == 0 {
+		} else if okProps && len(propsObj) == 0 {
 			// Empty properties object
 			needsPlaceholder = true
 		}
@@ -562,55 +585,54 @@ func addEmptySchemaPlaceholder(jsonStr string) string {
 		if needsPlaceholder {
 			// Add placeholder "reason" property
 			reasonPath := joinPath(propsPath, "reason")
-			jsonStr, _ = sjson.Set(jsonStr, reasonPath+".type", "string")
-			jsonStr, _ = sjson.Set(jsonStr, reasonPath+".description", placeholderReasonDescription)
+			root = setValueAt(root, reasonPath+".type", "string")
+			root = setValueAt(root, reasonPath+".description", placeholderReasonDescription)
 
 			// Add to required array
-			jsonStr, _ = sjson.Set(jsonStr, reqPath, []string{"reason"})
+			root = setValueAt(root, reqPath, toAnyStrings([]string{"reason"}))
 			continue
 		}
 
 		// If schema has properties but none are required, add a minimal placeholder.
-		if propsVal.IsObject() && !hasRequiredProperties {
+		if okProps && !hasRequiredProperties {
 			// DO NOT add placeholder if it's a top-level schema (parentPath is empty)
 			// or if we've already added a placeholder reason above.
 			if parentPath == "" {
 				continue
 			}
 			placeholderPath := joinPath(propsPath, "_")
-			if !gjson.Get(jsonStr, placeholderPath).Exists() {
-				jsonStr, _ = sjson.Set(jsonStr, placeholderPath+".type", "boolean")
+			if !jsonutil.Exists(root, placeholderPath) {
+				root = setValueAt(root, placeholderPath+".type", "boolean")
 			}
-			jsonStr, _ = sjson.Set(jsonStr, reqPath, []string{"_"})
+			root = setValueAt(root, reqPath, toAnyStrings([]string{"_"}))
 		}
 	}
 
-	return jsonStr
+	return root
 }
 
 // --- Helpers ---
 
-func findPaths(jsonStr, field string) []string {
+func findPaths(root any, field string) []string {
 	var paths []string
-	Walk(gjson.Parse(jsonStr), "", field, &paths)
+	Walk(root, "", field, &paths)
 	return paths
 }
 
-func findPathsByFields(jsonStr string, fields []string) map[string][]string {
+func findPathsByFields(root any, fields []string) map[string][]string {
 	set := make(map[string]struct{}, len(fields))
 	for _, field := range fields {
 		set[field] = struct{}{}
 	}
 	paths := make(map[string][]string, len(set))
-	walkForFields(gjson.Parse(jsonStr), "", set, paths)
+	walkForFields(root, "", set, paths)
 	return paths
 }
 
-func walkForFields(value gjson.Result, path string, fields map[string]struct{}, paths map[string][]string) {
-	switch value.Type {
-	case gjson.JSON:
-		value.ForEach(func(key, val gjson.Result) bool {
-			keyStr := key.String()
+func walkForFields(value any, path string, fields map[string]struct{}, paths map[string][]string) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for keyStr, child := range typed {
 			safeKey := escapeGJSONPathKey(keyStr)
 
 			var childPath string
@@ -624,11 +646,16 @@ func walkForFields(value gjson.Result, path string, fields map[string]struct{}, 
 				paths[keyStr] = append(paths[keyStr], childPath)
 			}
 
-			walkForFields(val, childPath, fields, paths)
-			return true
-		})
-	case gjson.String, gjson.Number, gjson.True, gjson.False, gjson.Null:
-		// Terminal types - no further traversal needed
+			walkForFields(child, childPath, fields, paths)
+		}
+	case []any:
+		for index, child := range typed {
+			childPath := strconv.Itoa(index)
+			if path != "" {
+				childPath = path + "." + childPath
+			}
+			walkForFields(child, childPath, fields, paths)
+		}
 	}
 }
 
@@ -650,12 +677,32 @@ func joinPath(base, suffix string) string {
 	return base + "." + suffix
 }
 
-func setRawAt(jsonStr, path, value string) string {
+func setValueAt(root any, path string, value any) any {
 	if path == "" {
 		return value
 	}
-	result, _ := sjson.SetRaw(jsonStr, path, value)
-	return result
+	rootObj, ok := root.(map[string]any)
+	if !ok {
+		return root
+	}
+	if errSet := jsonutil.Set(rootObj, path, value); errSet != nil {
+		return root
+	}
+	return rootObj
+}
+
+func deleteAt(root any, path string) any {
+	if path == "" {
+		return root
+	}
+	rootObj, ok := root.(map[string]any)
+	if !ok {
+		return root
+	}
+	if errDelete := jsonutil.Delete(rootObj, path); errDelete != nil {
+		return root
+	}
+	return rootObj
 }
 
 func isPropertyDefinition(path string) bool {
@@ -669,34 +716,38 @@ func descriptionPath(parentPath string) string {
 	return parentPath + ".description"
 }
 
-func appendHint(jsonStr, parentPath, hint string) string {
+func appendHint(root any, parentPath, hint string) any {
 	descPath := parentPath + ".description"
 	if parentPath == "" || parentPath == "@this" {
 		descPath = "description"
 	}
-	existing := gjson.Get(jsonStr, descPath).String()
-	if existing != "" {
+	if existing, okExisting := jsonutil.String(root, descPath); okExisting && existing != "" {
 		hint = fmt.Sprintf("%s (%s)", existing, hint)
 	}
-	jsonStr, _ = sjson.Set(jsonStr, descPath, hint)
-	return jsonStr
+	return setValueAt(root, descPath, hint)
 }
 
-func appendHintRaw(jsonRaw, hint string) string {
-	existing := gjson.Get(jsonRaw, "description").String()
-	if existing != "" {
+func appendHintRaw(value any, hint string) any {
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return value
+	}
+	if existing, okExisting := obj["description"].(string); okExisting && existing != "" {
 		hint = fmt.Sprintf("%s (%s)", existing, hint)
 	}
-	jsonRaw, _ = sjson.Set(jsonRaw, "description", hint)
-	return jsonRaw
+	obj["description"] = hint
+	return obj
 }
 
-func getStrings(jsonStr, path string) []string {
-	var result []string
-	if arr := gjson.Get(jsonStr, path); arr.IsArray() {
-		for _, r := range arr.Array() {
-			result = append(result, r.String())
-		}
+func getStrings(root any, path string) []string {
+	arr, ok := jsonutil.Array(root, path)
+	if !ok {
+		return nil
+	}
+
+	result := make([]string, 0, len(arr))
+	for _, item := range arr {
+		result = append(result, jsonValueString(item))
 	}
 	return result
 }
@@ -710,6 +761,14 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
+func toAnyStrings(values []string) []any {
+	result := make([]any, 0, len(values))
+	for _, value := range values {
+		result = append(result, value)
+	}
+	return result
+}
+
 func orDefault(val, def string) string {
 	if val == "" {
 		return def
@@ -721,7 +780,7 @@ func escapeGJSONPathKey(key string) string {
 	if strings.IndexAny(key, ".*?") == -1 {
 		return key
 	}
-	return gjsonPathKeyReplacer.Replace(key)
+	return jsonPathKeyReplacer.Replace(key)
 }
 
 func unescapeGJSONPathKey(key string) string {
@@ -769,17 +828,76 @@ func splitGJSONPath(path string) []string {
 	return parts
 }
 
-func mergeDescriptionRaw(schemaRaw, parentDesc string) string {
-	childDesc := gjson.Get(schemaRaw, "description").String()
+func mergeDescriptionRaw(value any, parentDesc string) any {
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return value
+	}
+	childDesc, _ := obj["description"].(string)
 	switch {
 	case childDesc == "":
-		schemaRaw, _ = sjson.Set(schemaRaw, "description", parentDesc)
-		return schemaRaw
+		obj["description"] = parentDesc
+		return obj
 	case childDesc == parentDesc:
-		return schemaRaw
+		return obj
 	default:
-		combined := fmt.Sprintf("%s (%s)", parentDesc, childDesc)
-		schemaRaw, _ = sjson.Set(schemaRaw, "description", combined)
-		return schemaRaw
+		obj["description"] = fmt.Sprintf("%s (%s)", parentDesc, childDesc)
+		return obj
+	}
+}
+
+func isJSONObject(value any) bool {
+	_, ok := value.(map[string]any)
+	return ok
+}
+
+func isJSONArray(value any) bool {
+	_, ok := value.([]any)
+	return ok
+}
+
+func jsonValueString(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case json.Number:
+		return typed.String()
+	case bool:
+		if typed {
+			return "true"
+		}
+		return "false"
+	case float64:
+		return strconv.FormatFloat(typed, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(typed), 'f', -1, 32)
+	case int:
+		return strconv.Itoa(typed)
+	case int8:
+		return strconv.FormatInt(int64(typed), 10)
+	case int16:
+		return strconv.FormatInt(int64(typed), 10)
+	case int32:
+		return strconv.FormatInt(int64(typed), 10)
+	case int64:
+		return strconv.FormatInt(typed, 10)
+	case uint:
+		return strconv.FormatUint(uint64(typed), 10)
+	case uint8:
+		return strconv.FormatUint(uint64(typed), 10)
+	case uint16:
+		return strconv.FormatUint(uint64(typed), 10)
+	case uint32:
+		return strconv.FormatUint(uint64(typed), 10)
+	case uint64:
+		return strconv.FormatUint(typed, 10)
+	case nil:
+		return ""
+	default:
+		out, errMarshal := json.Marshal(typed)
+		if errMarshal != nil {
+			return fmt.Sprint(typed)
+		}
+		return string(out)
 	}
 }

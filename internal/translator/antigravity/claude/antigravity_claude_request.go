@@ -9,13 +9,245 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
+
+const skipThoughtSignatureValidator = "skip_thought_signature_validator"
+
+func extractThinkingText(part map[string]any) string {
+	if text, ok := jsonutil.String(part, "text"); ok {
+		return text
+	}
+
+	thinkingValue, ok := jsonutil.Get(part, "thinking")
+	if !ok {
+		return ""
+	}
+
+	switch typed := thinkingValue.(type) {
+	case string:
+		return typed
+	case map[string]any:
+		if text, ok := jsonutil.String(typed, "text"); ok {
+			return text
+		}
+		if text, ok := jsonutil.String(typed, "thinking"); ok {
+			return text
+		}
+	}
+
+	return ""
+}
+
+func parseJSONObjectString(raw string) (map[string]any, bool) {
+	value, errParse := jsonutil.ParseAnyBytes([]byte(raw))
+	if errParse != nil {
+		return nil, false
+	}
+	object, ok := value.(map[string]any)
+	return object, ok
+}
+
+func buildInlineDataPart(source map[string]any) (map[string]any, bool) {
+	sourceType, _ := jsonutil.String(source, "type")
+	if sourceType != "base64" {
+		return nil, false
+	}
+
+	inlineData := map[string]any{}
+	if mimeType, ok := jsonutil.String(source, "media_type"); ok && mimeType != "" {
+		inlineData["mimeType"] = mimeType
+	}
+	if data, ok := jsonutil.String(source, "data"); ok && data != "" {
+		inlineData["data"] = data
+	}
+
+	return map[string]any{"inlineData": inlineData}, true
+}
+
+func deriveFunctionName(toolCallID string) string {
+	parts := strings.Split(toolCallID, "-")
+	if len(parts) > 2 {
+		name := strings.Join(parts[:len(parts)-2], "-")
+		if name != "" {
+			return name
+		}
+	}
+	return toolCallID
+}
+
+func reorderModelParts(parts []any) []any {
+	thinkingParts := make([]any, 0)
+	otherParts := make([]any, 0, len(parts))
+	for _, partValue := range parts {
+		part, ok := partValue.(map[string]any)
+		if ok {
+			if thought, ok := jsonutil.Bool(part, "thought"); ok && thought {
+				thinkingParts = append(thinkingParts, partValue)
+				continue
+			}
+		}
+		otherParts = append(otherParts, partValue)
+	}
+	if len(thinkingParts) == 0 {
+		return parts
+	}
+	if firstPart, ok := parts[0].(map[string]any); ok {
+		if thought, ok := jsonutil.Bool(firstPart, "thought"); ok && thought && len(thinkingParts) == 1 {
+			return parts
+		}
+	}
+
+	reordered := make([]any, 0, len(parts))
+	reordered = append(reordered, thinkingParts...)
+	reordered = append(reordered, otherParts...)
+	return reordered
+}
+
+func buildToolResultPart(toolResult map[string]any, toolNameByID map[string]string) (map[string]any, bool) {
+	toolCallID, _ := jsonutil.String(toolResult, "tool_use_id")
+	if toolCallID == "" {
+		return nil, false
+	}
+
+	funcName, ok := toolNameByID[toolCallID]
+	if !ok {
+		funcName = deriveFunctionName(toolCallID)
+		log.Warnf("antigravity claude request: tool_result references unknown tool_use_id=%s, derived function name=%s", toolCallID, funcName)
+	}
+
+	functionResponse := map[string]any{
+		"id":   toolCallID,
+		"name": funcName,
+		"response": map[string]any{
+			"result": "",
+		},
+	}
+
+	contentValue, hasContent := jsonutil.Get(toolResult, "content")
+	if !hasContent {
+		return map[string]any{"functionResponse": functionResponse}, true
+	}
+
+	switch typed := contentValue.(type) {
+	case string:
+		functionResponse["response"].(map[string]any)["result"] = typed
+	case []any:
+		filtered := make([]any, 0)
+		imageParts := make([]any, 0)
+		var lastNonImage any
+
+		for _, itemValue := range typed {
+			if item, ok := itemValue.(map[string]any); ok {
+				if itemType, _ := jsonutil.String(item, "type"); itemType == "image" {
+					if source, ok := jsonutil.Object(item, "source"); ok {
+						if imagePart, ok := buildInlineDataPart(source); ok {
+							imageParts = append(imageParts, imagePart)
+							continue
+						}
+					}
+				}
+			}
+
+			lastNonImage = itemValue
+			filtered = append(filtered, itemValue)
+		}
+
+		switch len(filtered) {
+		case 0:
+			functionResponse["response"].(map[string]any)["result"] = ""
+		case 1:
+			functionResponse["response"].(map[string]any)["result"] = lastNonImage
+		default:
+			functionResponse["response"].(map[string]any)["result"] = filtered
+		}
+
+		if len(imageParts) > 0 {
+			functionResponse["parts"] = imageParts
+		}
+	case map[string]any:
+		if itemType, _ := jsonutil.String(typed, "type"); itemType == "image" {
+			if source, ok := jsonutil.Object(typed, "source"); ok {
+				if imagePart, ok := buildInlineDataPart(source); ok {
+					functionResponse["parts"] = []any{imagePart}
+					functionResponse["response"].(map[string]any)["result"] = ""
+					return map[string]any{"functionResponse": functionResponse}, true
+				}
+			}
+		}
+		functionResponse["response"].(map[string]any)["result"] = typed
+	default:
+		functionResponse["response"].(map[string]any)["result"] = typed
+	}
+
+	return map[string]any{"functionResponse": functionResponse}, true
+}
+
+func buildToolDeclarations(root map[string]any) ([]any, int) {
+	tools, ok := jsonutil.Array(root, "tools")
+	if !ok {
+		return nil, 0
+	}
+
+	allowedKeys := map[string]struct{}{
+		"name":                 {},
+		"description":          {},
+		"behavior":             {},
+		"parameters":           {},
+		"parametersJsonSchema": {},
+		"response":             {},
+		"responseJsonSchema":   {},
+	}
+
+	functionDeclarations := make([]any, 0)
+	for _, toolValue := range tools {
+		tool, ok := toolValue.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		inputSchema, ok := jsonutil.Object(tool, "input_schema")
+		if !ok {
+			continue
+		}
+
+		inputSchemaJSON, errMarshal := jsonutil.MarshalAny(inputSchema)
+		if errMarshal != nil {
+			continue
+		}
+		cleanedSchema := util.CleanJSONSchemaForAntigravity(string(inputSchemaJSON))
+		cleanedValue, errParse := jsonutil.ParseAnyBytes([]byte(cleanedSchema))
+		if errParse != nil {
+			continue
+		}
+
+		functionDeclaration := make(map[string]any)
+		for key, value := range tool {
+			if _, ok := allowedKeys[key]; !ok {
+				continue
+			}
+			if key == "parametersJsonSchema" {
+				continue
+			}
+			functionDeclaration[key] = value
+		}
+		functionDeclaration["parametersJsonSchema"] = cleanedValue
+		functionDeclarations = append(functionDeclarations, functionDeclaration)
+	}
+
+	if len(functionDeclarations) == 0 {
+		return nil, 0
+	}
+
+	return []any{
+		map[string]any{
+			"functionDeclarations": functionDeclarations,
+		},
+	}, len(functionDeclarations)
+}
 
 // ConvertClaudeRequestToAntigravity parses and transforms a Claude Code API request into Gemini CLI API format.
 // It extracts the model name, system instruction, message contents, and tool declarations
@@ -37,486 +269,319 @@ import (
 //   - []byte: The transformed request data in Gemini CLI API format
 func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ bool) []byte {
 	enableThoughtTranslate := true
-	rawJSON := inputRawJSON
+	root := jsonutil.ParseObjectBytesOrEmpty(inputRawJSON)
 
-	// system instruction
-	systemInstructionJSON := ""
-	hasSystemInstruction := false
-	systemResult := gjson.GetBytes(rawJSON, "system")
-	if systemResult.IsArray() {
-		systemResults := systemResult.Array()
-		systemInstructionJSON = `{"role":"user","parts":[]}`
-		for i := 0; i < len(systemResults); i++ {
-			systemPromptResult := systemResults[i]
-			systemTypePromptResult := systemPromptResult.Get("type")
-			if systemTypePromptResult.Type == gjson.String && systemTypePromptResult.String() == "text" {
-				systemPrompt := systemPromptResult.Get("text").String()
-				partJSON := `{}`
-				if systemPrompt != "" {
-					partJSON, _ = sjson.Set(partJSON, "text", systemPrompt)
-				}
-				systemInstructionJSON, _ = sjson.SetRaw(systemInstructionJSON, "parts.-1", partJSON)
-				hasSystemInstruction = true
+	var (
+		systemInstruction    map[string]any
+		hasSystemInstruction bool
+	)
+
+	if systemEntries, ok := jsonutil.Array(root, "system"); ok {
+		parts := make([]any, 0, len(systemEntries))
+		for _, entryValue := range systemEntries {
+			entry, ok := entryValue.(map[string]any)
+			if !ok {
+				continue
+			}
+			entryType, _ := jsonutil.String(entry, "type")
+			if entryType != "text" {
+				continue
+			}
+			systemPrompt, _ := jsonutil.String(entry, "text")
+			part := map[string]any{}
+			if systemPrompt != "" {
+				part["text"] = systemPrompt
+			}
+			parts = append(parts, part)
+			hasSystemInstruction = true
+		}
+		if hasSystemInstruction {
+			systemInstruction = map[string]any{
+				"role":  "user",
+				"parts": parts,
 			}
 		}
-	} else if systemResult.Type == gjson.String {
-		systemInstructionJSON = `{"role":"user","parts":[{"text":""}]}`
-		systemInstructionJSON, _ = sjson.Set(systemInstructionJSON, "parts.0.text", systemResult.String())
+	} else if systemText, ok := jsonutil.String(root, "system"); ok {
+		systemInstruction = map[string]any{
+			"role": "user",
+			"parts": []any{
+				map[string]any{
+					"text": systemText,
+				},
+			},
+		}
 		hasSystemInstruction = true
 	}
 
-	// contents
-	contentsJSON := "[]"
-	hasContents := false
-
-	// tool_use_id → tool_name lookup, populated incrementally during the main loop.
-	// Claude's tool_result references tool_use by ID; Gemini requires functionResponse.name.
+	contents := make([]any, 0)
 	toolNameByID := make(map[string]string)
 
-	messagesResult := gjson.GetBytes(rawJSON, "messages")
-	if messagesResult.IsArray() {
-		messageResults := messagesResult.Array()
-		numMessages := len(messageResults)
-		for i := 0; i < numMessages; i++ {
-			messageResult := messageResults[i]
-			roleResult := messageResult.Get("role")
-			if roleResult.Type != gjson.String {
+	if messages, ok := jsonutil.Array(root, "messages"); ok {
+		for _, messageValue := range messages {
+			message, ok := messageValue.(map[string]any)
+			if !ok {
 				continue
 			}
-			originalRole := roleResult.String()
+
+			originalRole, ok := jsonutil.String(message, "role")
+			if !ok || originalRole == "" {
+				continue
+			}
+
 			role := originalRole
 			if role == "assistant" {
 				role = "model"
 			}
-			clientContentJSON := `{"role":"","parts":[]}`
-			clientContentJSON, _ = sjson.Set(clientContentJSON, "role", role)
-			contentsResult := messageResult.Get("content")
-			if contentsResult.IsArray() {
-				contentResults := contentsResult.Array()
-				numContents := len(contentResults)
-				var currentMessageThinkingSignature string
-				for j := 0; j < numContents; j++ {
-					contentResult := contentResults[j]
-					contentTypeResult := contentResult.Get("type")
-					if contentTypeResult.Type == gjson.String && contentTypeResult.String() == "thinking" {
-						// Use GetThinkingText to handle wrapped thinking objects
-						thinkingText := thinking.GetThinkingText(contentResult)
 
-						// Always try cached signature first (more reliable than client-provided)
-						// Client may send stale or invalid signatures from different sessions
+			clientContent := map[string]any{
+				"role":  role,
+				"parts": []any{},
+			}
+			parts := make([]any, 0)
+			var currentMessageThinkingSignature string
+
+			if contentArray, ok := jsonutil.Array(message, "content"); ok {
+				for _, contentValue := range contentArray {
+					content, ok := contentValue.(map[string]any)
+					if !ok {
+						continue
+					}
+
+					contentType, _ := jsonutil.String(content, "type")
+					switch contentType {
+					case "thinking":
+						thinkingText := extractThinkingText(content)
 						signature := ""
 						if thinkingText != "" {
-							if cachedSig := cache.GetCachedSignature(modelName, thinkingText); cachedSig != "" {
-								signature = cachedSig
-								// log.Debugf("Using cached signature for thinking block")
+							if cachedSignature := cache.GetCachedSignature(modelName, thinkingText); cachedSignature != "" {
+								signature = cachedSignature
 							}
 						}
-
-						// Fallback to client signature only if cache miss and client signature is valid
 						if signature == "" {
-							signatureResult := contentResult.Get("signature")
-							clientSignature := ""
-							if signatureResult.Exists() && signatureResult.String() != "" {
-								arrayClientSignatures := strings.SplitN(signatureResult.String(), "#", 2)
+							if signatureValue, ok := jsonutil.String(content, "signature"); ok && signatureValue != "" {
+								arrayClientSignatures := strings.SplitN(signatureValue, "#", 2)
 								if len(arrayClientSignatures) == 2 {
 									if cache.GetModelGroup(modelName) == arrayClientSignatures[0] {
-										clientSignature = arrayClientSignatures[1]
+										signature = arrayClientSignatures[1]
 									}
 								}
 							}
-							if cache.HasValidSignature(modelName, clientSignature) {
-								signature = clientSignature
+							if !cache.HasValidSignature(modelName, signature) {
+								signature = ""
 							}
-							// log.Debugf("Using client-provided signature for thinking block")
 						}
 
-						// Store for subsequent tool_use in the same message
 						if cache.HasValidSignature(modelName, signature) {
 							currentMessageThinkingSignature = signature
 						}
 
-						// Skip trailing unsigned thinking blocks on last assistant message
-						isUnsigned := !cache.HasValidSignature(modelName, signature)
-
-						// If unsigned, skip entirely (don't convert to text)
-						// Claude requires assistant messages to start with thinking blocks when thinking is enabled
-						// Converting to text would break this requirement
-						if isUnsigned {
-							// log.Debugf("Dropping unsigned thinking block (no valid signature)")
+						if !cache.HasValidSignature(modelName, signature) {
 							enableThoughtTranslate = false
 							continue
 						}
 
-						// Valid signature, send as thought block
-						partJSON := `{}`
-						partJSON, _ = sjson.Set(partJSON, "thought", true)
+						part := map[string]any{
+							"thought": true,
+						}
 						if thinkingText != "" {
-							partJSON, _ = sjson.Set(partJSON, "text", thinkingText)
+							part["text"] = thinkingText
 						}
 						if signature != "" {
-							partJSON, _ = sjson.Set(partJSON, "thoughtSignature", signature)
+							part["thoughtSignature"] = signature
 						}
-						clientContentJSON, _ = sjson.SetRaw(clientContentJSON, "parts.-1", partJSON)
-					} else if contentTypeResult.Type == gjson.String && contentTypeResult.String() == "text" {
-						prompt := contentResult.Get("text").String()
-						// Skip empty text parts to avoid Gemini API error:
-						// "required oneof field 'data' must have one initialized field"
+						parts = append(parts, part)
+
+					case "text":
+						prompt, _ := jsonutil.String(content, "text")
 						if prompt == "" {
 							continue
 						}
-						partJSON := `{}`
-						partJSON, _ = sjson.Set(partJSON, "text", prompt)
-						clientContentJSON, _ = sjson.SetRaw(clientContentJSON, "parts.-1", partJSON)
-					} else if contentTypeResult.Type == gjson.String && contentTypeResult.String() == "tool_use" {
-						// NOTE: Do NOT inject dummy thinking blocks here.
-						// Antigravity API validates signatures, so dummy values are rejected.
+						parts = append(parts, map[string]any{"text": prompt})
 
-						functionName := contentResult.Get("name").String()
-						argsResult := contentResult.Get("input")
-						functionID := contentResult.Get("id").String()
-
+					case "tool_use":
+						functionName, _ := jsonutil.String(content, "name")
+						functionID, _ := jsonutil.String(content, "id")
 						if functionID != "" && functionName != "" {
 							toolNameByID[functionID] = functionName
 						}
 
-						// Handle both object and string input formats
-						var argsRaw string
-						if argsResult.IsObject() {
-							argsRaw = argsResult.Raw
-						} else if argsResult.Type == gjson.String {
-							// Input is a JSON string, parse and validate it
-							parsed := gjson.Parse(argsResult.String())
-							if parsed.IsObject() {
-								argsRaw = parsed.Raw
+						var argsValue any
+						switch inputValue, ok := jsonutil.Get(content, "input"); {
+						case !ok:
+							continue
+						case inputValue == nil:
+							continue
+						default:
+							switch typed := inputValue.(type) {
+							case map[string]any:
+								argsValue = typed
+							case string:
+								parsed, ok := parseJSONObjectString(typed)
+								if !ok {
+									continue
+								}
+								argsValue = parsed
+							default:
+								continue
 							}
 						}
 
-						if argsRaw != "" {
-							partJSON := `{}`
-
-							// Use skip_thought_signature_validator for tool calls without valid thinking signature
-							// This is the approach used in opencode-google-antigravity-auth for Gemini
-							// and also works for Claude through Antigravity API
-							const skipSentinel = "skip_thought_signature_validator"
-							if cache.HasValidSignature(modelName, currentMessageThinkingSignature) {
-								partJSON, _ = sjson.Set(partJSON, "thoughtSignature", currentMessageThinkingSignature)
-							} else {
-								// No valid signature - use skip sentinel to bypass validation
-								partJSON, _ = sjson.Set(partJSON, "thoughtSignature", skipSentinel)
-							}
-
-							if functionID != "" {
-								partJSON, _ = sjson.Set(partJSON, "functionCall.id", functionID)
-							}
-							partJSON, _ = sjson.Set(partJSON, "functionCall.name", functionName)
-							partJSON, _ = sjson.SetRaw(partJSON, "functionCall.args", argsRaw)
-							clientContentJSON, _ = sjson.SetRaw(clientContentJSON, "parts.-1", partJSON)
+						part := map[string]any{
+							"thoughtSignature": skipThoughtSignatureValidator,
+							"functionCall": map[string]any{
+								"name": functionName,
+								"args": argsValue,
+							},
 						}
-					} else if contentTypeResult.Type == gjson.String && contentTypeResult.String() == "tool_result" {
-						toolCallID := contentResult.Get("tool_use_id").String()
-						if toolCallID != "" {
-							funcName, ok := toolNameByID[toolCallID]
-							if !ok {
-								// Fallback: derive a semantic name from the ID by stripping
-								// the last two dash-separated segments (e.g. "get_weather-call-123" → "get_weather").
-								// Only use the raw ID as a last resort when the heuristic produces an empty string.
-								parts := strings.Split(toolCallID, "-")
-								if len(parts) > 2 {
-									funcName = strings.Join(parts[:len(parts)-2], "-")
-								}
-								if funcName == "" {
-									funcName = toolCallID
-								}
-								log.Warnf("antigravity claude request: tool_result references unknown tool_use_id=%s, derived function name=%s", toolCallID, funcName)
-							}
-							functionResponseResult := contentResult.Get("content")
-
-							functionResponseJSON := `{}`
-							functionResponseJSON, _ = sjson.Set(functionResponseJSON, "id", toolCallID)
-							functionResponseJSON, _ = sjson.Set(functionResponseJSON, "name", funcName)
-
-							responseData := ""
-							if functionResponseResult.Type == gjson.String {
-								responseData = functionResponseResult.String()
-								functionResponseJSON, _ = sjson.Set(functionResponseJSON, "response.result", responseData)
-							} else if functionResponseResult.IsArray() {
-								frResults := functionResponseResult.Array()
-								nonImageCount := 0
-								lastNonImageRaw := ""
-								filteredJSON := "[]"
-								imagePartsJSON := "[]"
-								for _, fr := range frResults {
-									if fr.Get("type").String() == "image" && fr.Get("source.type").String() == "base64" {
-										inlineDataJSON := `{}`
-										if mimeType := fr.Get("source.media_type").String(); mimeType != "" {
-											inlineDataJSON, _ = sjson.Set(inlineDataJSON, "mimeType", mimeType)
-										}
-										if data := fr.Get("source.data").String(); data != "" {
-											inlineDataJSON, _ = sjson.Set(inlineDataJSON, "data", data)
-										}
-
-										imagePartJSON := `{}`
-										imagePartJSON, _ = sjson.SetRaw(imagePartJSON, "inlineData", inlineDataJSON)
-										imagePartsJSON, _ = sjson.SetRaw(imagePartsJSON, "-1", imagePartJSON)
-										continue
-									}
-
-									nonImageCount++
-									lastNonImageRaw = fr.Raw
-									filteredJSON, _ = sjson.SetRaw(filteredJSON, "-1", fr.Raw)
-								}
-
-								if nonImageCount == 1 {
-									functionResponseJSON, _ = sjson.SetRaw(functionResponseJSON, "response.result", lastNonImageRaw)
-								} else if nonImageCount > 1 {
-									functionResponseJSON, _ = sjson.SetRaw(functionResponseJSON, "response.result", filteredJSON)
-								} else {
-									functionResponseJSON, _ = sjson.Set(functionResponseJSON, "response.result", "")
-								}
-
-								// Place image data inside functionResponse.parts as inlineData
-								// instead of as sibling parts in the outer content, to avoid
-								// base64 data bloating the text context.
-								if gjson.Get(imagePartsJSON, "#").Int() > 0 {
-									functionResponseJSON, _ = sjson.SetRaw(functionResponseJSON, "parts", imagePartsJSON)
-								}
-
-							} else if functionResponseResult.IsObject() {
-								if functionResponseResult.Get("type").String() == "image" && functionResponseResult.Get("source.type").String() == "base64" {
-									inlineDataJSON := `{}`
-									if mimeType := functionResponseResult.Get("source.media_type").String(); mimeType != "" {
-										inlineDataJSON, _ = sjson.Set(inlineDataJSON, "mimeType", mimeType)
-									}
-									if data := functionResponseResult.Get("source.data").String(); data != "" {
-										inlineDataJSON, _ = sjson.Set(inlineDataJSON, "data", data)
-									}
-
-									imagePartJSON := `{}`
-									imagePartJSON, _ = sjson.SetRaw(imagePartJSON, "inlineData", inlineDataJSON)
-									imagePartsJSON := "[]"
-									imagePartsJSON, _ = sjson.SetRaw(imagePartsJSON, "-1", imagePartJSON)
-									functionResponseJSON, _ = sjson.SetRaw(functionResponseJSON, "parts", imagePartsJSON)
-									functionResponseJSON, _ = sjson.Set(functionResponseJSON, "response.result", "")
-								} else {
-									functionResponseJSON, _ = sjson.SetRaw(functionResponseJSON, "response.result", functionResponseResult.Raw)
-								}
-							} else if functionResponseResult.Raw != "" {
-								functionResponseJSON, _ = sjson.SetRaw(functionResponseJSON, "response.result", functionResponseResult.Raw)
-							} else {
-								// Content field is missing entirely — .Raw is empty which
-								// causes sjson.SetRaw to produce invalid JSON (e.g. "result":}).
-								functionResponseJSON, _ = sjson.Set(functionResponseJSON, "response.result", "")
-							}
-
-							partJSON := `{}`
-							partJSON, _ = sjson.SetRaw(partJSON, "functionResponse", functionResponseJSON)
-							clientContentJSON, _ = sjson.SetRaw(clientContentJSON, "parts.-1", partJSON)
+						if cache.HasValidSignature(modelName, currentMessageThinkingSignature) {
+							part["thoughtSignature"] = currentMessageThinkingSignature
 						}
-					} else if contentTypeResult.Type == gjson.String && contentTypeResult.String() == "image" {
-						sourceResult := contentResult.Get("source")
-						if sourceResult.Get("type").String() == "base64" {
-							inlineDataJSON := `{}`
-							if mimeType := sourceResult.Get("media_type").String(); mimeType != "" {
-								inlineDataJSON, _ = sjson.Set(inlineDataJSON, "mimeType", mimeType)
-							}
-							if data := sourceResult.Get("data").String(); data != "" {
-								inlineDataJSON, _ = sjson.Set(inlineDataJSON, "data", data)
-							}
-
-							partJSON := `{}`
-							partJSON, _ = sjson.SetRaw(partJSON, "inlineData", inlineDataJSON)
-							clientContentJSON, _ = sjson.SetRaw(clientContentJSON, "parts.-1", partJSON)
+						if functionID != "" {
+							part["functionCall"].(map[string]any)["id"] = functionID
 						}
+						parts = append(parts, part)
+
+					case "tool_result":
+						part, ok := buildToolResultPart(content, toolNameByID)
+						if !ok {
+							continue
+						}
+						parts = append(parts, part)
+
+					case "image":
+						source, ok := jsonutil.Object(content, "source")
+						if !ok {
+							continue
+						}
+						imagePart, ok := buildInlineDataPart(source)
+						if !ok {
+							continue
+						}
+						parts = append(parts, imagePart)
 					}
 				}
 
-				// Reorder parts for 'model' role to ensure thinking block is first
 				if role == "model" {
-					partsResult := gjson.Get(clientContentJSON, "parts")
-					if partsResult.IsArray() {
-						parts := partsResult.Array()
-						var thinkingParts []gjson.Result
-						var otherParts []gjson.Result
-						for _, part := range parts {
-							if part.Get("thought").Bool() {
-								thinkingParts = append(thinkingParts, part)
-							} else {
-								otherParts = append(otherParts, part)
-							}
-						}
-						if len(thinkingParts) > 0 {
-							firstPartIsThinking := parts[0].Get("thought").Bool()
-							if !firstPartIsThinking || len(thinkingParts) > 1 {
-								var newParts []interface{}
-								for _, p := range thinkingParts {
-									newParts = append(newParts, p.Value())
-								}
-								for _, p := range otherParts {
-									newParts = append(newParts, p.Value())
-								}
-								clientContentJSON, _ = sjson.Set(clientContentJSON, "parts", newParts)
-							}
-						}
-					}
+					parts = reorderModelParts(parts)
 				}
 
-				// Skip messages with empty parts array to avoid Gemini API error:
-				// "required oneof field 'data' must have one initialized field"
-				partsCheck := gjson.Get(clientContentJSON, "parts")
-				if !partsCheck.IsArray() || len(partsCheck.Array()) == 0 {
+				if len(parts) == 0 {
 					continue
 				}
 
-				contentsJSON, _ = sjson.SetRaw(contentsJSON, "-1", clientContentJSON)
-				hasContents = true
-			} else if contentsResult.Type == gjson.String {
-				prompt := contentsResult.String()
-				partJSON := `{}`
+				clientContent["parts"] = parts
+				contents = append(contents, clientContent)
+			} else if prompt, ok := jsonutil.String(message, "content"); ok {
+				clientContent["parts"] = []any{map[string]any{}}
 				if prompt != "" {
-					partJSON, _ = sjson.Set(partJSON, "text", prompt)
+					clientContent["parts"] = []any{map[string]any{"text": prompt}}
 				}
-				clientContentJSON, _ = sjson.SetRaw(clientContentJSON, "parts.-1", partJSON)
-				contentsJSON, _ = sjson.SetRaw(contentsJSON, "-1", clientContentJSON)
-				hasContents = true
+				contents = append(contents, clientContent)
 			}
 		}
 	}
 
-	// tools
-	toolsJSON := ""
-	toolDeclCount := 0
-	allowedToolKeys := []string{"name", "description", "behavior", "parameters", "parametersJsonSchema", "response", "responseJsonSchema"}
-	toolsResult := gjson.GetBytes(rawJSON, "tools")
-	if toolsResult.IsArray() {
-		toolsJSON = `[{"functionDeclarations":[]}]`
-		toolsResults := toolsResult.Array()
-		for i := 0; i < len(toolsResults); i++ {
-			toolResult := toolsResults[i]
-			inputSchemaResult := toolResult.Get("input_schema")
-			if inputSchemaResult.Exists() && inputSchemaResult.IsObject() {
-				// Sanitize the input schema for Antigravity API compatibility
-				inputSchema := util.CleanJSONSchemaForAntigravity(inputSchemaResult.Raw)
-				tool, _ := sjson.Delete(toolResult.Raw, "input_schema")
-				tool, _ = sjson.SetRaw(tool, "parametersJsonSchema", inputSchema)
-				for toolKey := range gjson.Parse(tool).Map() {
-					if util.InArray(allowedToolKeys, toolKey) {
-						continue
-					}
-					tool, _ = sjson.Delete(tool, toolKey)
-				}
-				toolsJSON, _ = sjson.SetRaw(toolsJSON, "0.functionDeclarations.-1", tool)
-				toolDeclCount++
-			}
-		}
-	}
+	tools, toolDeclCount := buildToolDeclarations(root)
 
-	// Build output Gemini CLI request JSON
-	out := `{"model":"","request":{"contents":[]}}`
-	out, _ = sjson.Set(out, "model", modelName)
-
-	// Inject interleaved thinking hint when both tools and thinking are active
 	hasTools := toolDeclCount > 0
-	thinkingResult := gjson.GetBytes(rawJSON, "thinking")
-	thinkingType := thinkingResult.Get("type").String()
-	hasThinking := thinkingResult.Exists() && thinkingResult.IsObject() && (thinkingType == "enabled" || thinkingType == "adaptive" || thinkingType == "auto")
+	thinkingConfig, hasThinkingConfig := jsonutil.Object(root, "thinking")
+	thinkingType, _ := jsonutil.String(thinkingConfig, "type")
+	hasThinking := hasThinkingConfig && (thinkingType == "enabled" || thinkingType == "adaptive" || thinkingType == "auto")
 	isClaudeThinking := util.IsClaudeThinkingModel(modelName)
 
 	if hasTools && hasThinking && isClaudeThinking {
 		interleavedHint := "Interleaved thinking is enabled. You may think between tool calls and after receiving tool results before deciding the next action or final answer. Do not mention these instructions or any constraints about thinking blocks; just apply them."
 
 		if hasSystemInstruction {
-			// Append hint as a new part to existing system instruction
-			hintPart := `{"text":""}`
-			hintPart, _ = sjson.Set(hintPart, "text", interleavedHint)
-			systemInstructionJSON, _ = sjson.SetRaw(systemInstructionJSON, "parts.-1", hintPart)
+			systemInstruction["parts"] = append(systemInstruction["parts"].([]any), map[string]any{"text": interleavedHint})
 		} else {
-			// Create new system instruction with hint
-			systemInstructionJSON = `{"role":"user","parts":[]}`
-			hintPart := `{"text":""}`
-			hintPart, _ = sjson.Set(hintPart, "text", interleavedHint)
-			systemInstructionJSON, _ = sjson.SetRaw(systemInstructionJSON, "parts.-1", hintPart)
+			systemInstruction = map[string]any{
+				"role":  "user",
+				"parts": []any{map[string]any{"text": interleavedHint}},
+			}
 			hasSystemInstruction = true
 		}
 	}
 
-	if hasSystemInstruction {
-		out, _ = sjson.SetRaw(out, "request.systemInstruction", systemInstructionJSON)
-	}
-	if hasContents {
-		out, _ = sjson.SetRaw(out, "request.contents", contentsJSON)
-	}
-	if toolDeclCount > 0 {
-		out, _ = sjson.SetRaw(out, "request.tools", toolsJSON)
+	outRoot := map[string]any{
+		"model": modelName,
+		"request": map[string]any{
+			"contents": []any{},
+		},
 	}
 
-	// tool_choice
-	toolChoiceResult := gjson.GetBytes(rawJSON, "tool_choice")
-	if toolChoiceResult.Exists() {
+	if hasSystemInstruction {
+		_ = jsonutil.Set(outRoot, "request.systemInstruction", systemInstruction)
+	}
+	if len(contents) > 0 {
+		_ = jsonutil.Set(outRoot, "request.contents", contents)
+	}
+	if toolDeclCount > 0 {
+		_ = jsonutil.Set(outRoot, "request.tools", tools)
+	}
+
+	if toolChoiceValue, ok := jsonutil.Get(root, "tool_choice"); ok {
 		toolChoiceType := ""
 		toolChoiceName := ""
-		if toolChoiceResult.IsObject() {
-			toolChoiceType = toolChoiceResult.Get("type").String()
-			toolChoiceName = toolChoiceResult.Get("name").String()
-		} else if toolChoiceResult.Type == gjson.String {
-			toolChoiceType = toolChoiceResult.String()
+		switch typed := toolChoiceValue.(type) {
+		case map[string]any:
+			toolChoiceType, _ = jsonutil.String(typed, "type")
+			toolChoiceName, _ = jsonutil.String(typed, "name")
+		case string:
+			toolChoiceType = typed
 		}
 
 		switch toolChoiceType {
 		case "auto":
-			out, _ = sjson.Set(out, "request.toolConfig.functionCallingConfig.mode", "AUTO")
+			_ = jsonutil.Set(outRoot, "request.toolConfig.functionCallingConfig.mode", "AUTO")
 		case "none":
-			out, _ = sjson.Set(out, "request.toolConfig.functionCallingConfig.mode", "NONE")
+			_ = jsonutil.Set(outRoot, "request.toolConfig.functionCallingConfig.mode", "NONE")
 		case "any":
-			out, _ = sjson.Set(out, "request.toolConfig.functionCallingConfig.mode", "ANY")
+			_ = jsonutil.Set(outRoot, "request.toolConfig.functionCallingConfig.mode", "ANY")
 		case "tool":
-			out, _ = sjson.Set(out, "request.toolConfig.functionCallingConfig.mode", "ANY")
+			_ = jsonutil.Set(outRoot, "request.toolConfig.functionCallingConfig.mode", "ANY")
 			if toolChoiceName != "" {
-				out, _ = sjson.Set(out, "request.toolConfig.functionCallingConfig.allowedFunctionNames", []string{toolChoiceName})
+				_ = jsonutil.Set(outRoot, "request.toolConfig.functionCallingConfig.allowedFunctionNames", []string{toolChoiceName})
 			}
 		}
 	}
 
-	// Map Anthropic thinking -> Gemini thinkingBudget/include_thoughts when type==enabled
-	if t := gjson.GetBytes(rawJSON, "thinking"); enableThoughtTranslate && t.Exists() && t.IsObject() {
-		switch t.Get("type").String() {
+	if enableThoughtTranslate && hasThinkingConfig {
+		switch thinkingType {
 		case "enabled":
-			if b := t.Get("budget_tokens"); b.Exists() && b.Type == gjson.Number {
-				budget := int(b.Int())
-				out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.thinkingBudget", budget)
-				out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.includeThoughts", true)
+			if budget, ok := jsonutil.Get(thinkingConfig, "budget_tokens"); ok {
+				_ = jsonutil.Set(outRoot, "request.generationConfig.thinkingConfig.thinkingBudget", budget)
+				_ = jsonutil.Set(outRoot, "request.generationConfig.thinkingConfig.includeThoughts", true)
 			}
 		case "adaptive", "auto":
-			// For adaptive thinking:
-			// - If output_config.effort is explicitly present, pass through as thinkingLevel.
-			// - Otherwise, treat it as "enabled with target-model maximum" and emit high.
-			// ApplyThinking handles clamping to target model's supported levels.
 			effort := ""
-			if v := gjson.GetBytes(rawJSON, "output_config.effort"); v.Exists() && v.Type == gjson.String {
-				effort = strings.ToLower(strings.TrimSpace(v.String()))
+			if outputConfig, ok := jsonutil.Object(root, "output_config"); ok {
+				if value, ok := jsonutil.String(outputConfig, "effort"); ok {
+					effort = strings.ToLower(strings.TrimSpace(value))
+				}
 			}
 			if effort != "" {
-				out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.thinkingLevel", effort)
+				_ = jsonutil.Set(outRoot, "request.generationConfig.thinkingConfig.thinkingLevel", effort)
 			} else {
-				out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.thinkingLevel", "high")
+				_ = jsonutil.Set(outRoot, "request.generationConfig.thinkingConfig.thinkingLevel", "high")
 			}
-			out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.includeThoughts", true)
+			_ = jsonutil.Set(outRoot, "request.generationConfig.thinkingConfig.includeThoughts", true)
 		}
 	}
-	if v := gjson.GetBytes(rawJSON, "temperature"); v.Exists() && v.Type == gjson.Number {
-		out, _ = sjson.Set(out, "request.generationConfig.temperature", v.Num)
+
+	if value, ok := jsonutil.Get(root, "temperature"); ok {
+		_ = jsonutil.Set(outRoot, "request.generationConfig.temperature", value)
 	}
-	if v := gjson.GetBytes(rawJSON, "top_p"); v.Exists() && v.Type == gjson.Number {
-		out, _ = sjson.Set(out, "request.generationConfig.topP", v.Num)
+	if value, ok := jsonutil.Get(root, "top_p"); ok {
+		_ = jsonutil.Set(outRoot, "request.generationConfig.topP", value)
 	}
-	if v := gjson.GetBytes(rawJSON, "top_k"); v.Exists() && v.Type == gjson.Number {
-		out, _ = sjson.Set(out, "request.generationConfig.topK", v.Num)
+	if value, ok := jsonutil.Get(root, "top_k"); ok {
+		_ = jsonutil.Set(outRoot, "request.generationConfig.topK", value)
 	}
-	if v := gjson.GetBytes(rawJSON, "max_tokens"); v.Exists() && v.Type == gjson.Number {
-		out, _ = sjson.Set(out, "request.generationConfig.maxOutputTokens", v.Num)
+	if value, ok := jsonutil.Get(root, "max_tokens"); ok {
+		_ = jsonutil.Set(outRoot, "request.generationConfig.maxOutputTokens", value)
 	}
 
-	outBytes := []byte(out)
-	outBytes = common.AttachDefaultSafetySettings(outBytes, "request.safetySettings")
-
-	return outBytes
+	outBytes := jsonutil.MarshalOrOriginal(inputRawJSON, outRoot)
+	return common.AttachDefaultSafetySettings(outBytes, "request.safetySettings")
 }

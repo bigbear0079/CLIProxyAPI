@@ -12,10 +12,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 )
 
 const (
@@ -370,9 +370,16 @@ func extractHTMLTitle(body []byte) string {
 
 // extractJSONErrorMessage attempts to extract error.message from JSON error responses
 func extractJSONErrorMessage(body []byte) string {
-	result := gjson.GetBytes(body, "error.message")
-	if result.Exists() && result.String() != "" {
-		return result.String()
+	root, errParse := jsonutil.ParseObjectBytes(body)
+	if errParse != nil {
+		return ""
+	}
+	value, ok := jsonutil.Get(root, "error.message")
+	if !ok {
+		return ""
+	}
+	if message, okString := value.(string); okString && message != "" {
+		return message
 	}
 	return ""
 }

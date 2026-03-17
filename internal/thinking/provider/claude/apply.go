@@ -9,10 +9,9 @@
 package claude
 
 import (
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // Applier implements thinking.ProviderApplier for Claude models.
@@ -77,30 +76,25 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		return body, nil
 	}
 
-	if len(body) == 0 || !gjson.ValidBytes(body) {
-		body = []byte(`{}`)
-	}
+	root := jsonutil.ParseObjectBytesOrEmpty(body)
 
 	supportsAdaptive := modelInfo != nil && modelInfo.Thinking != nil && len(modelInfo.Thinking.Levels) > 0
 
 	switch config.Mode {
 	case thinking.ModeNone:
-		result, _ := sjson.SetBytes(body, "thinking.type", "disabled")
-		result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
-		result, _ = sjson.DeleteBytes(result, "output_config.effort")
-		if oc := gjson.GetBytes(result, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
-			result, _ = sjson.DeleteBytes(result, "output_config")
-		}
-		return result, nil
+		_ = jsonutil.Set(root, "thinking.type", "disabled")
+		_ = jsonutil.Delete(root, "thinking.budget_tokens")
+		clearClaudeOutputConfig(root)
+		return jsonutil.MarshalOrOriginal(body, root), nil
 
 	case thinking.ModeLevel:
 		// Adaptive thinking effort is only valid when the model advertises discrete levels.
 		// (Claude 4.6 uses output_config.effort.)
 		if supportsAdaptive && config.Level != "" {
-			result, _ := sjson.SetBytes(body, "thinking.type", "adaptive")
-			result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
-			result, _ = sjson.SetBytes(result, "output_config.effort", string(config.Level))
-			return result, nil
+			_ = jsonutil.Set(root, "thinking.type", "adaptive")
+			_ = jsonutil.Delete(root, "thinking.budget_tokens")
+			_ = jsonutil.Set(root, "output_config.effort", string(config.Level))
+			return jsonutil.MarshalOrOriginal(body, root), nil
 		}
 
 		// Fallback for non-adaptive Claude models: convert level to budget_tokens.
@@ -117,47 +111,35 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		// Budget is expected to be pre-validated by ValidateConfig (clamped, ZeroAllowed enforced).
 		// Decide enabled/disabled based on budget value.
 		if config.Budget == 0 {
-			result, _ := sjson.SetBytes(body, "thinking.type", "disabled")
-			result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
-			result, _ = sjson.DeleteBytes(result, "output_config.effort")
-			if oc := gjson.GetBytes(result, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
-				result, _ = sjson.DeleteBytes(result, "output_config")
-			}
-			return result, nil
+			_ = jsonutil.Set(root, "thinking.type", "disabled")
+			_ = jsonutil.Delete(root, "thinking.budget_tokens")
+			clearClaudeOutputConfig(root)
+			return jsonutil.MarshalOrOriginal(body, root), nil
 		}
 
-		result, _ := sjson.SetBytes(body, "thinking.type", "enabled")
-		result, _ = sjson.SetBytes(result, "thinking.budget_tokens", config.Budget)
-		result, _ = sjson.DeleteBytes(result, "output_config.effort")
-		if oc := gjson.GetBytes(result, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
-			result, _ = sjson.DeleteBytes(result, "output_config")
-		}
+		_ = jsonutil.Set(root, "thinking.type", "enabled")
+		_ = jsonutil.Set(root, "thinking.budget_tokens", config.Budget)
+		clearClaudeOutputConfig(root)
 
 		// Ensure max_tokens > thinking.budget_tokens (Anthropic API constraint).
-		result = a.normalizeClaudeBudget(result, config.Budget, modelInfo)
-		return result, nil
+		a.normalizeClaudeBudget(root, config.Budget, modelInfo)
+		return jsonutil.MarshalOrOriginal(body, root), nil
 
 	case thinking.ModeAuto:
 		// For Claude 4.6 models, auto maps to adaptive thinking with upstream defaults.
 		if supportsAdaptive {
-			result, _ := sjson.SetBytes(body, "thinking.type", "adaptive")
-			result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
+			_ = jsonutil.Set(root, "thinking.type", "adaptive")
+			_ = jsonutil.Delete(root, "thinking.budget_tokens")
 			// Explicit effort is optional for adaptive thinking; omit it to allow upstream default.
-			result, _ = sjson.DeleteBytes(result, "output_config.effort")
-			if oc := gjson.GetBytes(result, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
-				result, _ = sjson.DeleteBytes(result, "output_config")
-			}
-			return result, nil
+			clearClaudeOutputConfig(root)
+			return jsonutil.MarshalOrOriginal(body, root), nil
 		}
 
 		// Legacy fallback: enable thinking without specifying budget_tokens.
-		result, _ := sjson.SetBytes(body, "thinking.type", "enabled")
-		result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
-		result, _ = sjson.DeleteBytes(result, "output_config.effort")
-		if oc := gjson.GetBytes(result, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
-			result, _ = sjson.DeleteBytes(result, "output_config")
-		}
-		return result, nil
+		_ = jsonutil.Set(root, "thinking.type", "enabled")
+		_ = jsonutil.Delete(root, "thinking.budget_tokens")
+		clearClaudeOutputConfig(root)
+		return jsonutil.MarshalOrOriginal(body, root), nil
 
 	default:
 		return body, nil
@@ -166,9 +148,9 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 
 // normalizeClaudeBudget applies Claude-specific constraints to ensure max_tokens > budget_tokens.
 // Anthropic API requires this constraint; violating it returns a 400 error.
-func (a *Applier) normalizeClaudeBudget(body []byte, budgetTokens int, modelInfo *registry.ModelInfo) []byte {
+func (a *Applier) normalizeClaudeBudget(root map[string]any, budgetTokens int, modelInfo *registry.ModelInfo) {
 	if budgetTokens <= 0 {
-		return body
+		return
 	}
 
 	// Ensure the request satisfies Claude constraints:
@@ -177,9 +159,9 @@ func (a *Applier) normalizeClaudeBudget(body []byte, budgetTokens int, modelInfo
 	//  3) If the adjusted budget falls below the model minimum, leave the request unchanged
 	//  4) If max_tokens came from model default, write it back into the request
 
-	effectiveMax, setDefaultMax := a.effectiveMaxTokens(body, modelInfo)
+	effectiveMax, setDefaultMax := a.effectiveMaxTokens(root, modelInfo)
 	if setDefaultMax && effectiveMax > 0 {
-		body, _ = sjson.SetBytes(body, "max_tokens", effectiveMax)
+		_ = jsonutil.Set(root, "max_tokens", effectiveMax)
 	}
 
 	// Compute the budget we would apply after enforcing budget_tokens < max_tokens.
@@ -195,22 +177,20 @@ func (a *Applier) normalizeClaudeBudget(body []byte, budgetTokens int, modelInfo
 	if minBudget > 0 && adjustedBudget > 0 && adjustedBudget < minBudget {
 		// If enforcing the max_tokens constraint would push the budget below the model minimum,
 		// leave the request unchanged.
-		return body
+		return
 	}
 
 	if adjustedBudget != budgetTokens {
-		body, _ = sjson.SetBytes(body, "thinking.budget_tokens", adjustedBudget)
+		_ = jsonutil.Set(root, "thinking.budget_tokens", adjustedBudget)
 	}
-
-	return body
 }
 
 // effectiveMaxTokens returns the max tokens to cap thinking:
 // prefer request-provided max_tokens; otherwise fall back to model default.
 // The boolean indicates whether the value came from the model default (and thus should be written back).
-func (a *Applier) effectiveMaxTokens(body []byte, modelInfo *registry.ModelInfo) (max int, fromModel bool) {
-	if maxTok := gjson.GetBytes(body, "max_tokens"); maxTok.Exists() && maxTok.Int() > 0 {
-		return int(maxTok.Int()), false
+func (a *Applier) effectiveMaxTokens(root map[string]any, modelInfo *registry.ModelInfo) (max int, fromModel bool) {
+	if maxTok, ok := jsonutil.Int64(root, "max_tokens"); ok && maxTok > 0 {
+		return int(maxTok), false
 	}
 	if modelInfo != nil && modelInfo.MaxCompletionTokens > 0 {
 		return modelInfo.MaxCompletionTokens, true
@@ -223,44 +203,40 @@ func applyCompatibleClaude(body []byte, config thinking.ThinkingConfig) ([]byte,
 		return body, nil
 	}
 
-	if len(body) == 0 || !gjson.ValidBytes(body) {
-		body = []byte(`{}`)
-	}
+	root := jsonutil.ParseObjectBytesOrEmpty(body)
 
 	switch config.Mode {
 	case thinking.ModeNone:
-		result, _ := sjson.SetBytes(body, "thinking.type", "disabled")
-		result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
-		result, _ = sjson.DeleteBytes(result, "output_config.effort")
-		if oc := gjson.GetBytes(result, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
-			result, _ = sjson.DeleteBytes(result, "output_config")
-		}
-		return result, nil
+		_ = jsonutil.Set(root, "thinking.type", "disabled")
+		_ = jsonutil.Delete(root, "thinking.budget_tokens")
+		clearClaudeOutputConfig(root)
+		return jsonutil.MarshalOrOriginal(body, root), nil
 	case thinking.ModeAuto:
-		result, _ := sjson.SetBytes(body, "thinking.type", "enabled")
-		result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
-		result, _ = sjson.DeleteBytes(result, "output_config.effort")
-		if oc := gjson.GetBytes(result, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
-			result, _ = sjson.DeleteBytes(result, "output_config")
-		}
-		return result, nil
+		_ = jsonutil.Set(root, "thinking.type", "enabled")
+		_ = jsonutil.Delete(root, "thinking.budget_tokens")
+		clearClaudeOutputConfig(root)
+		return jsonutil.MarshalOrOriginal(body, root), nil
 	case thinking.ModeLevel:
 		// For user-defined models, interpret ModeLevel as Claude adaptive thinking effort.
 		// Upstream is responsible for validating whether the target model supports it.
 		if config.Level == "" {
 			return body, nil
 		}
-		result, _ := sjson.SetBytes(body, "thinking.type", "adaptive")
-		result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
-		result, _ = sjson.SetBytes(result, "output_config.effort", string(config.Level))
-		return result, nil
+		_ = jsonutil.Set(root, "thinking.type", "adaptive")
+		_ = jsonutil.Delete(root, "thinking.budget_tokens")
+		_ = jsonutil.Set(root, "output_config.effort", string(config.Level))
+		return jsonutil.MarshalOrOriginal(body, root), nil
 	default:
-		result, _ := sjson.SetBytes(body, "thinking.type", "enabled")
-		result, _ = sjson.SetBytes(result, "thinking.budget_tokens", config.Budget)
-		result, _ = sjson.DeleteBytes(result, "output_config.effort")
-		if oc := gjson.GetBytes(result, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
-			result, _ = sjson.DeleteBytes(result, "output_config")
-		}
-		return result, nil
+		_ = jsonutil.Set(root, "thinking.type", "enabled")
+		_ = jsonutil.Set(root, "thinking.budget_tokens", config.Budget)
+		clearClaudeOutputConfig(root)
+		return jsonutil.MarshalOrOriginal(body, root), nil
+	}
+}
+
+func clearClaudeOutputConfig(root map[string]any) {
+	_ = jsonutil.Delete(root, "output_config.effort")
+	if jsonutil.IsEmptyObject(root, "output_config") {
+		_ = jsonutil.Delete(root, "output_config")
 	}
 }

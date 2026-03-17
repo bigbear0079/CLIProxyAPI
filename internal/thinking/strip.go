@@ -2,8 +2,7 @@
 package thinking
 
 import (
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 )
 
 // StripThinkingConfig removes thinking configuration fields from request body.
@@ -23,7 +22,11 @@ import (
 //   - provider is unknown
 //   - no thinking configuration found
 func StripThinkingConfig(body []byte, provider string) []byte {
-	if len(body) == 0 || !gjson.ValidBytes(body) {
+	if len(body) == 0 {
+		return body
+	}
+	root, errParse := jsonutil.ParseObjectBytes(body)
+	if errParse != nil {
 		return body
 	}
 
@@ -55,16 +58,18 @@ func StripThinkingConfig(body []byte, provider string) []byte {
 		return body
 	}
 
-	result := body
 	for _, path := range paths {
-		result, _ = sjson.DeleteBytes(result, path)
+		_ = jsonutil.Delete(root, path)
 	}
 
 	// Avoid leaving an empty output_config object for Claude when effort was the only field.
 	if provider == "claude" {
-		if oc := gjson.GetBytes(result, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
-			result, _ = sjson.DeleteBytes(result, "output_config")
+		outputConfig, ok := jsonutil.Get(root, "output_config")
+		if ok {
+			if object, okObject := outputConfig.(map[string]any); okObject && len(object) == 0 {
+				_ = jsonutil.Delete(root, "output_config")
+			}
 		}
 	}
-	return result
+	return jsonutil.MarshalOrOriginal(body, root)
 }

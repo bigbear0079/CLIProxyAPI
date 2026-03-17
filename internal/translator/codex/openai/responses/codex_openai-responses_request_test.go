@@ -3,7 +3,7 @@ package responses
 import (
 	"testing"
 
-	"github.com/tidwall/gjson"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/testjson"
 )
 
 // TestConvertSystemRoleToDeveloper_BasicConversion tests the basic system -> developer role conversion
@@ -28,19 +28,19 @@ func TestConvertSystemRoleToDeveloper_BasicConversion(t *testing.T) {
 	outputStr := string(output)
 
 	// Check that system role was converted to developer
-	firstItemRole := gjson.Get(outputStr, "input.0.role")
+	firstItemRole := testjson.Get(outputStr, "input.0.role")
 	if firstItemRole.String() != "developer" {
 		t.Errorf("Expected role 'developer', got '%s'", firstItemRole.String())
 	}
 
 	// Check that user role remains unchanged
-	secondItemRole := gjson.Get(outputStr, "input.1.role")
+	secondItemRole := testjson.Get(outputStr, "input.1.role")
 	if secondItemRole.String() != "user" {
 		t.Errorf("Expected role 'user', got '%s'", secondItemRole.String())
 	}
 
 	// Check content is preserved
-	firstItemContent := gjson.Get(outputStr, "input.0.content.0.text")
+	firstItemContent := testjson.Get(outputStr, "input.0.content.0.text")
 	if firstItemContent.String() != "You are a pirate." {
 		t.Errorf("Expected content 'You are a pirate.', got '%s'", firstItemContent.String())
 	}
@@ -73,18 +73,18 @@ func TestConvertSystemRoleToDeveloper_MultipleSystemMessages(t *testing.T) {
 	outputStr := string(output)
 
 	// Check that both system roles were converted
-	firstRole := gjson.Get(outputStr, "input.0.role")
+	firstRole := testjson.Get(outputStr, "input.0.role")
 	if firstRole.String() != "developer" {
 		t.Errorf("Expected first role 'developer', got '%s'", firstRole.String())
 	}
 
-	secondRole := gjson.Get(outputStr, "input.1.role")
+	secondRole := testjson.Get(outputStr, "input.1.role")
 	if secondRole.String() != "developer" {
 		t.Errorf("Expected second role 'developer', got '%s'", secondRole.String())
 	}
 
 	// Check that user role is unchanged
-	thirdRole := gjson.Get(outputStr, "input.2.role")
+	thirdRole := testjson.Get(outputStr, "input.2.role")
 	if thirdRole.String() != "user" {
 		t.Errorf("Expected third role 'user', got '%s'", thirdRole.String())
 	}
@@ -112,12 +112,12 @@ func TestConvertSystemRoleToDeveloper_NoSystemMessages(t *testing.T) {
 	outputStr := string(output)
 
 	// Check that user and assistant roles are unchanged
-	firstRole := gjson.Get(outputStr, "input.0.role")
+	firstRole := testjson.Get(outputStr, "input.0.role")
 	if firstRole.String() != "user" {
 		t.Errorf("Expected role 'user', got '%s'", firstRole.String())
 	}
 
-	secondRole := gjson.Get(outputStr, "input.1.role")
+	secondRole := testjson.Get(outputStr, "input.1.role")
 	if secondRole.String() != "assistant" {
 		t.Errorf("Expected role 'assistant', got '%s'", secondRole.String())
 	}
@@ -134,7 +134,7 @@ func TestConvertSystemRoleToDeveloper_EmptyInput(t *testing.T) {
 	outputStr := string(output)
 
 	// Check that input is still an empty array
-	inputArray := gjson.Get(outputStr, "input")
+	inputArray := testjson.Get(outputStr, "input")
 	if !inputArray.IsArray() {
 		t.Error("Input should still be an array")
 	}
@@ -154,12 +154,12 @@ func TestConvertSystemRoleToDeveloper_NoInputField(t *testing.T) {
 	outputStr := string(output)
 
 	// Check that other fields are still set correctly
-	stream := gjson.Get(outputStr, "stream")
+	stream := testjson.Get(outputStr, "stream")
 	if !stream.Bool() {
 		t.Error("Stream should be set to true by conversion")
 	}
 
-	store := gjson.Get(outputStr, "store")
+	store := testjson.Get(outputStr, "store")
 	if store.Bool() {
 		t.Error("Store should be set to false by conversion")
 	}
@@ -189,29 +189,29 @@ func TestConvertOpenAIResponsesRequestToCodex_OriginalIssue(t *testing.T) {
 	outputStr := string(output)
 
 	// Verify system role was converted to developer
-	firstRole := gjson.Get(outputStr, "input.0.role")
+	firstRole := testjson.Get(outputStr, "input.0.role")
 	if firstRole.String() != "developer" {
 		t.Errorf("Expected role 'developer', got '%s'", firstRole.String())
 	}
 
 	// Verify stream was set to true (as required by Codex)
-	stream := gjson.Get(outputStr, "stream")
+	stream := testjson.Get(outputStr, "stream")
 	if !stream.Bool() {
 		t.Error("Stream should be set to true")
 	}
 
 	// Verify other required fields for Codex
-	store := gjson.Get(outputStr, "store")
+	store := testjson.Get(outputStr, "store")
 	if store.Bool() {
 		t.Error("Store should be false")
 	}
 
-	parallelCalls := gjson.Get(outputStr, "parallel_tool_calls")
+	parallelCalls := testjson.Get(outputStr, "parallel_tool_calls")
 	if !parallelCalls.Bool() {
 		t.Error("parallel_tool_calls should be true")
 	}
 
-	include := gjson.Get(outputStr, "include")
+	include := testjson.Get(outputStr, "include")
 	if !include.IsArray() || len(include.Array()) != 1 {
 		t.Error("include should be an array with one element")
 	} else if include.Array()[0].String() != "reasoning.encrypted_content" {
@@ -246,19 +246,19 @@ func TestConvertSystemRoleToDeveloper_AssistantRole(t *testing.T) {
 	outputStr := string(output)
 
 	// Check system -> developer
-	firstRole := gjson.Get(outputStr, "input.0.role")
+	firstRole := testjson.Get(outputStr, "input.0.role")
 	if firstRole.String() != "developer" {
 		t.Errorf("Expected first role 'developer', got '%s'", firstRole.String())
 	}
 
 	// Check user unchanged
-	secondRole := gjson.Get(outputStr, "input.1.role")
+	secondRole := testjson.Get(outputStr, "input.1.role")
 	if secondRole.String() != "user" {
 		t.Errorf("Expected second role 'user', got '%s'", secondRole.String())
 	}
 
 	// Check assistant unchanged
-	thirdRole := gjson.Get(outputStr, "input.2.role")
+	thirdRole := testjson.Get(outputStr, "input.2.role")
 	if thirdRole.String() != "assistant" {
 		t.Errorf("Expected third role 'assistant', got '%s'", thirdRole.String())
 	}
@@ -275,7 +275,7 @@ func TestUserFieldDeletion(t *testing.T) {
 	outputStr := string(output)
 
 	// Verify user field is deleted
-	userField := gjson.Get(outputStr, "user")
+	userField := testjson.Get(outputStr, "user")
 	if userField.Exists() {
 		t.Errorf("user field should be deleted, but it was found with value: %s", userField.Raw)
 	}
@@ -296,10 +296,10 @@ func TestContextManagementCompactionCompatibility(t *testing.T) {
 	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
 	outputStr := string(output)
 
-	if gjson.Get(outputStr, "context_management").Exists() {
+	if testjson.Get(outputStr, "context_management").Exists() {
 		t.Fatalf("context_management should be removed for Codex compatibility")
 	}
-	if gjson.Get(outputStr, "truncation").Exists() {
+	if testjson.Get(outputStr, "truncation").Exists() {
 		t.Fatalf("truncation should be removed for Codex compatibility")
 	}
 }
@@ -314,7 +314,7 @@ func TestTruncationRemovedForCodexCompatibility(t *testing.T) {
 	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
 	outputStr := string(output)
 
-	if gjson.Get(outputStr, "truncation").Exists() {
+	if testjson.Get(outputStr, "truncation").Exists() {
 		t.Fatalf("truncation should be removed for Codex compatibility")
 	}
 }

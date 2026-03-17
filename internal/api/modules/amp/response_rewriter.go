@@ -6,9 +6,8 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // ResponseRewriter wraps a gin.ResponseWriter to intercept and modify the response body
@@ -71,37 +70,62 @@ var modelFieldPaths = []string{"message.model", "model", "modelVersion", "respon
 // rewriteModelInResponse replaces all occurrences of the mapped model with the original model in JSON
 // It also suppresses "thinking" blocks if "tool_use" is present to ensure Amp client compatibility
 func (rw *ResponseRewriter) rewriteModelInResponse(data []byte) []byte {
+	root, errParse := jsonutil.ParseObjectBytes(data)
+	if errParse != nil {
+		return data
+	}
+	modified := false
+
 	// 1. Amp Compatibility: Suppress thinking blocks if tool use is detected
 	// The Amp client struggles when both thinking and tool_use blocks are present
-	if gjson.GetBytes(data, `content.#(type=="tool_use")`).Exists() {
-		filtered := gjson.GetBytes(data, `content.#(type!="thinking")#`)
-		if filtered.Exists() {
-			originalCount := gjson.GetBytes(data, "content.#").Int()
-			filteredCount := filtered.Get("#").Int()
+	contentValue, okContent := jsonutil.Get(root, "content")
+	if okContent {
+		if contentArray, okArray := contentValue.([]any); okArray {
+			hasToolUse := false
+			filtered := make([]any, 0, len(contentArray))
+			for _, itemValue := range contentArray {
+				item, okItem := itemValue.(map[string]any)
+				if !okItem {
+					filtered = append(filtered, itemValue)
+					continue
+				}
+				itemType, _ := item["type"].(string)
+				if itemType == "tool_use" {
+					hasToolUse = true
+				}
+				if itemType != "thinking" {
+					filtered = append(filtered, itemValue)
+				}
+			}
 
-			if originalCount > filteredCount {
-				var err error
-				data, err = sjson.SetBytes(data, "content", filtered.Value())
-				if err != nil {
-					log.Warnf("Amp ResponseRewriter: failed to suppress thinking blocks: %v", err)
+			if hasToolUse && len(contentArray) > len(filtered) {
+				if errSet := jsonutil.Set(root, "content", filtered); errSet != nil {
+					log.Warnf("Amp ResponseRewriter: failed to suppress thinking blocks: %v", errSet)
 				} else {
-					log.Debugf("Amp ResponseRewriter: Suppressed %d thinking blocks due to tool usage", originalCount-filteredCount)
-					// Log the result for verification
-					log.Debugf("Amp ResponseRewriter: Resulting content: %s", gjson.GetBytes(data, "content").String())
+					modified = true
+					log.Debugf("Amp ResponseRewriter: Suppressed %d thinking blocks due to tool usage", len(contentArray)-len(filtered))
 				}
 			}
 		}
 	}
 
 	if rw.originalModel == "" {
-		return data
+		if !modified {
+			return data
+		}
+		return jsonutil.MarshalOrOriginal(data, root)
 	}
 	for _, path := range modelFieldPaths {
-		if gjson.GetBytes(data, path).Exists() {
-			data, _ = sjson.SetBytes(data, path, rw.originalModel)
+		if jsonutil.Exists(root, path) {
+			if errSet := jsonutil.Set(root, path, rw.originalModel); errSet == nil {
+				modified = true
+			}
 		}
 	}
-	return data
+	if !modified {
+		return data
+	}
+	return jsonutil.MarshalOrOriginal(data, root)
 }
 
 // rewriteStreamChunk rewrites model names in SSE stream chunks

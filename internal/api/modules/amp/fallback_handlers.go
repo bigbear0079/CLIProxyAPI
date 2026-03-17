@@ -8,11 +8,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // AmpRouteType represents the type of routing decision made for an Amp request
@@ -285,23 +284,27 @@ func filterAntropicBetaHeader(c *gin.Context) {
 
 // rewriteModelInRequest replaces the model name in a JSON request body
 func rewriteModelInRequest(body []byte, newModel string) []byte {
-	if !gjson.GetBytes(body, "model").Exists() {
+	root, errParse := jsonutil.ParseObjectBytes(body)
+	if errParse != nil || !jsonutil.Exists(root, "model") {
 		return body
 	}
-	result, err := sjson.SetBytes(body, "model", newModel)
-	if err != nil {
-		log.Warnf("amp model mapping: failed to rewrite model in request body: %v", err)
+	if errSet := jsonutil.Set(root, "model", newModel); errSet != nil {
+		log.Warnf("amp model mapping: failed to rewrite model in request body: %v", errSet)
 		return body
 	}
-	return result
+	return jsonutil.MarshalOrOriginal(body, root)
 }
 
 // extractModelFromRequest attempts to extract the model name from various request formats
 func extractModelFromRequest(body []byte, c *gin.Context) string {
 	// First try to parse from JSON body (OpenAI, Claude, etc.)
 	// Check common model field names
-	if result := gjson.GetBytes(body, "model"); result.Exists() && result.Type == gjson.String {
-		return result.String()
+	if root, errParse := jsonutil.ParseObjectBytes(body); errParse == nil {
+		if model, ok := jsonutil.Get(root, "model"); ok {
+			if modelString, okString := model.(string); okString {
+				return modelString
+			}
+		}
 	}
 
 	// For Gemini requests, model is in the URL path

@@ -3,7 +3,7 @@ package chat_completions
 import (
 	"testing"
 
-	"github.com/tidwall/gjson"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/testjson"
 )
 
 // Basic tool-call: system + user + assistant(tool_calls, no content) + tool result.
@@ -50,9 +50,9 @@ func TestToolCallSimple(t *testing.T) {
 	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
-	items := gjson.Get(result, "input").Array()
+	items := testjson.Get(result, "input").Array()
 	if len(items) != 4 {
-		t.Fatalf("expected 4 input items, got %d: %s", len(items), gjson.Get(result, "input").Raw)
+		t.Fatalf("expected 4 input items, got %d: %s", len(items), testjson.Get(result, "input").Raw)
 	}
 
 	// system -> developer
@@ -139,10 +139,10 @@ func TestToolCallWithContent(t *testing.T) {
 	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
-	items := gjson.Get(result, "input").Array()
+	items := testjson.Get(result, "input").Array()
 	// user + assistant(with content) + function_call + function_call_output
 	if len(items) != 4 {
-		t.Fatalf("expected 4 input items, got %d: %s", len(items), gjson.Get(result, "input").Raw)
+		t.Fatalf("expected 4 input items, got %d: %s", len(items), testjson.Get(result, "input").Raw)
 	}
 
 	if items[0].Get("role").String() != "user" {
@@ -232,10 +232,10 @@ func TestMultipleToolCalls(t *testing.T) {
 	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
-	items := gjson.Get(result, "input").Array()
+	items := testjson.Get(result, "input").Array()
 	// user + 3 function_call + 3 function_call_output = 7
 	if len(items) != 7 {
-		t.Fatalf("expected 7 input items, got %d: %s", len(items), gjson.Get(result, "input").Raw)
+		t.Fatalf("expected 7 input items, got %d: %s", len(items), testjson.Get(result, "input").Raw)
 	}
 
 	if items[0].Get("role").String() != "user" {
@@ -303,7 +303,7 @@ func TestNoSpuriousEmptyAssistantMessage(t *testing.T) {
 	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
-	items := gjson.Get(result, "input").Array()
+	items := testjson.Get(result, "input").Array()
 
 	for i, item := range items {
 		typ := item.Get("type").String()
@@ -318,7 +318,7 @@ func TestNoSpuriousEmptyAssistantMessage(t *testing.T) {
 
 	// should be exactly: user + function_call + function_call_output
 	if len(items) != 3 {
-		t.Fatalf("expected 3 input items (user + function_call + function_call_output), got %d: %s", len(items), gjson.Get(result, "input").Raw)
+		t.Fatalf("expected 3 input items (user + function_call + function_call_output), got %d: %s", len(items), testjson.Get(result, "input").Raw)
 	}
 	if items[0].Get("type").String() != "message" || items[0].Get("role").String() != "user" {
 		t.Errorf("item 0: expected user message")
@@ -367,10 +367,10 @@ func TestMultiTurnToolCalling(t *testing.T) {
 	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
-	items := gjson.Get(result, "input").Array()
+	items := testjson.Get(result, "input").Array()
 	// user, func_call(r1), func_output(r1), assistant text, user, func_call(r2), func_output(r2)
 	if len(items) != 7 {
-		t.Fatalf("expected 7 input items, got %d: %s", len(items), gjson.Get(result, "input").Raw)
+		t.Fatalf("expected 7 input items, got %d: %s", len(items), testjson.Get(result, "input").Raw)
 	}
 
 	for i, item := range items {
@@ -451,10 +451,10 @@ func TestToolNameShortening(t *testing.T) {
 	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
-	items := gjson.Get(result, "input").Array()
+	items := testjson.Get(result, "input").Array()
 
 	// find function_call
-	var funcCallItem gjson.Result
+	var funcCallItem testjson.Result
 	for _, item := range items {
 		if item.Get("type").String() == "function_call" {
 			funcCallItem = item
@@ -515,7 +515,7 @@ func TestEmptyStringContent(t *testing.T) {
 	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
-	items := gjson.Get(result, "input").Array()
+	items := testjson.Get(result, "input").Array()
 
 	for i, item := range items {
 		if item.Get("type").String() == "message" && item.Get("role").String() == "assistant" {
@@ -557,7 +557,7 @@ func TestCallIDsMatchBetweenCallAndOutput(t *testing.T) {
 	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
-	items := gjson.Get(result, "input").Array()
+	items := testjson.Get(result, "input").Array()
 
 	// collect call_ids from function_call items
 	callIDs := make(map[string]bool)
@@ -617,7 +617,7 @@ func TestToolsDefinitionTranslated(t *testing.T) {
 	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
-	tools := gjson.Get(result, "tools").Array()
+	tools := testjson.Get(result, "tools").Array()
 	if len(tools) == 0 {
 		t.Fatal("no tools found in output")
 	}
@@ -630,6 +630,6 @@ func TestToolsDefinitionTranslated(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("tool 'search' not found in output tools: %s", gjson.Get(result, "tools").Raw)
+		t.Errorf("tool 'search' not found in output tools: %s", testjson.Get(result, "tools").Raw)
 	}
 }

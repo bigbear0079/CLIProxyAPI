@@ -25,12 +25,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	sdkauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 )
 
 const (
@@ -76,7 +76,7 @@ func main() {
 	// Resolve relative paths against the working directory.
 	wd, err := os.Getwd()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: cannot get working directory: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "error: cannot get working directory: %v\n", err)
 		os.Exit(1)
 	}
 	if !filepath.IsAbs(authsDir) {
@@ -95,11 +95,11 @@ func main() {
 	ctx := context.Background()
 	auths, err := fileStore.List(ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to list auth files: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "error: failed to list auth files: %v\n", err)
 		os.Exit(1)
 	}
 	if len(auths) == 0 {
-		fmt.Fprintf(os.Stderr, "error: no auth files found in %s\n", authsDir)
+		_, _ = fmt.Fprintf(os.Stderr, "error: no auth files found in %s\n", authsDir)
 		os.Exit(1)
 	}
 
@@ -115,7 +115,7 @@ func main() {
 		}
 	}
 	if chosen == nil {
-		fmt.Fprintf(os.Stderr, "error: no enabled antigravity auth found in %s\n", authsDir)
+		_, _ = fmt.Fprintf(os.Stderr, "error: no enabled antigravity auth found in %s\n", authsDir)
 		os.Exit(1)
 	}
 
@@ -129,7 +129,7 @@ func main() {
 
 	models := fetchModels(fetchCtx, chosen)
 	if len(models) == 0 {
-		fmt.Fprintln(os.Stderr, "warning: no models returned (API may be unavailable or token expired)")
+		_, _ = fmt.Fprintln(os.Stderr, "warning: no models returned (API may be unavailable or token expired)")
 	} else {
 		fmt.Printf("Fetched %d models.\n", len(models))
 	}
@@ -147,12 +147,12 @@ func main() {
 		raw, err = json.Marshal(out)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to marshal JSON: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "error: failed to marshal JSON: %v\n", err)
 		os.Exit(1)
 	}
 
 	if err = os.WriteFile(outputPath, raw, 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to write output file %s: %v\n", outputPath, err)
+		_, _ = fmt.Fprintf(os.Stderr, "error: failed to write output file %s: %v\n", outputPath, err)
 		os.Exit(1)
 	}
 
@@ -162,7 +162,7 @@ func main() {
 func fetchModels(ctx context.Context, auth *coreauth.Auth) []modelEntry {
 	accessToken := metaStringValue(auth.Metadata, "access_token")
 	if accessToken == "" {
-		fmt.Fprintln(os.Stderr, "error: no access token found in auth")
+		_, _ = fmt.Fprintln(os.Stderr, "error: no access token found in auth")
 		return nil
 	}
 
@@ -200,7 +200,7 @@ func fetchModels(ctx context.Context, auth *coreauth.Auth) []modelEntry {
 		}
 
 		bodyBytes, errRead := io.ReadAll(httpResp.Body)
-		httpResp.Body.Close()
+		_ = httpResp.Body.Close()
 		if errRead != nil {
 			continue
 		}
@@ -209,14 +209,22 @@ func fetchModels(ctx context.Context, auth *coreauth.Auth) []modelEntry {
 			continue
 		}
 
-		result := gjson.GetBytes(bodyBytes, "models")
-		if !result.Exists() {
+		root, errParse := jsonutil.ParseObjectBytes(bodyBytes)
+		if errParse != nil {
+			continue
+		}
+		modelsValue, okModels := root["models"]
+		if !okModels {
+			continue
+		}
+		modelsMap, okModelsMap := modelsValue.(map[string]any)
+		if !okModelsMap {
 			continue
 		}
 
 		var models []modelEntry
 
-		for originalName, modelData := range result.Map() {
+		for originalName, modelDataValue := range modelsMap {
 			modelID := strings.TrimSpace(originalName)
 			if modelID == "" {
 				continue
@@ -227,7 +235,12 @@ func fetchModels(ctx context.Context, auth *coreauth.Auth) []modelEntry {
 				continue
 			}
 
-			displayName := modelData.Get("displayName").String()
+			modelData, okModelData := modelDataValue.(map[string]any)
+			if !okModelData {
+				continue
+			}
+
+			displayName := metaStringValue(modelData, "displayName")
 			if displayName == "" {
 				displayName = modelID
 			}
@@ -242,11 +255,11 @@ func fetchModels(ctx context.Context, auth *coreauth.Auth) []modelEntry {
 				Description: displayName,
 			}
 
-			if maxTok := modelData.Get("maxTokens").Int(); maxTok > 0 {
-				entry.ContextLength = int(maxTok)
+			if maxTok := metaIntValue(modelData, "maxTokens"); maxTok > 0 {
+				entry.ContextLength = maxTok
 			}
-			if maxOut := modelData.Get("maxOutputTokens").Int(); maxOut > 0 {
-				entry.MaxCompletionTokens = int(maxOut)
+			if maxOut := metaIntValue(modelData, "maxOutputTokens"); maxOut > 0 {
+				entry.MaxCompletionTokens = maxOut
 			}
 
 			models = append(models, entry)
@@ -271,5 +284,31 @@ func metaStringValue(m map[string]interface{}, key string) string {
 		return val
 	default:
 		return ""
+	}
+}
+
+func metaIntValue(m map[string]any, key string) int {
+	if m == nil {
+		return 0
+	}
+	v, ok := m[key]
+	if !ok {
+		return 0
+	}
+	switch val := v.(type) {
+	case float64:
+		return int(val)
+	case int:
+		return val
+	case int64:
+		return int(val)
+	case json.Number:
+		out, errParse := val.Int64()
+		if errParse != nil {
+			return 0
+		}
+		return int(out)
+	default:
+		return 0
 	}
 }

@@ -12,10 +12,9 @@
 package gemini
 
 import (
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // Applier applies thinking configuration for Gemini models.
@@ -70,10 +69,6 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		return body, nil
 	}
 
-	if len(body) == 0 || !gjson.ValidBytes(body) {
-		body = []byte(`{}`)
-	}
-
 	// Choose format based on config.Mode and model capabilities:
 	// - ModeLevel: use Level format (validation will reject unsupported levels)
 	// - ModeNone: use Level format if model has Levels, else Budget format
@@ -97,10 +92,6 @@ func (a *Applier) applyCompatible(body []byte, config thinking.ThinkingConfig) (
 		return body, nil
 	}
 
-	if len(body) == 0 || !gjson.ValidBytes(body) {
-		body = []byte(`{}`)
-	}
-
 	if config.Mode == thinking.ModeAuto {
 		return a.applyBudgetFormat(body, config)
 	}
@@ -113,24 +104,27 @@ func (a *Applier) applyCompatible(body []byte, config thinking.ThinkingConfig) (
 }
 
 func (a *Applier) applyLevelFormat(body []byte, config thinking.ThinkingConfig) ([]byte, error) {
+	root := jsonutil.ParseObjectBytesOrEmpty(body)
+	includeThoughts, includeThoughtsSet := readThinkingIncludeThoughts(root, "generationConfig.thinkingConfig")
+
 	// ModeNone semantics:
 	//   - ModeNone + Budget=0: completely disable thinking (not possible for Level-only models)
 	//   - ModeNone + Budget>0: forced to think but hide output (includeThoughts=false)
 	// ValidateConfig sets config.Level to the lowest level when ModeNone + Budget > 0.
 
 	// Remove conflicting fields to avoid both thinkingLevel and thinkingBudget in output
-	result, _ := sjson.DeleteBytes(body, "generationConfig.thinkingConfig.thinkingBudget")
-	result, _ = sjson.DeleteBytes(result, "generationConfig.thinkingConfig.thinking_budget")
-	result, _ = sjson.DeleteBytes(result, "generationConfig.thinkingConfig.thinking_level")
+	_ = jsonutil.Delete(root, "generationConfig.thinkingConfig.thinkingBudget")
+	_ = jsonutil.Delete(root, "generationConfig.thinkingConfig.thinking_budget")
+	_ = jsonutil.Delete(root, "generationConfig.thinkingConfig.thinking_level")
 	// Normalize includeThoughts field name to avoid oneof conflicts in upstream JSON parsing.
-	result, _ = sjson.DeleteBytes(result, "generationConfig.thinkingConfig.include_thoughts")
+	_ = jsonutil.Delete(root, "generationConfig.thinkingConfig.include_thoughts")
 
 	if config.Mode == thinking.ModeNone {
-		result, _ = sjson.SetBytes(result, "generationConfig.thinkingConfig.includeThoughts", false)
+		_ = jsonutil.Set(root, "generationConfig.thinkingConfig.includeThoughts", false)
 		if config.Level != "" {
-			result, _ = sjson.SetBytes(result, "generationConfig.thinkingConfig.thinkingLevel", string(config.Level))
+			_ = jsonutil.Set(root, "generationConfig.thinkingConfig.thinkingLevel", string(config.Level))
 		}
-		return result, nil
+		return jsonutil.MarshalOrOriginal(body, root), nil
 	}
 
 	// Only handle ModeLevel - budget conversion should be done by upper layer
@@ -139,27 +133,27 @@ func (a *Applier) applyLevelFormat(body []byte, config thinking.ThinkingConfig) 
 	}
 
 	level := string(config.Level)
-	result, _ = sjson.SetBytes(result, "generationConfig.thinkingConfig.thinkingLevel", level)
+	_ = jsonutil.Set(root, "generationConfig.thinkingConfig.thinkingLevel", level)
 
 	// Respect user's explicit includeThoughts setting from original body; default to true if not set
 	// Support both camelCase and snake_case variants
-	includeThoughts := true
-	if inc := gjson.GetBytes(body, "generationConfig.thinkingConfig.includeThoughts"); inc.Exists() {
-		includeThoughts = inc.Bool()
-	} else if inc := gjson.GetBytes(body, "generationConfig.thinkingConfig.include_thoughts"); inc.Exists() {
-		includeThoughts = inc.Bool()
+	if !includeThoughtsSet {
+		includeThoughts = true
 	}
-	result, _ = sjson.SetBytes(result, "generationConfig.thinkingConfig.includeThoughts", includeThoughts)
-	return result, nil
+	_ = jsonutil.Set(root, "generationConfig.thinkingConfig.includeThoughts", includeThoughts)
+	return jsonutil.MarshalOrOriginal(body, root), nil
 }
 
 func (a *Applier) applyBudgetFormat(body []byte, config thinking.ThinkingConfig) ([]byte, error) {
+	root := jsonutil.ParseObjectBytesOrEmpty(body)
+	includeThoughts, userSetIncludeThoughts := readThinkingIncludeThoughts(root, "generationConfig.thinkingConfig")
+
 	// Remove conflicting fields to avoid both thinkingLevel and thinkingBudget in output
-	result, _ := sjson.DeleteBytes(body, "generationConfig.thinkingConfig.thinkingLevel")
-	result, _ = sjson.DeleteBytes(result, "generationConfig.thinkingConfig.thinking_level")
-	result, _ = sjson.DeleteBytes(result, "generationConfig.thinkingConfig.thinking_budget")
+	_ = jsonutil.Delete(root, "generationConfig.thinkingConfig.thinkingLevel")
+	_ = jsonutil.Delete(root, "generationConfig.thinkingConfig.thinking_level")
+	_ = jsonutil.Delete(root, "generationConfig.thinkingConfig.thinking_budget")
 	// Normalize includeThoughts field name to avoid oneof conflicts in upstream JSON parsing.
-	result, _ = sjson.DeleteBytes(result, "generationConfig.thinkingConfig.include_thoughts")
+	_ = jsonutil.Delete(root, "generationConfig.thinkingConfig.include_thoughts")
 
 	budget := config.Budget
 
@@ -167,23 +161,13 @@ func (a *Applier) applyBudgetFormat(body []byte, config thinking.ThinkingConfig)
 	// This ensures that when user requests budget=0 (disable thinking output),
 	// the includeThoughts is correctly set to false even if budget is clamped to min.
 	if config.Mode == thinking.ModeNone {
-		result, _ = sjson.SetBytes(result, "generationConfig.thinkingConfig.thinkingBudget", budget)
-		result, _ = sjson.SetBytes(result, "generationConfig.thinkingConfig.includeThoughts", false)
-		return result, nil
+		_ = jsonutil.Set(root, "generationConfig.thinkingConfig.thinkingBudget", budget)
+		_ = jsonutil.Set(root, "generationConfig.thinkingConfig.includeThoughts", false)
+		return jsonutil.MarshalOrOriginal(body, root), nil
 	}
 
 	// Determine includeThoughts: respect user's explicit setting from original body if provided
 	// Support both camelCase and snake_case variants
-	var includeThoughts bool
-	var userSetIncludeThoughts bool
-	if inc := gjson.GetBytes(body, "generationConfig.thinkingConfig.includeThoughts"); inc.Exists() {
-		includeThoughts = inc.Bool()
-		userSetIncludeThoughts = true
-	} else if inc := gjson.GetBytes(body, "generationConfig.thinkingConfig.include_thoughts"); inc.Exists() {
-		includeThoughts = inc.Bool()
-		userSetIncludeThoughts = true
-	}
-
 	if !userSetIncludeThoughts {
 		// No explicit setting, use default logic based on mode
 		switch config.Mode {
@@ -194,7 +178,17 @@ func (a *Applier) applyBudgetFormat(body []byte, config thinking.ThinkingConfig)
 		}
 	}
 
-	result, _ = sjson.SetBytes(result, "generationConfig.thinkingConfig.thinkingBudget", budget)
-	result, _ = sjson.SetBytes(result, "generationConfig.thinkingConfig.includeThoughts", includeThoughts)
-	return result, nil
+	_ = jsonutil.Set(root, "generationConfig.thinkingConfig.thinkingBudget", budget)
+	_ = jsonutil.Set(root, "generationConfig.thinkingConfig.includeThoughts", includeThoughts)
+	return jsonutil.MarshalOrOriginal(body, root), nil
+}
+
+func readThinkingIncludeThoughts(root map[string]any, basePath string) (bool, bool) {
+	if includeThoughts, ok := jsonutil.Bool(root, basePath+".includeThoughts"); ok {
+		return includeThoughts, true
+	}
+	if includeThoughts, ok := jsonutil.Bool(root, basePath+".include_thoughts"); ok {
+		return includeThoughts, true
+	}
+	return false, false
 }

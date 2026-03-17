@@ -10,8 +10,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 )
 
 // ConvertAntigravityResponseToGemini parses and transforms a Gemini CLI API request into Gemini API format.
@@ -38,24 +37,12 @@ func ConvertAntigravityResponseToGemini(ctx context.Context, _ string, originalR
 	if alt, ok := ctx.Value("alt").(string); ok {
 		var chunk []byte
 		if alt == "" {
-			responseResult := gjson.GetBytes(rawJSON, "response")
-			if responseResult.Exists() {
-				chunk = []byte(responseResult.Raw)
+			if responseResult, ok := jsonutil.Get(jsonutil.ParseObjectBytesOrEmpty(rawJSON), "response"); ok {
+				chunk = jsonutil.MarshalOrOriginal(rawJSON, responseResult)
 				chunk = restoreUsageMetadata(chunk)
 			}
 		} else {
-			chunkTemplate := "[]"
-			responseResult := gjson.ParseBytes(chunk)
-			if responseResult.IsArray() {
-				responseResultItems := responseResult.Array()
-				for i := 0; i < len(responseResultItems); i++ {
-					responseResultItem := responseResultItems[i]
-					if responseResultItem.Get("response").Exists() {
-						chunkTemplate, _ = sjson.SetRaw(chunkTemplate, "-1", responseResultItem.Get("response").Raw)
-					}
-				}
-			}
-			chunk = []byte(chunkTemplate)
+			chunk = []byte("[]")
 		}
 		return []string{string(chunk)}
 	}
@@ -75,9 +62,8 @@ func ConvertAntigravityResponseToGemini(ctx context.Context, _ string, originalR
 // Returns:
 //   - string: A Gemini-compatible JSON response containing the response data
 func ConvertAntigravityResponseToGeminiNonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) string {
-	responseResult := gjson.GetBytes(rawJSON, "response")
-	if responseResult.Exists() {
-		chunk := restoreUsageMetadata([]byte(responseResult.Raw))
+	if responseResult, ok := jsonutil.Get(jsonutil.ParseObjectBytesOrEmpty(rawJSON), "response"); ok {
+		chunk := restoreUsageMetadata(jsonutil.MarshalOrOriginal(rawJSON, responseResult))
 		return string(chunk)
 	}
 	return string(rawJSON)
@@ -92,9 +78,11 @@ func GeminiTokenCount(ctx context.Context, count int64) string {
 // to preserve usage data while hiding it from clients that don't expect it.
 // When returning standard Gemini API format, we must restore the original name.
 func restoreUsageMetadata(chunk []byte) []byte {
-	if cpaUsage := gjson.GetBytes(chunk, "cpaUsageMetadata"); cpaUsage.Exists() {
-		chunk, _ = sjson.SetRawBytes(chunk, "usageMetadata", []byte(cpaUsage.Raw))
-		chunk, _ = sjson.DeleteBytes(chunk, "cpaUsageMetadata")
+	root := jsonutil.ParseObjectBytesOrEmpty(chunk)
+	if cpaUsage, ok := jsonutil.Get(root, "cpaUsageMetadata"); ok {
+		root["usageMetadata"] = cpaUsage
+		delete(root, "cpaUsageMetadata")
+		return jsonutil.MarshalOrOriginal(chunk, root)
 	}
 	return chunk
 }

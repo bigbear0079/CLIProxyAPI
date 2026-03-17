@@ -8,10 +8,10 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/testjson"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
-	"github.com/tidwall/gjson"
 )
 
 func TestOpenAICompatExecutorCompactPassthrough(t *testing.T) {
@@ -46,10 +46,10 @@ func TestOpenAICompatExecutorCompactPassthrough(t *testing.T) {
 	if gotPath != "/v1/responses/compact" {
 		t.Fatalf("path = %q, want %q", gotPath, "/v1/responses/compact")
 	}
-	if !gjson.GetBytes(gotBody, "input").Exists() {
+	if !testjson.GetBytes(gotBody, "input").Exists() {
 		t.Fatalf("expected input in body")
 	}
-	if gjson.GetBytes(gotBody, "messages").Exists() {
+	if testjson.GetBytes(gotBody, "messages").Exists() {
 		t.Fatalf("unexpected messages in body")
 	}
 	if string(resp.Payload) != `{"id":"resp_1","object":"response.compaction","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}` {

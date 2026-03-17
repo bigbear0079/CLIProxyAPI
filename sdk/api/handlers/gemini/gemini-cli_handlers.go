@@ -7,6 +7,7 @@ package gemini
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,10 +17,10 @@ import (
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 )
 
 // GeminiCLIAPIHandler contains the handlers for Gemini CLI API endpoints.
@@ -155,8 +156,10 @@ func (h *GeminiCLIAPIHandler) handleInternalStreamGenerateContent(c *gin.Context
 		return
 	}
 
-	modelResult := gjson.GetBytes(rawJSON, "model")
-	modelName := modelResult.String()
+	modelName := ""
+	if root, errParse := jsonutil.ParseObjectBytes(rawJSON); errParse == nil {
+		modelName = geminiCLIJSONString(root["model"])
+	}
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
@@ -169,8 +172,10 @@ func (h *GeminiCLIAPIHandler) handleInternalStreamGenerateContent(c *gin.Context
 // It sends a request to the backend client and proxies the entire response back to the client at once.
 func (h *GeminiCLIAPIHandler) handleInternalGenerateContent(c *gin.Context, rawJSON []byte) {
 	c.Header("Content-Type", "application/json")
-	modelResult := gjson.GetBytes(rawJSON, "model")
-	modelName := modelResult.String()
+	modelName := ""
+	if root, errParse := jsonutil.ParseObjectBytes(rawJSON); errParse == nil {
+		modelName = geminiCLIJSONString(root["model"])
+	}
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
@@ -228,4 +233,15 @@ func (h *GeminiCLIAPIHandler) forwardCLIStream(c *gin.Context, flusher http.Flus
 			}
 		},
 	})
+}
+
+func geminiCLIJSONString(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case json.Number:
+		return typed.String()
+	default:
+		return fmt.Sprint(typed)
+	}
 }

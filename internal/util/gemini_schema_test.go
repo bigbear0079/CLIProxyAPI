@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tidwall/gjson"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/testjson"
 )
 
 func TestCleanJSONSchemaForAntigravity_ConstToEnum(t *testing.T) {
@@ -293,7 +293,7 @@ func TestCleanJSONSchemaForAntigravity_CyclicRefDefaults(t *testing.T) {
 	result := CleanJSONSchemaForAntigravity(input)
 
 	var resMap map[string]interface{}
-	json.Unmarshal([]byte(result), &resMap)
+	_ = json.Unmarshal([]byte(result), &resMap)
 
 	if resMap["type"] != "object" {
 		t.Errorf("Expected type: object, got: %v", resMap["type"])
@@ -388,7 +388,7 @@ func TestCleanJSONSchemaForAntigravity_PropertyNameCollision(t *testing.T) {
 	compareJSON(t, expected, result)
 
 	var resMap map[string]interface{}
-	json.Unmarshal([]byte(result), &resMap)
+	_ = json.Unmarshal([]byte(result), &resMap)
 	props, _ := resMap["properties"].(map[string]interface{})
 	if _, ok := props["description"]; ok {
 		t.Errorf("Invalid 'description' property injected into properties map")
@@ -429,7 +429,7 @@ func TestCleanJSONSchemaForAntigravity_DotKeys(t *testing.T) {
 			t.Errorf("Key 'my.param' still contains $ref")
 		}
 		if _, ok := props["my"]; ok {
-			t.Errorf("Artifact key 'my' created by sjson splitting")
+			t.Errorf("artifact key 'my' was split incorrectly during path handling")
 		}
 	}
 }
@@ -708,7 +708,7 @@ func TestCleanJSONSchemaForAntigravity_NestedEmptySchema(t *testing.T) {
 
 	// Nested empty object should also get placeholder
 	// Check that the nested object has a reason property
-	parsed := gjson.Parse(result)
+	parsed := testjson.Parse(result)
 	nestedProps := parsed.Get("properties.items.items.properties")
 	if !nestedProps.Exists() || !nestedProps.Get("reason").Exists() {
 		t.Errorf("Nested empty object should have 'reason' placeholder, got: %s", result)

@@ -9,11 +9,9 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/common"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // ConvertGeminiRequestToGeminiCLI parses and transforms a Gemini CLI API request into Gemini API format.
@@ -33,102 +31,125 @@ import (
 // Returns:
 //   - []byte: The transformed request data in Gemini API format
 func ConvertGeminiRequestToGeminiCLI(_ string, inputRawJSON []byte, _ bool) []byte {
-	rawJSON := inputRawJSON
-	template := ""
-	template = `{"project":"","request":{},"model":""}`
-	template, _ = sjson.SetRaw(template, "request", string(rawJSON))
-	template, _ = sjson.Set(template, "model", gjson.Get(template, "request.model").String())
-	template, _ = sjson.Delete(template, "request.model")
+	requestRoot := jsonutil.ParseObjectBytesOrEmpty(inputRawJSON)
+	outRoot := map[string]any{
+		"project": "",
+		"request": requestRoot,
+		"model":   "",
+	}
+	if modelName, ok := jsonutil.String(requestRoot, "model"); ok {
+		outRoot["model"] = modelName
+		delete(requestRoot, "model")
+	}
 
-	template, errFixCLIToolResponse := fixCLIToolResponse(template)
+	errFixCLIToolResponse := fixCLIToolResponse(outRoot)
 	if errFixCLIToolResponse != nil {
 		return []byte{}
 	}
 
-	systemInstructionResult := gjson.Get(template, "request.system_instruction")
-	if systemInstructionResult.Exists() {
-		template, _ = sjson.SetRaw(template, "request.systemInstruction", systemInstructionResult.Raw)
-		template, _ = sjson.Delete(template, "request.system_instruction")
+	if systemInstruction, ok := jsonutil.Get(requestRoot, "system_instruction"); ok {
+		requestRoot["systemInstruction"] = systemInstruction
+		delete(requestRoot, "system_instruction")
 	}
-	rawJSON = []byte(template)
 
 	// Normalize roles in request.contents: default to valid values if missing/invalid
-	contents := gjson.GetBytes(rawJSON, "request.contents")
-	if contents.Exists() {
+	if contents, ok := jsonutil.Array(requestRoot, "contents"); ok {
 		prevRole := ""
-		idx := 0
-		contents.ForEach(func(_ gjson.Result, value gjson.Result) bool {
-			role := value.Get("role").String()
+		for _, contentValue := range contents {
+			content, ok := contentValue.(map[string]any)
+			if !ok {
+				continue
+			}
+			role, _ := jsonutil.String(content, "role")
 			valid := role == "user" || role == "model"
 			if role == "" || !valid {
-				var newRole string
 				if prevRole == "" {
-					newRole = "user"
+					role = "user"
 				} else if prevRole == "user" {
-					newRole = "model"
+					role = "model"
 				} else {
-					newRole = "user"
+					role = "user"
 				}
-				path := fmt.Sprintf("request.contents.%d.role", idx)
-				rawJSON, _ = sjson.SetBytes(rawJSON, path, newRole)
-				role = newRole
+				content["role"] = role
 			}
 			prevRole = role
-			idx++
-			return true
-		})
+		}
 	}
 
-	toolsResult := gjson.GetBytes(rawJSON, "request.tools")
-	if toolsResult.Exists() && toolsResult.IsArray() {
-		toolResults := toolsResult.Array()
-		for i := 0; i < len(toolResults); i++ {
-			functionDeclarationsResult := gjson.GetBytes(rawJSON, fmt.Sprintf("request.tools.%d.function_declarations", i))
-			if functionDeclarationsResult.Exists() && functionDeclarationsResult.IsArray() {
-				functionDeclarationsResults := functionDeclarationsResult.Array()
-				for j := 0; j < len(functionDeclarationsResults); j++ {
-					parametersResult := gjson.GetBytes(rawJSON, fmt.Sprintf("request.tools.%d.function_declarations.%d.parameters", i, j))
-					if parametersResult.Exists() {
-						strJson, _ := util.RenameKey(string(rawJSON), fmt.Sprintf("request.tools.%d.function_declarations.%d.parameters", i, j), fmt.Sprintf("request.tools.%d.function_declarations.%d.parametersJsonSchema", i, j))
-						rawJSON = []byte(strJson)
-					}
+	if tools, ok := jsonutil.Array(requestRoot, "tools"); ok {
+		for _, toolValue := range tools {
+			tool, ok := toolValue.(map[string]any)
+			if !ok {
+				continue
+			}
+			functionDeclarations, ok := jsonutil.Array(tool, "function_declarations")
+			if !ok {
+				continue
+			}
+			for _, declarationValue := range functionDeclarations {
+				declaration, ok := declarationValue.(map[string]any)
+				if !ok {
+					continue
+				}
+				if parameters, ok := declaration["parameters"]; ok {
+					declaration["parametersJsonSchema"] = parameters
+					delete(declaration, "parameters")
 				}
 			}
 		}
 	}
 
-	gjson.GetBytes(rawJSON, "request.contents").ForEach(func(key, content gjson.Result) bool {
-		if content.Get("role").String() == "model" {
-			content.Get("parts").ForEach(func(partKey, part gjson.Result) bool {
-				if part.Get("functionCall").Exists() {
-					rawJSON, _ = sjson.SetBytes(rawJSON, fmt.Sprintf("request.contents.%d.parts.%d.thoughtSignature", key.Int(), partKey.Int()), "skip_thought_signature_validator")
-				} else if part.Get("thoughtSignature").Exists() {
-					rawJSON, _ = sjson.SetBytes(rawJSON, fmt.Sprintf("request.contents.%d.parts.%d.thoughtSignature", key.Int(), partKey.Int()), "skip_thought_signature_validator")
+	if contents, ok := jsonutil.Array(requestRoot, "contents"); ok {
+		for _, contentValue := range contents {
+			content, ok := contentValue.(map[string]any)
+			if !ok {
+				continue
+			}
+			role, _ := jsonutil.String(content, "role")
+			if role != "model" {
+				continue
+			}
+			parts, ok := jsonutil.Array(content, "parts")
+			if !ok {
+				continue
+			}
+			for _, partValue := range parts {
+				part, ok := partValue.(map[string]any)
+				if !ok {
+					continue
 				}
-				return true
-			})
+				if jsonutil.Exists(part, "functionCall") || jsonutil.Exists(part, "thoughtSignature") {
+					part["thoughtSignature"] = "skip_thought_signature_validator"
+				}
+			}
 		}
-		return true
-	})
+	}
 
 	// Filter out contents with empty parts to avoid Gemini API error:
 	// "required oneof field 'data' must have one initialized field"
-	filteredContents := "[]"
-	hasFiltered := false
-	gjson.GetBytes(rawJSON, "request.contents").ForEach(func(_, content gjson.Result) bool {
-		parts := content.Get("parts")
-		if !parts.IsArray() || len(parts.Array()) == 0 {
-			hasFiltered = true
-			return true
+	if contents, ok := jsonutil.Array(requestRoot, "contents"); ok {
+		filteredContents := make([]any, 0, len(contents))
+		hasFiltered := false
+		for _, contentValue := range contents {
+			content, ok := contentValue.(map[string]any)
+			if !ok {
+				hasFiltered = true
+				continue
+			}
+			parts, ok := jsonutil.Array(content, "parts")
+			if !ok || len(parts) == 0 {
+				hasFiltered = true
+				continue
+			}
+			filteredContents = append(filteredContents, content)
 		}
-		filteredContents, _ = sjson.SetRaw(filteredContents, "-1", content.Raw)
-		return true
-	})
-	if hasFiltered {
-		rawJSON, _ = sjson.SetRawBytes(rawJSON, "request.contents", []byte(filteredContents))
+		if hasFiltered {
+			requestRoot["contents"] = filteredContents
+		}
 	}
 
-	return common.AttachDefaultSafetySettings(rawJSON, "request.safetySettings")
+	common.EnsureDefaultSafetySettings(outRoot, "request.safetySettings")
+	return jsonutil.MarshalOrOriginal(inputRawJSON, outRoot)
 }
 
 // FunctionCallGroup represents a group of function calls and their responses
@@ -139,12 +160,15 @@ type FunctionCallGroup struct {
 
 // backfillFunctionResponseName ensures that a functionResponse JSON object has a non-empty name,
 // falling back to fallbackName if the original is empty.
-func backfillFunctionResponseName(raw string, fallbackName string) string {
-	name := gjson.Get(raw, "functionResponse.name").String()
-	if strings.TrimSpace(name) == "" && fallbackName != "" {
-		raw, _ = sjson.Set(raw, "functionResponse.name", fallbackName)
+func backfillFunctionResponseName(part map[string]any, fallbackName string) {
+	functionResponse, ok := jsonutil.Object(part, "functionResponse")
+	if !ok {
+		return
 	}
-	return raw
+	name, _ := jsonutil.String(functionResponse, "name")
+	if strings.TrimSpace(name) == "" && fallbackName != "" {
+		functionResponse["name"] = fallbackName
+	}
 }
 
 // fixCLIToolResponse performs sophisticated tool response format conversion and grouping.
@@ -159,36 +183,39 @@ func backfillFunctionResponseName(raw string, fallbackName string) string {
 // Returns:
 //   - string: The processed JSON string with grouped function calls and responses
 //   - error: An error if the processing fails
-func fixCLIToolResponse(input string) (string, error) {
-	// Parse the input JSON to extract the conversation structure
-	parsed := gjson.Parse(input)
-
-	// Extract the contents array which contains the conversation messages
-	contents := parsed.Get("request.contents")
-	if !contents.Exists() {
-		// log.Debugf(input)
-		return input, fmt.Errorf("contents not found in input")
+func fixCLIToolResponse(root map[string]any) error {
+	contents, ok := jsonutil.Array(root, "request.contents")
+	if !ok {
+		return fmt.Errorf("contents not found in input")
 	}
 
 	// Initialize data structures for processing and grouping
-	contentsWrapper := `{"contents":[]}`
-	var pendingGroups []*FunctionCallGroup // Groups awaiting completion with responses
-	var collectedResponses []gjson.Result  // Standalone responses to be matched
+	var pendingGroups []*FunctionCallGroup  // Groups awaiting completion with responses
+	var collectedResponses []map[string]any // Standalone responses to be matched
+	groupedContents := make([]any, 0, len(contents))
 
 	// Process each content object in the conversation
 	// This iterates through messages and groups function calls with their responses
-	contents.ForEach(func(key, value gjson.Result) bool {
-		role := value.Get("role").String()
-		parts := value.Get("parts")
+	for _, contentValue := range contents {
+		value, ok := contentValue.(map[string]any)
+		if !ok {
+			log.Warnf("failed to parse content")
+			continue
+		}
+		role, _ := jsonutil.String(value, "role")
+		parts, _ := jsonutil.Array(value, "parts")
 
 		// Check if this content has function responses
-		var responsePartsInThisContent []gjson.Result
-		parts.ForEach(func(_, part gjson.Result) bool {
-			if part.Get("functionResponse").Exists() {
+		responsePartsInThisContent := make([]map[string]any, 0)
+		for _, partValue := range parts {
+			part, ok := partValue.(map[string]any)
+			if !ok {
+				continue
+			}
+			if jsonutil.Exists(part, "functionResponse") {
 				responsePartsInThisContent = append(responsePartsInThisContent, part)
 			}
-			return true
-		})
+		}
 
 		// If this content has function responses, collect them
 		if len(responsePartsInThisContent) > 0 {
@@ -204,41 +231,41 @@ func fixCLIToolResponse(input string) (string, error) {
 				collectedResponses = collectedResponses[group.ResponsesNeeded:]
 
 				// Create merged function response content
-				functionResponseContent := `{"parts":[],"role":"function"}`
+				groupParts := make([]any, 0, len(groupResponses))
 				for ri, response := range groupResponses {
-					if !response.IsObject() {
-						log.Warnf("failed to parse function response")
-						continue
-					}
-					raw := backfillFunctionResponseName(response.Raw, group.CallNames[ri])
-					functionResponseContent, _ = sjson.SetRaw(functionResponseContent, "parts.-1", raw)
+					backfillFunctionResponseName(response, group.CallNames[ri])
+					groupParts = append(groupParts, response)
 				}
 
-				if gjson.Get(functionResponseContent, "parts.#").Int() > 0 {
-					contentsWrapper, _ = sjson.SetRaw(contentsWrapper, "contents.-1", functionResponseContent)
+				if len(groupParts) > 0 {
+					groupedContents = append(groupedContents, map[string]any{
+						"parts": groupParts,
+						"role":  "function",
+					})
 				}
 			}
 
-			return true // Skip adding this content, responses are merged
+			continue // Skip adding this content, responses are merged
 		}
 
 		// If this is a model with function calls, create a new group
 		if role == "model" {
 			var callNames []string
-			parts.ForEach(func(_, part gjson.Result) bool {
-				if part.Get("functionCall").Exists() {
-					callNames = append(callNames, part.Get("functionCall.name").String())
+			for _, partValue := range parts {
+				part, ok := partValue.(map[string]any)
+				if !ok {
+					continue
 				}
-				return true
-			})
+				if functionCall, ok := jsonutil.Object(part, "functionCall"); ok {
+					if name, ok := jsonutil.String(functionCall, "name"); ok {
+						callNames = append(callNames, name)
+					}
+				}
+			}
 
 			if len(callNames) > 0 {
 				// Add the model content
-				if !value.IsObject() {
-					log.Warnf("failed to parse model content")
-					return true
-				}
-				contentsWrapper, _ = sjson.SetRaw(contentsWrapper, "contents.-1", value.Raw)
+				groupedContents = append(groupedContents, value)
 
 				// Create a new group for tracking responses
 				group := &FunctionCallGroup{
@@ -248,23 +275,13 @@ func fixCLIToolResponse(input string) (string, error) {
 				pendingGroups = append(pendingGroups, group)
 			} else {
 				// Regular model content without function calls
-				if !value.IsObject() {
-					log.Warnf("failed to parse content")
-					return true
-				}
-				contentsWrapper, _ = sjson.SetRaw(contentsWrapper, "contents.-1", value.Raw)
+				groupedContents = append(groupedContents, value)
 			}
 		} else {
 			// Non-model content (user, etc.)
-			if !value.IsObject() {
-				log.Warnf("failed to parse content")
-				return true
-			}
-			contentsWrapper, _ = sjson.SetRaw(contentsWrapper, "contents.-1", value.Raw)
+			groupedContents = append(groupedContents, value)
 		}
-
-		return true
-	})
+	}
 
 	// Handle any remaining pending groups with remaining responses
 	for _, group := range pendingGroups {
@@ -272,25 +289,26 @@ func fixCLIToolResponse(input string) (string, error) {
 			groupResponses := collectedResponses[:group.ResponsesNeeded]
 			collectedResponses = collectedResponses[group.ResponsesNeeded:]
 
-			functionResponseContent := `{"parts":[],"role":"function"}`
+			groupParts := make([]any, 0, len(groupResponses))
 			for ri, response := range groupResponses {
-				if !response.IsObject() {
-					log.Warnf("failed to parse function response")
-					continue
-				}
-				raw := backfillFunctionResponseName(response.Raw, group.CallNames[ri])
-				functionResponseContent, _ = sjson.SetRaw(functionResponseContent, "parts.-1", raw)
+				backfillFunctionResponseName(response, group.CallNames[ri])
+				groupParts = append(groupParts, response)
 			}
 
-			if gjson.Get(functionResponseContent, "parts.#").Int() > 0 {
-				contentsWrapper, _ = sjson.SetRaw(contentsWrapper, "contents.-1", functionResponseContent)
+			if len(groupParts) > 0 {
+				groupedContents = append(groupedContents, map[string]any{
+					"parts": groupParts,
+					"role":  "function",
+				})
 			}
 		}
 	}
 
 	// Update the original JSON with the new contents
-	result := input
-	result, _ = sjson.SetRaw(result, "request.contents", gjson.Get(contentsWrapper, "contents").Raw)
-
-	return result, nil
+	requestRoot, ok := jsonutil.Object(root, "request")
+	if !ok {
+		return fmt.Errorf("request not found in input")
+	}
+	requestRoot["contents"] = groupedContents
+	return nil
 }

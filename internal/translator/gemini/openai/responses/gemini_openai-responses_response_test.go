@@ -5,10 +5,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tidwall/gjson"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/testjson"
 )
 
-func parseSSEEvent(t *testing.T, chunk string) (string, gjson.Result) {
+func parseSSEEvent(t *testing.T, chunk string) (string, testjson.Result) {
 	t.Helper()
 
 	lines := strings.Split(chunk, "\n")
@@ -18,10 +18,10 @@ func parseSSEEvent(t *testing.T, chunk string) (string, gjson.Result) {
 
 	event := strings.TrimSpace(strings.TrimPrefix(lines[0], "event:"))
 	dataLine := strings.TrimSpace(strings.TrimPrefix(lines[1], "data:"))
-	if !gjson.Valid(dataLine) {
+	if !testjson.Valid(dataLine) {
 		t.Fatalf("invalid SSE data JSON: %q", dataLine)
 	}
-	return event, gjson.Parse(dataLine)
+	return event, testjson.Parse(dataLine)
 }
 
 func TestConvertGeminiResponseToOpenAIResponses_UnwrapAndAggregateText(t *testing.T) {
@@ -142,14 +142,14 @@ func TestConvertGeminiResponseToOpenAIResponses_UnwrapAndAggregateText(t *testin
 	if funcName != "mcp__serena__list_dir" {
 		t.Fatalf("unexpected function name: got %q", funcName)
 	}
-	if !gjson.Valid(funcArgs) {
+	if !testjson.Valid(funcArgs) {
 		t.Fatalf("invalid function arguments JSON: %q", funcArgs)
 	}
-	if gjson.Get(funcArgs, "recursive").Bool() != false {
-		t.Fatalf("unexpected recursive arg: %v", gjson.Get(funcArgs, "recursive").Value())
+	if testjson.Get(funcArgs, "recursive").Bool() != false {
+		t.Fatalf("unexpected recursive arg: %v", testjson.Get(funcArgs, "recursive").Value())
 	}
-	if gjson.Get(funcArgs, "relative_path").String() != "internal" {
-		t.Fatalf("unexpected relative_path arg: %q", gjson.Get(funcArgs, "relative_path").String())
+	if testjson.Get(funcArgs, "relative_path").String() != "internal" {
+		t.Fatalf("unexpected relative_path arg: %q", testjson.Get(funcArgs, "relative_path").String())
 	}
 }
 
@@ -264,7 +264,7 @@ func TestConvertGeminiResponseToOpenAIResponses_FunctionCallEventOrder(t *testin
 			if data.Get("response.output.2.name").String() != "tool2" {
 				t.Fatalf("unexpected output[2] name: %s", data.Get("response.output.2").Raw)
 			}
-			if !gjson.Valid(data.Get("response.output.2.arguments").String()) {
+			if !testjson.Valid(data.Get("response.output.2.arguments").String()) {
 				t.Fatalf("unexpected output[2] arguments: %q", data.Get("response.output.2.arguments").String())
 			}
 		}
@@ -291,7 +291,7 @@ func TestConvertGeminiResponseToOpenAIResponses_FunctionCallEventOrder(t *testin
 	if deltaByIndex[1] != "{}" {
 		t.Fatalf("unexpected delta for output_index 1: got %q", deltaByIndex[1])
 	}
-	if deltaByIndex[2] == "" || !gjson.Valid(deltaByIndex[2]) || gjson.Get(deltaByIndex[2], "a").Int() != 1 {
+	if deltaByIndex[2] == "" || !testjson.Valid(deltaByIndex[2]) || testjson.Get(deltaByIndex[2], "a").Int() != 1 {
 		t.Fatalf("unexpected delta for output_index 2: got %q", deltaByIndex[2])
 	}
 	if !(posItemDone[2] < posCompleted) {

@@ -4,8 +4,8 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/testjson"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/tidwall/gjson"
 )
 
 func TestApply_ModeNone_UsesDisabledThinking(t *testing.T) {
@@ -20,13 +20,13 @@ func TestApply_ModeNone_UsesDisabledThinking(t *testing.T) {
 	if errApply != nil {
 		t.Fatalf("Apply() error = %v", errApply)
 	}
-	if got := gjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
+	if got := testjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
 		t.Fatalf("thinking.type = %q, want %q, body=%s", got, "disabled", string(out))
 	}
-	if gjson.GetBytes(out, "thinking.budget_tokens").Exists() {
+	if testjson.GetBytes(out, "thinking.budget_tokens").Exists() {
 		t.Fatalf("thinking.budget_tokens should be removed, body=%s", string(out))
 	}
-	if gjson.GetBytes(out, "reasoning_effort").Exists() {
+	if testjson.GetBytes(out, "reasoning_effort").Exists() {
 		t.Fatalf("reasoning_effort should be removed in ModeNone, body=%s", string(out))
 	}
 }
@@ -43,10 +43,10 @@ func TestApply_ModeLevel_UsesReasoningEffort(t *testing.T) {
 	if errApply != nil {
 		t.Fatalf("Apply() error = %v", errApply)
 	}
-	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "high" {
+	if got := testjson.GetBytes(out, "reasoning_effort").String(); got != "high" {
 		t.Fatalf("reasoning_effort = %q, want %q, body=%s", got, "high", string(out))
 	}
-	if gjson.GetBytes(out, "thinking").Exists() {
+	if testjson.GetBytes(out, "thinking").Exists() {
 		t.Fatalf("thinking should be removed when reasoning_effort is used, body=%s", string(out))
 	}
 }
@@ -63,10 +63,10 @@ func TestApply_UserDefinedModeNone_UsesDisabledThinking(t *testing.T) {
 	if errApply != nil {
 		t.Fatalf("Apply() error = %v", errApply)
 	}
-	if got := gjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
+	if got := testjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
 		t.Fatalf("thinking.type = %q, want %q, body=%s", got, "disabled", string(out))
 	}
-	if gjson.GetBytes(out, "reasoning_effort").Exists() {
+	if testjson.GetBytes(out, "reasoning_effort").Exists() {
 		t.Fatalf("reasoning_effort should be removed in ModeNone, body=%s", string(out))
 	}
 }

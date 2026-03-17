@@ -3,6 +3,7 @@ package openai
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -14,12 +15,12 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
-	"github.com/tidwall/gjson"
 )
 
 type websocketCaptureExecutor struct {
@@ -60,6 +61,92 @@ func (s *orderedWebsocketSelector) Pick(_ context.Context, _ string, _ string, _
 type websocketAuthCaptureExecutor struct {
 	mu      sync.Mutex
 	authIDs []string
+}
+
+func decodeObject(t *testing.T, payload []byte) map[string]any {
+	t.Helper()
+	var root map[string]any
+	if err := json.Unmarshal(payload, &root); err != nil {
+		t.Fatalf("json.Unmarshal object error: %v", err)
+	}
+	return root
+}
+
+func decodeArray(t *testing.T, payload []byte) []any {
+	t.Helper()
+	var root []any
+	if err := json.Unmarshal(payload, &root); err != nil {
+		t.Fatalf("json.Unmarshal array error: %v", err)
+	}
+	return root
+}
+
+func stringAt(t *testing.T, root any, path string) string {
+	t.Helper()
+	value, ok := jsonutil.Get(root, path)
+	if !ok || value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case json.Number:
+		return typed.String()
+	default:
+		return fmt.Sprint(typed)
+	}
+}
+
+func boolAt(t *testing.T, root any, path string) bool {
+	t.Helper()
+	value, ok := jsonutil.Get(root, path)
+	if !ok {
+		return false
+	}
+	typed, ok := value.(bool)
+	return ok && typed
+}
+
+func intAt(t *testing.T, root any, path string) int64 {
+	t.Helper()
+	value, ok := jsonutil.Get(root, path)
+	if !ok || value == nil {
+		return 0
+	}
+	switch typed := value.(type) {
+	case float64:
+		return int64(typed)
+	case int64:
+		return typed
+	case int:
+		return int64(typed)
+	case json.Number:
+		out, errParse := typed.Int64()
+		if errParse != nil {
+			t.Fatalf("json.Number.Int64 error: %v", errParse)
+		}
+		return out
+	default:
+		t.Fatalf("unexpected numeric type at %s: %T", path, value)
+		return 0
+	}
+}
+
+func existsAt(root any, path string) bool {
+	return jsonutil.Exists(root, path)
+}
+
+func arrayAt(t *testing.T, root any, path string) []any {
+	t.Helper()
+	value, ok := jsonutil.Get(root, path)
+	if !ok {
+		t.Fatalf("path %s not found", path)
+	}
+	array, ok := value.([]any)
+	if !ok {
+		t.Fatalf("path %s = %#v, want []any", path, value)
+	}
+	return array
 }
 
 func (e *websocketAuthCaptureExecutor) Identifier() string { return "test-provider" }
@@ -133,14 +220,15 @@ func TestNormalizeResponsesWebsocketRequestCreate(t *testing.T) {
 	if errMsg != nil {
 		t.Fatalf("unexpected error: %v", errMsg.Error)
 	}
-	if gjson.GetBytes(normalized, "type").Exists() {
+	root := decodeObject(t, normalized)
+	if existsAt(root, "type") {
 		t.Fatalf("normalized create request must not include type field")
 	}
-	if !gjson.GetBytes(normalized, "stream").Bool() {
+	if !boolAt(t, root, "stream") {
 		t.Fatalf("normalized create request must force stream=true")
 	}
-	if gjson.GetBytes(normalized, "model").String() != "test-model" {
-		t.Fatalf("unexpected model: %s", gjson.GetBytes(normalized, "model").String())
+	if got := stringAt(t, root, "model"); got != "test-model" {
+		t.Fatalf("unexpected model: %s", got)
 	}
 	if !bytes.Equal(last, normalized) {
 		t.Fatalf("last request snapshot should match normalized request")
@@ -159,21 +247,22 @@ func TestNormalizeResponsesWebsocketRequestCreateWithHistory(t *testing.T) {
 	if errMsg != nil {
 		t.Fatalf("unexpected error: %v", errMsg.Error)
 	}
-	if gjson.GetBytes(normalized, "type").Exists() {
+	root := decodeObject(t, normalized)
+	if existsAt(root, "type") {
 		t.Fatalf("normalized subsequent create request must not include type field")
 	}
-	if gjson.GetBytes(normalized, "model").String() != "test-model" {
-		t.Fatalf("unexpected model: %s", gjson.GetBytes(normalized, "model").String())
+	if got := stringAt(t, root, "model"); got != "test-model" {
+		t.Fatalf("unexpected model: %s", got)
 	}
 
-	input := gjson.GetBytes(normalized, "input").Array()
+	input := arrayAt(t, root, "input")
 	if len(input) != 4 {
 		t.Fatalf("merged input len = %d, want 4", len(input))
 	}
-	if input[0].Get("id").String() != "msg-1" ||
-		input[1].Get("id").String() != "fc-1" ||
-		input[2].Get("id").String() != "assistant-1" ||
-		input[3].Get("id").String() != "tool-out-1" {
+	if stringAt(t, input[0], "id") != "msg-1" ||
+		stringAt(t, input[1], "id") != "fc-1" ||
+		stringAt(t, input[2], "id") != "assistant-1" ||
+		stringAt(t, input[3], "id") != "tool-out-1" {
 		t.Fatalf("unexpected merged input order")
 	}
 	if !bytes.Equal(next, normalized) {
@@ -193,24 +282,25 @@ func TestNormalizeResponsesWebsocketRequestWithPreviousResponseIDIncremental(t *
 	if errMsg != nil {
 		t.Fatalf("unexpected error: %v", errMsg.Error)
 	}
-	if gjson.GetBytes(normalized, "type").Exists() {
+	root := decodeObject(t, normalized)
+	if existsAt(root, "type") {
 		t.Fatalf("normalized request must not include type field")
 	}
-	if gjson.GetBytes(normalized, "previous_response_id").String() != "resp-1" {
+	if got := stringAt(t, root, "previous_response_id"); got != "resp-1" {
 		t.Fatalf("previous_response_id must be preserved in incremental mode")
 	}
-	input := gjson.GetBytes(normalized, "input").Array()
+	input := arrayAt(t, root, "input")
 	if len(input) != 1 {
 		t.Fatalf("incremental input len = %d, want 1", len(input))
 	}
-	if input[0].Get("id").String() != "tool-out-1" {
-		t.Fatalf("unexpected incremental input item id: %s", input[0].Get("id").String())
+	if got := stringAt(t, input[0], "id"); got != "tool-out-1" {
+		t.Fatalf("unexpected incremental input item id: %s", got)
 	}
-	if gjson.GetBytes(normalized, "model").String() != "test-model" {
-		t.Fatalf("unexpected model: %s", gjson.GetBytes(normalized, "model").String())
+	if got := stringAt(t, root, "model"); got != "test-model" {
+		t.Fatalf("unexpected model: %s", got)
 	}
-	if gjson.GetBytes(normalized, "instructions").String() != "be helpful" {
-		t.Fatalf("unexpected instructions: %s", gjson.GetBytes(normalized, "instructions").String())
+	if got := stringAt(t, root, "instructions"); got != "be helpful" {
+		t.Fatalf("unexpected instructions: %s", got)
 	}
 	if !bytes.Equal(next, normalized) {
 		t.Fatalf("next request snapshot should match normalized request")
@@ -229,17 +319,18 @@ func TestNormalizeResponsesWebsocketRequestWithPreviousResponseIDMergedWhenIncre
 	if errMsg != nil {
 		t.Fatalf("unexpected error: %v", errMsg.Error)
 	}
-	if gjson.GetBytes(normalized, "previous_response_id").Exists() {
+	root := decodeObject(t, normalized)
+	if existsAt(root, "previous_response_id") {
 		t.Fatalf("previous_response_id must be removed when incremental mode is disabled")
 	}
-	input := gjson.GetBytes(normalized, "input").Array()
+	input := arrayAt(t, root, "input")
 	if len(input) != 4 {
 		t.Fatalf("merged input len = %d, want 4", len(input))
 	}
-	if input[0].Get("id").String() != "msg-1" ||
-		input[1].Get("id").String() != "fc-1" ||
-		input[2].Get("id").String() != "assistant-1" ||
-		input[3].Get("id").String() != "tool-out-1" {
+	if stringAt(t, input[0], "id") != "msg-1" ||
+		stringAt(t, input[1], "id") != "fc-1" ||
+		stringAt(t, input[2], "id") != "assistant-1" ||
+		stringAt(t, input[3], "id") != "tool-out-1" {
 		t.Fatalf("unexpected merged input order")
 	}
 	if !bytes.Equal(next, normalized) {
@@ -259,15 +350,16 @@ func TestNormalizeResponsesWebsocketRequestAppend(t *testing.T) {
 	if errMsg != nil {
 		t.Fatalf("unexpected error: %v", errMsg.Error)
 	}
-	input := gjson.GetBytes(normalized, "input").Array()
+	root := decodeObject(t, normalized)
+	input := arrayAt(t, root, "input")
 	if len(input) != 5 {
 		t.Fatalf("merged input len = %d, want 5", len(input))
 	}
-	if input[0].Get("id").String() != "msg-1" ||
-		input[1].Get("id").String() != "assistant-1" ||
-		input[2].Get("id").String() != "tool-out-1" ||
-		input[3].Get("id").String() != "msg-2" ||
-		input[4].Get("id").String() != "msg-3" {
+	if stringAt(t, input[0], "id") != "msg-1" ||
+		stringAt(t, input[1], "id") != "assistant-1" ||
+		stringAt(t, input[2], "id") != "tool-out-1" ||
+		stringAt(t, input[3], "id") != "msg-2" ||
+		stringAt(t, input[4], "id") != "msg-3" {
 		t.Fatalf("unexpected merged input order")
 	}
 	if !bytes.Equal(next, normalized) {
@@ -294,8 +386,9 @@ func TestWebsocketJSONPayloadsFromChunk(t *testing.T) {
 	if len(payloads) != 1 {
 		t.Fatalf("payloads len = %d, want 1", len(payloads))
 	}
-	if gjson.GetBytes(payloads[0], "type").String() != "response.created" {
-		t.Fatalf("unexpected payload type: %s", gjson.GetBytes(payloads[0], "type").String())
+	root := decodeObject(t, payloads[0])
+	if got := stringAt(t, root, "type"); got != "response.created" {
+		t.Fatalf("unexpected payload type: %s", got)
 	}
 }
 
@@ -306,8 +399,9 @@ func TestWebsocketJSONPayloadsFromPlainJSONChunk(t *testing.T) {
 	if len(payloads) != 1 {
 		t.Fatalf("payloads len = %d, want 1", len(payloads))
 	}
-	if gjson.GetBytes(payloads[0], "type").String() != "response.completed" {
-		t.Fatalf("unexpected payload type: %s", gjson.GetBytes(payloads[0], "type").String())
+	root := decodeObject(t, payloads[0])
+	if got := stringAt(t, root, "type"); got != "response.completed" {
+		t.Fatalf("unexpected payload type: %s", got)
 	}
 }
 
@@ -315,12 +409,12 @@ func TestResponseCompletedOutputFromPayload(t *testing.T) {
 	payload := []byte(`{"type":"response.completed","response":{"id":"resp-1","output":[{"type":"message","id":"out-1"}]}}`)
 
 	output := responseCompletedOutputFromPayload(payload)
-	items := gjson.ParseBytes(output).Array()
+	items := decodeArray(t, output)
 	if len(items) != 1 {
 		t.Fatalf("output len = %d, want 1", len(items))
 	}
-	if items[0].Get("id").String() != "out-1" {
-		t.Fatalf("unexpected output id: %s", items[0].Get("id").String())
+	if got := stringAt(t, items[0], "id"); got != "out-1" {
+		t.Fatalf("unexpected output id: %s", got)
 	}
 }
 
@@ -430,7 +524,7 @@ func TestForwardResponsesWebsocketPreservesCompletedEvent(t *testing.T) {
 			serverErrCh <- err
 			return
 		}
-		if gjson.GetBytes(completedOutput, "0.id").String() != "out-1" {
+		if stringAt(t, decodeArray(t, completedOutput), "0.id") != "out-1" {
 			serverErrCh <- errors.New("completed output not captured")
 			return
 		}
@@ -454,8 +548,9 @@ func TestForwardResponsesWebsocketPreservesCompletedEvent(t *testing.T) {
 	if errReadMessage != nil {
 		t.Fatalf("read websocket message: %v", errReadMessage)
 	}
-	if gjson.GetBytes(payload, "type").String() != wsEventTypeCompleted {
-		t.Fatalf("payload type = %s, want %s", gjson.GetBytes(payload, "type").String(), wsEventTypeCompleted)
+	root := decodeObject(t, payload)
+	if got := stringAt(t, root, "type"); got != wsEventTypeCompleted {
+		t.Fatalf("payload type = %s, want %s", got, wsEventTypeCompleted)
 	}
 	if strings.Contains(string(payload), "response.done") {
 		t.Fatalf("payload unexpectedly rewrote completed event: %s", payload)
@@ -533,10 +628,11 @@ func TestResponsesWebsocketPrewarmHandledLocallyForSSEUpstream(t *testing.T) {
 	if errReadMessage != nil {
 		t.Fatalf("read prewarm created message: %v", errReadMessage)
 	}
-	if gjson.GetBytes(createdPayload, "type").String() != "response.created" {
-		t.Fatalf("created payload type = %s, want response.created", gjson.GetBytes(createdPayload, "type").String())
+	createdRoot := decodeObject(t, createdPayload)
+	if got := stringAt(t, createdRoot, "type"); got != "response.created" {
+		t.Fatalf("created payload type = %s, want response.created", got)
 	}
-	prewarmResponseID := gjson.GetBytes(createdPayload, "response.id").String()
+	prewarmResponseID := stringAt(t, createdRoot, "response.id")
 	if prewarmResponseID == "" {
 		t.Fatalf("prewarm response id is empty")
 	}
@@ -548,14 +644,15 @@ func TestResponsesWebsocketPrewarmHandledLocallyForSSEUpstream(t *testing.T) {
 	if errReadMessage != nil {
 		t.Fatalf("read prewarm completed message: %v", errReadMessage)
 	}
-	if gjson.GetBytes(completedPayload, "type").String() != wsEventTypeCompleted {
-		t.Fatalf("completed payload type = %s, want %s", gjson.GetBytes(completedPayload, "type").String(), wsEventTypeCompleted)
+	completedRoot := decodeObject(t, completedPayload)
+	if got := stringAt(t, completedRoot, "type"); got != wsEventTypeCompleted {
+		t.Fatalf("completed payload type = %s, want %s", got, wsEventTypeCompleted)
 	}
-	if gjson.GetBytes(completedPayload, "response.id").String() != prewarmResponseID {
-		t.Fatalf("completed response id = %s, want %s", gjson.GetBytes(completedPayload, "response.id").String(), prewarmResponseID)
+	if got := stringAt(t, completedRoot, "response.id"); got != prewarmResponseID {
+		t.Fatalf("completed response id = %s, want %s", got, prewarmResponseID)
 	}
-	if gjson.GetBytes(completedPayload, "response.usage.total_tokens").Int() != 0 {
-		t.Fatalf("prewarm total tokens = %d, want 0", gjson.GetBytes(completedPayload, "response.usage.total_tokens").Int())
+	if got := intAt(t, completedRoot, "response.usage.total_tokens"); got != 0 {
+		t.Fatalf("prewarm total tokens = %d, want 0", got)
 	}
 
 	secondRequest := fmt.Sprintf(`{"type":"response.create","previous_response_id":%q,"input":[{"type":"message","id":"msg-1"}]}`, prewarmResponseID)
@@ -568,8 +665,9 @@ func TestResponsesWebsocketPrewarmHandledLocallyForSSEUpstream(t *testing.T) {
 	if errReadMessage != nil {
 		t.Fatalf("read upstream completed message: %v", errReadMessage)
 	}
-	if gjson.GetBytes(upstreamPayload, "type").String() != wsEventTypeCompleted {
-		t.Fatalf("upstream payload type = %s, want %s", gjson.GetBytes(upstreamPayload, "type").String(), wsEventTypeCompleted)
+	upstreamRoot := decodeObject(t, upstreamPayload)
+	if got := stringAt(t, upstreamRoot, "type"); got != wsEventTypeCompleted {
+		t.Fatalf("upstream payload type = %s, want %s", got, wsEventTypeCompleted)
 	}
 	if executor.streamCalls != 1 {
 		t.Fatalf("stream calls after follow-up = %d, want 1", executor.streamCalls)
@@ -578,17 +676,18 @@ func TestResponsesWebsocketPrewarmHandledLocallyForSSEUpstream(t *testing.T) {
 		t.Fatalf("captured upstream payloads = %d, want 1", len(executor.payloads))
 	}
 	forwarded := executor.payloads[0]
-	if gjson.GetBytes(forwarded, "previous_response_id").Exists() {
+	forwardedRoot := decodeObject(t, forwarded)
+	if existsAt(forwardedRoot, "previous_response_id") {
 		t.Fatalf("previous_response_id leaked upstream: %s", forwarded)
 	}
-	if gjson.GetBytes(forwarded, "generate").Exists() {
+	if existsAt(forwardedRoot, "generate") {
 		t.Fatalf("generate leaked upstream: %s", forwarded)
 	}
-	if gjson.GetBytes(forwarded, "model").String() != "test-model" {
-		t.Fatalf("forwarded model = %s, want test-model", gjson.GetBytes(forwarded, "model").String())
+	if got := stringAt(t, forwardedRoot, "model"); got != "test-model" {
+		t.Fatalf("forwarded model = %s, want test-model", got)
 	}
-	input := gjson.GetBytes(forwarded, "input").Array()
-	if len(input) != 1 || input[0].Get("id").String() != "msg-1" {
+	input := arrayAt(t, forwardedRoot, "input")
+	if len(input) != 1 || stringAt(t, input[0], "id") != "msg-1" {
 		t.Fatalf("unexpected forwarded input: %s", forwarded)
 	}
 }
@@ -653,7 +752,7 @@ func TestResponsesWebsocketPinsOnlyWebsocketCapableAuth(t *testing.T) {
 		if errReadMessage != nil {
 			t.Fatalf("read websocket message %d: %v", i+1, errReadMessage)
 		}
-		if got := gjson.GetBytes(payload, "type").String(); got != wsEventTypeCompleted {
+		if got := stringAt(t, decodeObject(t, payload), "type"); got != wsEventTypeCompleted {
 			t.Fatalf("message %d payload type = %s, want %s", i+1, got, wsEventTypeCompleted)
 		}
 	}

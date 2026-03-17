@@ -5,6 +5,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -18,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -26,8 +28,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 	"golang.org/x/net/proxy"
 )
 
@@ -175,14 +175,16 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body, _ = sjson.SetBytes(body, "stream", true)
-	body, _ = sjson.DeleteBytes(body, "previous_response_id")
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	if !gjson.GetBytes(body, "instructions").Exists() {
-		body, _ = sjson.SetBytes(body, "instructions", "")
-	}
+	body = mutateJSONObjectBytes(body, func(root map[string]any) {
+		_ = jsonutil.Set(root, "model", baseModel)
+		_ = jsonutil.Set(root, "stream", true)
+		_ = jsonutil.Delete(root, "previous_response_id")
+		_ = jsonutil.Delete(root, "prompt_cache_retention")
+		_ = jsonutil.Delete(root, "safety_identifier")
+		if !jsonutil.Exists(root, "instructions") {
+			_ = jsonutil.Set(root, "instructions", "")
+		}
+	})
 
 	httpURL := strings.TrimSuffix(baseURL, "/") + "/responses"
 	wsURL, err := buildCodexResponsesWebsocketURL(httpURL)
@@ -336,7 +338,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 
 		payload = normalizeCodexWebsocketCompletion(payload)
-		eventType := gjson.GetBytes(payload, "type").String()
+		eventType := jsonStringFieldBytes(payload, "type")
 		if eventType == "response.completed" {
 			if detail, ok := parseCodexUsage(payload); ok {
 				reporter.publish(ctx, detail)
@@ -582,7 +584,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			payload = normalizeCodexWebsocketCompletion(payload)
-			eventType := gjson.GetBytes(payload, "type").String()
+			eventType := jsonStringFieldBytes(payload, "type")
 			if eventType == "response.completed" || eventType == "response.done" {
 				if detail, ok := parseCodexUsage(payload); ok {
 					reporter.publish(ctx, detail)
@@ -641,13 +643,9 @@ func buildCodexWebsocketRequestBody(body []byte) []byte {
 	// Match codex-rs websocket v2 semantics: every request is `response.create`.
 	// Incremental follow-up turns continue on the same websocket using
 	// `previous_response_id` + incremental `input`, not `response.append`.
-	wsReqBody, errSet := sjson.SetBytes(bytes.Clone(body), "type", "response.create")
-	if errSet == nil && len(wsReqBody) > 0 {
-		return wsReqBody
-	}
-	fallback := bytes.Clone(body)
-	fallback, _ = sjson.SetBytes(fallback, "type", "response.create")
-	return fallback
+	return mutateJSONObjectBytes(bytes.Clone(body), func(root map[string]any) {
+		_ = jsonutil.Set(root, "type", "response.create")
+	})
 }
 
 func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, readCh chan codexWebsocketRead) (int, []byte, error) {
@@ -769,9 +767,8 @@ func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecuto
 
 	var cache codexCache
 	if from == "claude" {
-		userIDResult := gjson.GetBytes(req.Payload, "metadata.user_id")
-		if userIDResult.Exists() {
-			key := fmt.Sprintf("%s-%s", req.Model, userIDResult.String())
+		if userID := jsonStringFieldBytes(req.Payload, "metadata.user_id"); userID != "" {
+			key := fmt.Sprintf("%s-%s", req.Model, userID)
 			if cached, ok := getCodexCache(key); ok {
 				cache = cached
 			} else {
@@ -783,13 +780,15 @@ func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecuto
 			}
 		}
 	} else if from == "openai-response" {
-		if promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key"); promptCacheKey.Exists() {
-			cache.ID = promptCacheKey.String()
+		if promptCacheKey := jsonStringFieldBytes(req.Payload, "prompt_cache_key"); promptCacheKey != "" {
+			cache.ID = promptCacheKey
 		}
 	}
 
 	if cache.ID != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
+		rawJSON = mutateJSONObjectBytes(rawJSON, func(root map[string]any) {
+			_ = jsonutil.Set(root, "prompt_cache_key", cache.ID)
+		})
 		headers.Set("Conversation_id", cache.ID)
 		headers.Set("Session_id", cache.ID)
 	}
@@ -926,60 +925,81 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 	if len(payload) == 0 {
 		return nil, false
 	}
-	if strings.TrimSpace(gjson.GetBytes(payload, "type").String()) != "error" {
+
+	root, errParse := jsonutil.ParseObjectBytes(payload)
+	if errParse != nil {
 		return nil, false
 	}
-	status := int(gjson.GetBytes(payload, "status").Int())
+	if eventType, ok := jsonutil.String(root, "type"); !ok || strings.TrimSpace(eventType) != "error" {
+		return nil, false
+	}
+	status := 0
+	if value, ok := jsonutil.Int64(root, "status"); ok {
+		status = int(value)
+	}
 	if status == 0 {
-		status = int(gjson.GetBytes(payload, "status_code").Int())
+		if value, ok := jsonutil.Int64(root, "status_code"); ok {
+			status = int(value)
+		}
 	}
 	if status <= 0 {
 		return nil, false
 	}
 
-	out := []byte(`{}`)
-	if errNode := gjson.GetBytes(payload, "error"); errNode.Exists() {
-		raw := errNode.Raw
-		if errNode.Type == gjson.String {
-			raw = errNode.Raw
-		}
-		out, _ = sjson.SetRawBytes(out, "error", []byte(raw))
+	out := map[string]any{}
+	if errNode, ok := jsonutil.Get(root, "error"); ok {
+		out["error"] = errNode
 	} else {
-		out, _ = sjson.SetBytes(out, "error.type", "server_error")
-		out, _ = sjson.SetBytes(out, "error.message", http.StatusText(status))
+		out["error"] = map[string]any{
+			"type":    "server_error",
+			"message": http.StatusText(status),
+		}
 	}
 
 	headers := parseCodexWebsocketErrorHeaders(payload)
+	outBytes := jsonutil.MarshalOrOriginal([]byte(`{}`), out)
 	return statusErrWithHeaders{
-		statusErr: statusErr{code: status, msg: string(out)},
+		statusErr: statusErr{code: status, msg: string(outBytes)},
 		headers:   headers,
 	}, true
 }
 
 func parseCodexWebsocketErrorHeaders(payload []byte) http.Header {
-	headersNode := gjson.GetBytes(payload, "headers")
-	if !headersNode.Exists() || !headersNode.IsObject() {
+	root, errParse := jsonutil.ParseObjectBytes(payload)
+	if errParse != nil {
+		return nil
+	}
+	headersNode, ok := jsonutil.Object(root, "headers")
+	if !ok {
 		return nil
 	}
 	mapped := make(http.Header)
-	headersNode.ForEach(func(key, value gjson.Result) bool {
-		name := strings.TrimSpace(key.String())
+	for key, value := range headersNode {
+		name := strings.TrimSpace(key)
 		if name == "" {
-			return true
+			continue
 		}
-		switch value.Type {
-		case gjson.String:
-			if v := strings.TrimSpace(value.String()); v != "" {
+		switch typed := value.(type) {
+		case string:
+			if v := strings.TrimSpace(typed); v != "" {
 				mapped.Set(name, v)
 			}
-		case gjson.Number, gjson.True, gjson.False:
-			if v := strings.TrimSpace(value.Raw); v != "" {
+		case json.Number:
+			if v := strings.TrimSpace(typed.String()); v != "" {
 				mapped.Set(name, v)
+			}
+		case bool:
+			if typed {
+				mapped.Set(name, "true")
+			} else {
+				mapped.Set(name, "false")
 			}
 		default:
+			if v := strings.TrimSpace(fmt.Sprint(typed)); v != "" {
+				mapped.Set(name, v)
+			}
 		}
-		return true
-	})
+	}
 	if len(mapped) == 0 {
 		return nil
 	}
@@ -987,11 +1007,10 @@ func parseCodexWebsocketErrorHeaders(payload []byte) http.Header {
 }
 
 func normalizeCodexWebsocketCompletion(payload []byte) []byte {
-	if strings.TrimSpace(gjson.GetBytes(payload, "type").String()) == "response.done" {
-		updated, err := sjson.SetBytes(payload, "type", "response.completed")
-		if err == nil && len(updated) > 0 {
-			return updated
-		}
+	if strings.TrimSpace(jsonStringFieldBytes(payload, "type")) == "response.done" {
+		return mutateJSONObjectBytes(payload, func(root map[string]any) {
+			_ = jsonutil.Set(root, "type", "response.completed")
+		})
 	}
 	return payload
 }

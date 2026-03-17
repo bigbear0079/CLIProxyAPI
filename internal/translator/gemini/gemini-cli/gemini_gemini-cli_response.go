@@ -9,7 +9,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/tidwall/sjson"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 )
 
 var dataTag = []byte("data:")
@@ -36,9 +36,11 @@ func ConvertGeminiResponseToGeminiCLI(_ context.Context, _ string, originalReque
 	if bytes.Equal(rawJSON, []byte("[DONE]")) {
 		return []string{}
 	}
-	json := `{"response": {}}`
-	rawJSON, _ = sjson.SetRawBytes([]byte(json), "response", rawJSON)
-	return []string{string(rawJSON)}
+	responseValue, errParse := jsonutil.ParseAnyBytes(rawJSON)
+	if errParse != nil {
+		return []string{string(jsonutil.MarshalOrOriginal(nil, map[string]any{"response": string(rawJSON)}))}
+	}
+	return []string{string(jsonutil.MarshalOrOriginal(nil, map[string]any{"response": responseValue}))}
 }
 
 // ConvertGeminiResponseToGeminiCLINonStream converts a non-streaming Gemini response to a non-streaming Gemini CLI response.
@@ -52,9 +54,11 @@ func ConvertGeminiResponseToGeminiCLI(_ context.Context, _ string, originalReque
 // Returns:
 //   - string: A Gemini CLI-compatible JSON response.
 func ConvertGeminiResponseToGeminiCLINonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) string {
-	json := `{"response": {}}`
-	rawJSON, _ = sjson.SetRawBytes([]byte(json), "response", rawJSON)
-	return string(rawJSON)
+	responseValue, errParse := jsonutil.ParseAnyBytes(rawJSON)
+	if errParse != nil {
+		return string(jsonutil.MarshalOrOriginal(nil, map[string]any{"response": string(rawJSON)}))
+	}
+	return string(jsonutil.MarshalOrOriginal(nil, map[string]any{"response": responseValue}))
 }
 
 func GeminiCLITokenCount(ctx context.Context, count int64) string {

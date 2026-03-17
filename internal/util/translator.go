@@ -6,49 +6,45 @@ package util
 import (
 	"bytes"
 	"fmt"
+	"strconv"
 	"strings"
 
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 )
 
 // Walk recursively traverses a JSON structure to find all occurrences of a specific field.
 // It builds paths to each occurrence and adds them to the provided paths slice.
 //
 // Parameters:
-//   - value: The gjson.Result object to traverse
+//   - value: The parsed JSON value to traverse
 //   - path: The current path in the JSON structure (empty string for root)
 //   - field: The field name to search for
 //   - paths: Pointer to a slice where found paths will be stored
 //
 // The function works recursively, building dot-notation paths to each occurrence
 // of the specified field throughout the JSON structure.
-func Walk(value gjson.Result, path, field string, paths *[]string) {
-	switch value.Type {
-	case gjson.JSON:
-		// For JSON objects and arrays, iterate through each child
-		value.ForEach(func(key, val gjson.Result) bool {
-			var childPath string
-			// Escape special characters for gjson/sjson path syntax
-			// . -> \.
-			// * -> \*
-			// ? -> \?
-			keyStr := key.String()
-			safeKey := escapeGJSONPathKey(keyStr)
-
-			if path == "" {
-				childPath = safeKey
-			} else {
+func Walk(value any, path, field string, paths *[]string) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			safeKey := escapeGJSONPathKey(key)
+			childPath := safeKey
+			if path != "" {
 				childPath = path + "." + safeKey
 			}
-			if keyStr == field {
+			if key == field {
 				*paths = append(*paths, childPath)
 			}
-			Walk(val, childPath, field, paths)
-			return true
-		})
-	case gjson.String, gjson.Number, gjson.True, gjson.False, gjson.Null:
-		// Terminal types - no further traversal needed
+			Walk(child, childPath, field, paths)
+		}
+	case []any:
+		for index, child := range typed {
+			childPath := strconv.Itoa(index)
+			if path != "" {
+				childPath = path + "." + childPath
+			}
+			Walk(child, childPath, field, paths)
+		}
 	}
 }
 
@@ -68,23 +64,25 @@ func Walk(value gjson.Result, path, field string, paths *[]string) {
 // 1. Sets the value at the new key path
 // 2. Deletes the old key path
 func RenameKey(jsonStr, oldKeyPath, newKeyPath string) (string, error) {
-	value := gjson.Get(jsonStr, oldKeyPath)
+	root, errParse := jsonutil.ParseObjectBytes([]byte(jsonStr))
+	if errParse != nil {
+		return "", fmt.Errorf("failed to parse json: %w", errParse)
+	}
 
-	if !value.Exists() {
+	value, ok := jsonutil.Get(root, oldKeyPath)
+	if !ok {
 		return "", fmt.Errorf("old key '%s' does not exist", oldKeyPath)
 	}
 
-	interimJson, err := sjson.SetRaw(jsonStr, newKeyPath, value.Raw)
-	if err != nil {
-		return "", fmt.Errorf("failed to set new key '%s': %w", newKeyPath, err)
+	if errSet := jsonutil.Set(root, newKeyPath, value); errSet != nil {
+		return "", fmt.Errorf("failed to set new key '%s': %w", newKeyPath, errSet)
 	}
 
-	finalJson, err := sjson.Delete(interimJson, oldKeyPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to delete old key '%s': %w", oldKeyPath, err)
+	if errDelete := jsonutil.Delete(root, oldKeyPath); errDelete != nil {
+		return "", fmt.Errorf("failed to delete old key '%s': %w", oldKeyPath, errDelete)
 	}
 
-	return finalJson, nil
+	return string(jsonutil.MarshalOrOriginal([]byte(jsonStr), root)), nil
 }
 
 // FixJSON converts non-standard JSON that uses single quotes for strings into
@@ -230,31 +228,35 @@ func CanonicalToolName(name string) string {
 // ToolNameMapFromClaudeRequest returns a canonical-name -> original-name map extracted from a Claude request.
 // It is used to restore exact tool name casing for clients that require strict tool name matching (e.g. Claude Code).
 func ToolNameMapFromClaudeRequest(rawJSON []byte) map[string]string {
-	if len(rawJSON) == 0 || !gjson.ValidBytes(rawJSON) {
+	root, errParse := jsonutil.ParseObjectBytes(rawJSON)
+	if errParse != nil {
 		return nil
 	}
 
-	tools := gjson.GetBytes(rawJSON, "tools")
-	if !tools.Exists() || !tools.IsArray() {
+	tools, ok := jsonutil.Array(root, "tools")
+	if !ok {
 		return nil
 	}
 
-	toolResults := tools.Array()
-	out := make(map[string]string, len(toolResults))
-	tools.ForEach(func(_, tool gjson.Result) bool {
-		name := strings.TrimSpace(tool.Get("name").String())
+	out := make(map[string]string, len(tools))
+	for _, toolValue := range tools {
+		tool, ok := toolValue.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := jsonutil.String(tool, "name")
+		name = strings.TrimSpace(name)
 		if name == "" {
-			return true
+			continue
 		}
 		key := CanonicalToolName(name)
 		if key == "" {
-			return true
+			continue
 		}
 		if _, exists := out[key]; !exists {
 			out[key] = name
 		}
-		return true
-	})
+	}
 
 	if len(out) == 0 {
 		return nil

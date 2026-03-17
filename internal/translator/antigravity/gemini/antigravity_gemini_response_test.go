@@ -2,7 +2,10 @@ package gemini
 
 import (
 	"context"
+	"reflect"
 	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 )
 
 func TestRestoreUsageMetadata(t *testing.T) {
@@ -31,10 +34,24 @@ func TestRestoreUsageMetadata(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := restoreUsageMetadata(tt.input)
-			if string(result) != tt.expected {
-				t.Errorf("restoreUsageMetadata() = %s, want %s", string(result), tt.expected)
-			}
+			assertJSONEqual(t, result, []byte(tt.expected))
 		})
+	}
+}
+
+func assertJSONEqual(t *testing.T, actual []byte, expected []byte) {
+	t.Helper()
+
+	actualValue, errParseActual := jsonutil.ParseAnyBytes(actual)
+	if errParseActual != nil {
+		t.Fatalf("parse actual json failed: %v", errParseActual)
+	}
+	expectedValue, errParseExpected := jsonutil.ParseAnyBytes(expected)
+	if errParseExpected != nil {
+		t.Fatalf("parse expected json failed: %v", errParseExpected)
+	}
+	if !reflect.DeepEqual(actualValue, expectedValue) {
+		t.Errorf("json mismatch: actual=%s expected=%s", string(actual), string(expected))
 	}
 }
 
@@ -59,9 +76,7 @@ func TestConvertAntigravityResponseToGeminiNonStream(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := ConvertAntigravityResponseToGeminiNonStream(context.Background(), "", nil, nil, tt.input, nil)
-			if result != tt.expected {
-				t.Errorf("ConvertAntigravityResponseToGeminiNonStream() = %s, want %s", result, tt.expected)
-			}
+			assertJSONEqual(t, []byte(result), []byte(tt.expected))
 		})
 	}
 }
@@ -87,9 +102,7 @@ func TestConvertAntigravityResponseToGeminiStream(t *testing.T) {
 			if len(results) != 1 {
 				t.Fatalf("expected 1 result, got %d", len(results))
 			}
-			if results[0] != tt.expected {
-				t.Errorf("ConvertAntigravityResponseToGemini() = %s, want %s", results[0], tt.expected)
-			}
+			assertJSONEqual(t, []byte(results[0]), []byte(tt.expected))
 		})
 	}
 }

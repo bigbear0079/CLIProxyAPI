@@ -1,243 +1,322 @@
-// Package claude provides request translation functionality for Claude Code API compatibility.
-// This package handles the conversion of Claude Code API requests into Gemini CLI-compatible
-// JSON format, transforming message contents, system instructions, and tool declarations
-// into the format expected by Gemini CLI API clients. It performs JSON data transformation
-// to ensure compatibility between Claude Code API format and Gemini CLI API's expected format.
+// Package claude provides request translation functionality for Claude Code API
+// compatibility using standard JSON trees.
 package claude
 
 import (
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 const geminiCLIClaudeThoughtSignature = "skip_thought_signature_validator"
 
-// ConvertClaudeRequestToCLI parses and transforms a Claude Code API request into Gemini CLI API format.
-// It extracts the model name, system instruction, message contents, and tool declarations
-// from the raw JSON request and returns them in the format expected by the Gemini CLI API.
-// The function performs the following transformations:
-// 1. Extracts the model information from the request
-// 2. Restructures the JSON to match Gemini CLI API format
-// 3. Converts system instructions to the expected format
-// 4. Maps message contents with proper role transformations
-// 5. Handles tool declarations and tool choices
-// 6. Maps generation configuration parameters
-//
-// Parameters:
-//   - modelName: The name of the model to use for the request
-//   - rawJSON: The raw JSON request data from the Claude Code API
-//   - stream: A boolean indicating if the request is for a streaming response (unused in current implementation)
-//
-// Returns:
-//   - []byte: The transformed request data in Gemini CLI API format
+// ConvertClaudeRequestToCLI parses and transforms a Claude Code API request
+// into Gemini CLI API format.
 func ConvertClaudeRequestToCLI(modelName string, inputRawJSON []byte, _ bool) []byte {
-	rawJSON := inputRawJSON
+	root := jsonutil.ParseObjectBytesOrEmpty(inputRawJSON)
 
-	// Build output Gemini CLI request JSON
-	out := `{"model":"","request":{"contents":[]}}`
-	out, _ = sjson.Set(out, "model", modelName)
-
-	// system instruction
-	if systemResult := gjson.GetBytes(rawJSON, "system"); systemResult.IsArray() {
-		systemInstruction := `{"role":"user","parts":[]}`
-		hasSystemParts := false
-		systemResult.ForEach(func(_, systemPromptResult gjson.Result) bool {
-			if systemPromptResult.Get("type").String() == "text" {
-				textResult := systemPromptResult.Get("text")
-				if textResult.Type == gjson.String {
-					part := `{"text":""}`
-					part, _ = sjson.Set(part, "text", textResult.String())
-					systemInstruction, _ = sjson.SetRaw(systemInstruction, "parts.-1", part)
-					hasSystemParts = true
-				}
-			}
-			return true
-		})
-		if hasSystemParts {
-			out, _ = sjson.SetRaw(out, "request.systemInstruction", systemInstruction)
-		}
-	} else if systemResult.Type == gjson.String {
-		out, _ = sjson.Set(out, "request.systemInstruction.parts.-1.text", systemResult.String())
+	requestRoot := map[string]any{
+		"contents":       []any{},
+		"safetySettings": common.DefaultSafetySettings(),
+	}
+	outRoot := map[string]any{
+		"model":   modelName,
+		"request": requestRoot,
 	}
 
-	// contents
-	if messagesResult := gjson.GetBytes(rawJSON, "messages"); messagesResult.IsArray() {
-		messagesResult.ForEach(func(_, messageResult gjson.Result) bool {
-			roleResult := messageResult.Get("role")
-			if roleResult.Type != gjson.String {
-				return true
-			}
-			role := roleResult.String()
-			if role == "assistant" {
-				role = "model"
-			}
-
-			contentJSON := `{"role":"","parts":[]}`
-			contentJSON, _ = sjson.Set(contentJSON, "role", role)
-
-			contentsResult := messageResult.Get("content")
-			if contentsResult.IsArray() {
-				contentsResult.ForEach(func(_, contentResult gjson.Result) bool {
-					switch contentResult.Get("type").String() {
-					case "text":
-						part := `{"text":""}`
-						part, _ = sjson.Set(part, "text", contentResult.Get("text").String())
-						contentJSON, _ = sjson.SetRaw(contentJSON, "parts.-1", part)
-
-					case "tool_use":
-						functionName := contentResult.Get("name").String()
-						functionArgs := contentResult.Get("input").String()
-						argsResult := gjson.Parse(functionArgs)
-						if argsResult.IsObject() && gjson.Valid(functionArgs) {
-							part := `{"thoughtSignature":"","functionCall":{"name":"","args":{}}}`
-							part, _ = sjson.Set(part, "thoughtSignature", geminiCLIClaudeThoughtSignature)
-							part, _ = sjson.Set(part, "functionCall.name", functionName)
-							part, _ = sjson.SetRaw(part, "functionCall.args", functionArgs)
-							contentJSON, _ = sjson.SetRaw(contentJSON, "parts.-1", part)
-						}
-
-					case "tool_result":
-						toolCallID := contentResult.Get("tool_use_id").String()
-						if toolCallID == "" {
-							return true
-						}
-						funcName := toolCallID
-						toolCallIDs := strings.Split(toolCallID, "-")
-						if len(toolCallIDs) > 1 {
-							funcName = strings.Join(toolCallIDs[0:len(toolCallIDs)-1], "-")
-						}
-						responseData := contentResult.Get("content").Raw
-						part := `{"functionResponse":{"name":"","response":{"result":""}}}`
-						part, _ = sjson.Set(part, "functionResponse.name", funcName)
-						part, _ = sjson.Set(part, "functionResponse.response.result", responseData)
-						contentJSON, _ = sjson.SetRaw(contentJSON, "parts.-1", part)
-
-					case "image":
-						source := contentResult.Get("source")
-						if source.Get("type").String() == "base64" {
-							mimeType := source.Get("media_type").String()
-							data := source.Get("data").String()
-							if mimeType != "" && data != "" {
-								part := `{"inlineData":{"mime_type":"","data":""}}`
-								part, _ = sjson.Set(part, "inlineData.mime_type", mimeType)
-								part, _ = sjson.Set(part, "inlineData.data", data)
-								contentJSON, _ = sjson.SetRaw(contentJSON, "parts.-1", part)
-							}
-						}
-					}
-					return true
-				})
-				out, _ = sjson.SetRaw(out, "request.contents.-1", contentJSON)
-			} else if contentsResult.Type == gjson.String {
-				part := `{"text":""}`
-				part, _ = sjson.Set(part, "text", contentsResult.String())
-				contentJSON, _ = sjson.SetRaw(contentJSON, "parts.-1", part)
-				out, _ = sjson.SetRaw(out, "request.contents.-1", contentJSON)
-			}
-			return true
-		})
+	if systemInstruction, ok := buildGeminiCLIClaudeSystemInstruction(root); ok {
+		requestRoot["systemInstruction"] = systemInstruction
 	}
 
-	// tools
-	if toolsResult := gjson.GetBytes(rawJSON, "tools"); toolsResult.IsArray() {
-		hasTools := false
-		toolsResult.ForEach(func(_, toolResult gjson.Result) bool {
-			inputSchemaResult := toolResult.Get("input_schema")
-			if inputSchemaResult.Exists() && inputSchemaResult.IsObject() {
-				inputSchema := util.CleanJSONSchemaForGemini(inputSchemaResult.Raw)
-				tool, _ := sjson.Delete(toolResult.Raw, "input_schema")
-				tool, _ = sjson.SetRaw(tool, "parametersJsonSchema", inputSchema)
-				tool, _ = sjson.Delete(tool, "strict")
-				tool, _ = sjson.Delete(tool, "input_examples")
-				tool, _ = sjson.Delete(tool, "type")
-				tool, _ = sjson.Delete(tool, "cache_control")
-				tool, _ = sjson.Delete(tool, "defer_loading")
-				tool, _ = sjson.Delete(tool, "eager_input_streaming")
-				if gjson.Valid(tool) && gjson.Parse(tool).IsObject() {
-					if !hasTools {
-						out, _ = sjson.SetRaw(out, "request.tools", `[{"functionDeclarations":[]}]`)
-						hasTools = true
-					}
-					out, _ = sjson.SetRaw(out, "request.tools.0.functionDeclarations.-1", tool)
-				}
-			}
-			return true
-		})
-		if !hasTools {
-			out, _ = sjson.Delete(out, "request.tools")
-		}
+	if contents := buildGeminiCLIClaudeContents(root); len(contents) > 0 {
+		requestRoot["contents"] = contents
 	}
 
-	// tool_choice
-	toolChoiceResult := gjson.GetBytes(rawJSON, "tool_choice")
-	if toolChoiceResult.Exists() {
+	if tools := buildGeminiCLIClaudeTools(root); len(tools) > 0 {
+		requestRoot["tools"] = tools
+	}
+
+	if toolChoiceValue, ok := jsonutil.Get(root, "tool_choice"); ok {
 		toolChoiceType := ""
 		toolChoiceName := ""
-		if toolChoiceResult.IsObject() {
-			toolChoiceType = toolChoiceResult.Get("type").String()
-			toolChoiceName = toolChoiceResult.Get("name").String()
-		} else if toolChoiceResult.Type == gjson.String {
-			toolChoiceType = toolChoiceResult.String()
+		switch typed := toolChoiceValue.(type) {
+		case map[string]any:
+			toolChoiceType, _ = jsonutil.String(typed, "type")
+			toolChoiceName, _ = jsonutil.String(typed, "name")
+		case string:
+			toolChoiceType = typed
 		}
 
 		switch toolChoiceType {
 		case "auto":
-			out, _ = sjson.Set(out, "request.toolConfig.functionCallingConfig.mode", "AUTO")
+			_ = jsonutil.Set(outRoot, "request.toolConfig.functionCallingConfig.mode", "AUTO")
 		case "none":
-			out, _ = sjson.Set(out, "request.toolConfig.functionCallingConfig.mode", "NONE")
+			_ = jsonutil.Set(outRoot, "request.toolConfig.functionCallingConfig.mode", "NONE")
 		case "any":
-			out, _ = sjson.Set(out, "request.toolConfig.functionCallingConfig.mode", "ANY")
+			_ = jsonutil.Set(outRoot, "request.toolConfig.functionCallingConfig.mode", "ANY")
 		case "tool":
-			out, _ = sjson.Set(out, "request.toolConfig.functionCallingConfig.mode", "ANY")
+			_ = jsonutil.Set(outRoot, "request.toolConfig.functionCallingConfig.mode", "ANY")
 			if toolChoiceName != "" {
-				out, _ = sjson.Set(out, "request.toolConfig.functionCallingConfig.allowedFunctionNames", []string{toolChoiceName})
+				_ = jsonutil.Set(outRoot, "request.toolConfig.functionCallingConfig.allowedFunctionNames", []string{toolChoiceName})
 			}
 		}
 	}
 
-	// Map Anthropic thinking -> Gemini CLI thinkingConfig when enabled
-	// Translator only does format conversion, ApplyThinking handles model capability validation.
-	if t := gjson.GetBytes(rawJSON, "thinking"); t.Exists() && t.IsObject() {
-		switch t.Get("type").String() {
+	if thinkingConfig, ok := jsonutil.Object(root, "thinking"); ok {
+		thinkingType, _ := jsonutil.String(thinkingConfig, "type")
+		switch thinkingType {
 		case "enabled":
-			if b := t.Get("budget_tokens"); b.Exists() && b.Type == gjson.Number {
-				budget := int(b.Int())
-				out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.thinkingBudget", budget)
-				out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.includeThoughts", true)
+			if budget, ok := jsonutil.Get(thinkingConfig, "budget_tokens"); ok {
+				_ = jsonutil.Set(outRoot, "request.generationConfig.thinkingConfig.thinkingBudget", budget)
+				_ = jsonutil.Set(outRoot, "request.generationConfig.thinkingConfig.includeThoughts", true)
 			}
 		case "adaptive", "auto":
-			// For adaptive thinking:
-			// - If output_config.effort is explicitly present, pass through as thinkingLevel.
-			// - Otherwise, treat it as "enabled with target-model maximum" and emit high.
-			// ApplyThinking handles clamping to target model's supported levels.
 			effort := ""
-			if v := gjson.GetBytes(rawJSON, "output_config.effort"); v.Exists() && v.Type == gjson.String {
-				effort = strings.ToLower(strings.TrimSpace(v.String()))
+			if outputConfig, ok := jsonutil.Object(root, "output_config"); ok {
+				if value, ok := jsonutil.String(outputConfig, "effort"); ok {
+					effort = strings.ToLower(strings.TrimSpace(value))
+				}
 			}
 			if effort != "" {
-				out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.thinkingLevel", effort)
+				_ = jsonutil.Set(outRoot, "request.generationConfig.thinkingConfig.thinkingLevel", effort)
 			} else {
-				out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.thinkingLevel", "high")
+				_ = jsonutil.Set(outRoot, "request.generationConfig.thinkingConfig.thinkingLevel", "high")
 			}
-			out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.includeThoughts", true)
+			_ = jsonutil.Set(outRoot, "request.generationConfig.thinkingConfig.includeThoughts", true)
 		}
 	}
-	if v := gjson.GetBytes(rawJSON, "temperature"); v.Exists() && v.Type == gjson.Number {
-		out, _ = sjson.Set(out, "request.generationConfig.temperature", v.Num)
+
+	if value, ok := jsonutil.Get(root, "temperature"); ok {
+		_ = jsonutil.Set(outRoot, "request.generationConfig.temperature", value)
 	}
-	if v := gjson.GetBytes(rawJSON, "top_p"); v.Exists() && v.Type == gjson.Number {
-		out, _ = sjson.Set(out, "request.generationConfig.topP", v.Num)
+	if value, ok := jsonutil.Get(root, "top_p"); ok {
+		_ = jsonutil.Set(outRoot, "request.generationConfig.topP", value)
 	}
-	if v := gjson.GetBytes(rawJSON, "top_k"); v.Exists() && v.Type == gjson.Number {
-		out, _ = sjson.Set(out, "request.generationConfig.topK", v.Num)
+	if value, ok := jsonutil.Get(root, "top_k"); ok {
+		_ = jsonutil.Set(outRoot, "request.generationConfig.topK", value)
 	}
 
-	outBytes := []byte(out)
-	outBytes = common.AttachDefaultSafetySettings(outBytes, "request.safetySettings")
+	return jsonutil.MarshalOrOriginal(inputRawJSON, outRoot)
+}
 
-	return outBytes
+func buildGeminiCLIClaudeSystemInstruction(root map[string]any) (map[string]any, bool) {
+	if systemEntries, ok := jsonutil.Array(root, "system"); ok {
+		parts := make([]any, 0, len(systemEntries))
+		for _, entryValue := range systemEntries {
+			entry, ok := entryValue.(map[string]any)
+			if !ok {
+				continue
+			}
+			entryType, _ := jsonutil.String(entry, "type")
+			if entryType != "text" {
+				continue
+			}
+			text, _ := jsonutil.String(entry, "text")
+			parts = append(parts, map[string]any{"text": text})
+		}
+		if len(parts) > 0 {
+			return map[string]any{
+				"role":  "user",
+				"parts": parts,
+			}, true
+		}
+	}
+
+	if systemText, ok := jsonutil.String(root, "system"); ok {
+		return map[string]any{
+			"role": "user",
+			"parts": []any{
+				map[string]any{"text": systemText},
+			},
+		}, true
+	}
+
+	return nil, false
+}
+
+func buildGeminiCLIClaudeContents(root map[string]any) []any {
+	messages, ok := jsonutil.Array(root, "messages")
+	if !ok {
+		return nil
+	}
+
+	contents := make([]any, 0, len(messages))
+	for _, messageValue := range messages {
+		message, ok := messageValue.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		role, ok := jsonutil.String(message, "role")
+		if !ok || role == "" {
+			continue
+		}
+		if role == "assistant" {
+			role = "model"
+		}
+
+		parts := make([]any, 0)
+		if contentArray, ok := jsonutil.Array(message, "content"); ok {
+			for _, contentValue := range contentArray {
+				content, ok := contentValue.(map[string]any)
+				if !ok {
+					continue
+				}
+				if part, ok := buildGeminiCLIClaudeContentPart(content); ok {
+					parts = append(parts, part)
+				}
+			}
+		} else if contentText, ok := jsonutil.String(message, "content"); ok {
+			parts = append(parts, map[string]any{"text": contentText})
+		}
+
+		if len(parts) == 0 {
+			continue
+		}
+
+		contents = append(contents, map[string]any{
+			"role":  role,
+			"parts": parts,
+		})
+	}
+
+	return contents
+}
+
+func buildGeminiCLIClaudeContentPart(content map[string]any) (map[string]any, bool) {
+	contentType, _ := jsonutil.String(content, "type")
+	switch contentType {
+	case "text":
+		text, _ := jsonutil.String(content, "text")
+		return map[string]any{"text": text}, true
+	case "tool_use":
+		functionName, _ := jsonutil.String(content, "name")
+		functionArgs, ok := geminiCLIClaudeToolInput(content)
+		if !ok {
+			return nil, false
+		}
+		return map[string]any{
+			"thoughtSignature": geminiCLIClaudeThoughtSignature,
+			"functionCall": map[string]any{
+				"name": functionName,
+				"args": functionArgs,
+			},
+		}, true
+	case "tool_result":
+		toolCallID, _ := jsonutil.String(content, "tool_use_id")
+		if toolCallID == "" {
+			return nil, false
+		}
+		functionName := toolCallID
+		parts := strings.Split(toolCallID, "-")
+		if len(parts) > 1 {
+			functionName = strings.Join(parts[:len(parts)-1], "-")
+		}
+		response := map[string]any{}
+		if value, ok := jsonutil.Get(content, "content"); ok {
+			response["result"] = value
+		}
+		return map[string]any{
+			"functionResponse": map[string]any{
+				"name":     functionName,
+				"response": response,
+			},
+		}, true
+	case "image":
+		source, ok := jsonutil.Object(content, "source")
+		if !ok {
+			return nil, false
+		}
+		sourceType, _ := jsonutil.String(source, "type")
+		if sourceType != "base64" {
+			return nil, false
+		}
+		mimeType, _ := jsonutil.String(source, "media_type")
+		data, _ := jsonutil.String(source, "data")
+		if mimeType == "" || data == "" {
+			return nil, false
+		}
+		return map[string]any{
+			"inlineData": map[string]any{
+				"mime_type": mimeType,
+				"data":      data,
+			},
+		}, true
+	default:
+		return nil, false
+	}
+}
+
+func geminiCLIClaudeToolInput(content map[string]any) (map[string]any, bool) {
+	inputValue, ok := jsonutil.Get(content, "input")
+	if !ok || inputValue == nil {
+		return nil, false
+	}
+	switch typed := inputValue.(type) {
+	case map[string]any:
+		return typed, true
+	case string:
+		parsed, errParse := jsonutil.ParseAnyBytes([]byte(typed))
+		if errParse != nil {
+			return nil, false
+		}
+		object, ok := parsed.(map[string]any)
+		return object, ok
+	default:
+		return nil, false
+	}
+}
+
+func buildGeminiCLIClaudeTools(root map[string]any) []any {
+	tools, ok := jsonutil.Array(root, "tools")
+	if !ok {
+		return nil
+	}
+
+	functionDeclarations := make([]any, 0)
+	for _, toolValue := range tools {
+		tool, ok := toolValue.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		inputSchema, ok := jsonutil.Object(tool, "input_schema")
+		if !ok {
+			continue
+		}
+
+		inputSchemaJSON, errMarshal := jsonutil.MarshalAny(inputSchema)
+		if errMarshal != nil {
+			continue
+		}
+		cleanedSchema := util.CleanJSONSchemaForGemini(string(inputSchemaJSON))
+		cleanedValue, errParse := jsonutil.ParseAnyBytes([]byte(cleanedSchema))
+		if errParse != nil {
+			continue
+		}
+
+		functionDeclaration := make(map[string]any)
+		for key, value := range tool {
+			switch key {
+			case "strict", "input_examples", "type", "cache_control", "defer_loading", "eager_input_streaming", "input_schema":
+				continue
+			default:
+				functionDeclaration[key] = value
+			}
+		}
+		functionDeclaration["parametersJsonSchema"] = cleanedValue
+		functionDeclarations = append(functionDeclarations, functionDeclaration)
+	}
+
+	if len(functionDeclarations) == 0 {
+		return nil
+	}
+
+	return []any{
+		map[string]any{
+			"functionDeclarations": functionDeclarations,
+		},
+	}
 }

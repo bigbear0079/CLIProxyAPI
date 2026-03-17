@@ -19,8 +19,6 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // AIStudioExecutor routes AI Studio requests through a websocket-backed transport.
@@ -328,9 +326,9 @@ func (e *AIStudioExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.A
 		return cliproxyexecutor.Response{}, err
 	}
 
-	body.payload, _ = sjson.DeleteBytes(body.payload, "generationConfig")
-	body.payload, _ = sjson.DeleteBytes(body.payload, "tools")
-	body.payload, _ = sjson.DeleteBytes(body.payload, "safetySettings")
+	body.payload = deleteJSONFieldBytes(body.payload, "generationConfig")
+	body.payload = deleteJSONFieldBytes(body.payload, "tools")
+	body.payload = deleteJSONFieldBytes(body.payload, "safetySettings")
 
 	endpoint := e.buildEndpoint(baseModel, "countTokens", "")
 	wsReq := &wsrelay.HTTPRequest{
@@ -368,7 +366,10 @@ func (e *AIStudioExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.A
 	if resp.Status < 200 || resp.Status >= 300 {
 		return cliproxyexecutor.Response{}, statusErr{code: resp.Status, msg: string(resp.Body)}
 	}
-	totalTokens := gjson.GetBytes(resp.Body, "totalTokens").Int()
+	totalTokens, ok := jsonInt64FieldBytes(resp.Body, "totalTokens")
+	if !ok {
+		totalTokens = 0
+	}
 	if totalTokens <= 0 {
 		return cliproxyexecutor.Response{}, fmt.Errorf("wsrelay: totalTokens missing in response")
 	}
@@ -406,9 +407,9 @@ func (e *AIStudioExecutor) translateRequest(req cliproxyexecutor.Request, opts c
 	payload = fixGeminiImageAspectRatio(baseModel, payload)
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	payload = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", payload, originalTranslated, requestedModel)
-	payload, _ = sjson.DeleteBytes(payload, "generationConfig.maxOutputTokens")
-	payload, _ = sjson.DeleteBytes(payload, "generationConfig.responseMimeType")
-	payload, _ = sjson.DeleteBytes(payload, "generationConfig.responseJsonSchema")
+	payload = deleteJSONFieldBytes(payload, "generationConfig.maxOutputTokens")
+	payload = deleteJSONFieldBytes(payload, "generationConfig.responseMimeType")
+	payload = deleteJSONFieldBytes(payload, "generationConfig.responseJsonSchema")
 	metadataAction := "generateContent"
 	if req.Metadata != nil {
 		if action, _ := req.Metadata["action"].(string); action == "countTokens" {
@@ -419,7 +420,7 @@ func (e *AIStudioExecutor) translateRequest(req cliproxyexecutor.Request, opts c
 	if stream && action != "countTokens" {
 		action = "streamGenerateContent"
 	}
-	payload, _ = sjson.DeleteBytes(payload, "session_id")
+	payload = deleteJSONFieldBytes(payload, "session_id")
 	return payload, translatedPayload{payload: payload, action: action, toFormat: to}, nil
 }
 

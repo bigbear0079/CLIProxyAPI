@@ -1,10 +1,11 @@
 package executor
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
-	"github.com/tidwall/gjson"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/tiktoken-go/tokenizer"
 )
 
@@ -46,16 +47,19 @@ func countOpenAIChatTokens(enc tokenizer.Codec, payload []byte) (int64, error) {
 		return 0, nil
 	}
 
-	root := gjson.ParseBytes(payload)
+	root, errParse := jsonutil.ParseObjectBytes(payload)
+	if errParse != nil {
+		return 0, nil
+	}
 	segments := make([]string, 0, 32)
 
-	collectOpenAIMessages(root.Get("messages"), &segments)
-	collectOpenAITools(root.Get("tools"), &segments)
-	collectOpenAIFunctions(root.Get("functions"), &segments)
-	collectOpenAIToolChoice(root.Get("tool_choice"), &segments)
-	collectOpenAIResponseFormat(root.Get("response_format"), &segments)
-	addIfNotEmpty(&segments, root.Get("input").String())
-	addIfNotEmpty(&segments, root.Get("prompt").String())
+	collectOpenAIMessages(root["messages"], &segments)
+	collectOpenAITools(root["tools"], &segments)
+	collectOpenAIFunctions(root["functions"], &segments)
+	collectOpenAIToolChoice(root["tool_choice"], &segments)
+	collectOpenAIResponseFormat(root["response_format"], &segments)
+	addIfNotEmpty(&segments, jsonTextValue(root["input"]))
+	addIfNotEmpty(&segments, jsonTextValue(root["prompt"]))
 
 	joined := strings.TrimSpace(strings.Join(segments, "\n"))
 	if joined == "" {
@@ -74,155 +78,187 @@ func buildOpenAIUsageJSON(count int64) []byte {
 	return []byte(fmt.Sprintf(`{"usage":{"prompt_tokens":%d,"completion_tokens":0,"total_tokens":%d}}`, count, count))
 }
 
-func collectOpenAIMessages(messages gjson.Result, segments *[]string) {
-	if !messages.Exists() || !messages.IsArray() {
+func collectOpenAIMessages(messages any, segments *[]string) {
+	messageArray, ok := messages.([]any)
+	if !ok {
 		return
 	}
-	messages.ForEach(func(_, message gjson.Result) bool {
-		addIfNotEmpty(segments, message.Get("role").String())
-		addIfNotEmpty(segments, message.Get("name").String())
-		collectOpenAIContent(message.Get("content"), segments)
-		collectOpenAIToolCalls(message.Get("tool_calls"), segments)
-		collectOpenAIFunctionCall(message.Get("function_call"), segments)
-		return true
-	})
+	for _, messageValue := range messageArray {
+		message, ok := messageValue.(map[string]any)
+		if !ok {
+			continue
+		}
+		addIfNotEmpty(segments, jsonTextValue(message["role"]))
+		addIfNotEmpty(segments, jsonTextValue(message["name"]))
+		collectOpenAIContent(message["content"], segments)
+		collectOpenAIToolCalls(message["tool_calls"], segments)
+		collectOpenAIFunctionCall(message["function_call"], segments)
+	}
 }
 
-func collectOpenAIContent(content gjson.Result, segments *[]string) {
-	if !content.Exists() {
+func collectOpenAIContent(content any, segments *[]string) {
+	if content == nil {
 		return
 	}
-	if content.Type == gjson.String {
-		addIfNotEmpty(segments, content.String())
+	if contentString, ok := content.(string); ok {
+		addIfNotEmpty(segments, contentString)
 		return
 	}
-	if content.IsArray() {
-		content.ForEach(func(_, part gjson.Result) bool {
-			partType := part.Get("type").String()
+	if contentArray, ok := content.([]any); ok {
+		for _, partValue := range contentArray {
+			part, ok := partValue.(map[string]any)
+			if !ok {
+				collectOpenAIContent(partValue, segments)
+				continue
+			}
+			partType := jsonTextValue(part["type"])
 			switch partType {
 			case "text", "input_text", "output_text":
-				addIfNotEmpty(segments, part.Get("text").String())
+				addIfNotEmpty(segments, jsonTextValue(part["text"]))
 			case "image_url":
-				addIfNotEmpty(segments, part.Get("image_url.url").String())
+				if imageURL, ok := part["image_url"].(map[string]any); ok {
+					addIfNotEmpty(segments, jsonTextValue(imageURL["url"]))
+				}
 			case "input_audio", "output_audio", "audio":
-				addIfNotEmpty(segments, part.Get("id").String())
+				addIfNotEmpty(segments, jsonTextValue(part["id"]))
 			case "tool_result":
-				addIfNotEmpty(segments, part.Get("name").String())
-				collectOpenAIContent(part.Get("content"), segments)
+				addIfNotEmpty(segments, jsonTextValue(part["name"]))
+				collectOpenAIContent(part["content"], segments)
 			default:
-				if part.IsArray() {
-					collectOpenAIContent(part, segments)
-					return true
-				}
-				if part.Type == gjson.JSON {
-					addIfNotEmpty(segments, part.Raw)
-					return true
-				}
-				addIfNotEmpty(segments, part.String())
-			}
-			return true
-		})
-		return
-	}
-	if content.Type == gjson.JSON {
-		addIfNotEmpty(segments, content.Raw)
-	}
-}
-
-func collectOpenAIToolCalls(calls gjson.Result, segments *[]string) {
-	if !calls.Exists() || !calls.IsArray() {
-		return
-	}
-	calls.ForEach(func(_, call gjson.Result) bool {
-		addIfNotEmpty(segments, call.Get("id").String())
-		addIfNotEmpty(segments, call.Get("type").String())
-		function := call.Get("function")
-		if function.Exists() {
-			addIfNotEmpty(segments, function.Get("name").String())
-			addIfNotEmpty(segments, function.Get("description").String())
-			addIfNotEmpty(segments, function.Get("arguments").String())
-			if params := function.Get("parameters"); params.Exists() {
-				addIfNotEmpty(segments, params.Raw)
+				addIfNotEmpty(segments, jsonTextValue(part))
 			}
 		}
-		return true
-	})
-}
-
-func collectOpenAIFunctionCall(call gjson.Result, segments *[]string) {
-	if !call.Exists() {
 		return
 	}
-	addIfNotEmpty(segments, call.Get("name").String())
-	addIfNotEmpty(segments, call.Get("arguments").String())
+	addIfNotEmpty(segments, jsonTextValue(content))
 }
 
-func collectOpenAITools(tools gjson.Result, segments *[]string) {
-	if !tools.Exists() {
+func collectOpenAIToolCalls(calls any, segments *[]string) {
+	callArray, ok := calls.([]any)
+	if !ok {
 		return
 	}
-	if tools.IsArray() {
-		tools.ForEach(func(_, tool gjson.Result) bool {
-			appendToolPayload(tool, segments)
-			return true
-		})
+	for _, callValue := range callArray {
+		call, ok := callValue.(map[string]any)
+		if !ok {
+			continue
+		}
+		addIfNotEmpty(segments, jsonTextValue(call["id"]))
+		addIfNotEmpty(segments, jsonTextValue(call["type"]))
+		if function, ok := call["function"].(map[string]any); ok {
+			addIfNotEmpty(segments, jsonTextValue(function["name"]))
+			addIfNotEmpty(segments, jsonTextValue(function["description"]))
+			addIfNotEmpty(segments, jsonTextValue(function["arguments"]))
+			if params, ok := function["parameters"]; ok {
+				addIfNotEmpty(segments, jsonTextValue(params))
+			}
+		}
+	}
+}
+
+func collectOpenAIFunctionCall(call any, segments *[]string) {
+	functionCall, ok := call.(map[string]any)
+	if !ok {
+		return
+	}
+	addIfNotEmpty(segments, jsonTextValue(functionCall["name"]))
+	addIfNotEmpty(segments, jsonTextValue(functionCall["arguments"]))
+}
+
+func collectOpenAITools(tools any, segments *[]string) {
+	if tools == nil {
+		return
+	}
+	if toolArray, ok := tools.([]any); ok {
+		for _, toolValue := range toolArray {
+			appendToolPayload(toolValue, segments)
+		}
 		return
 	}
 	appendToolPayload(tools, segments)
 }
 
-func collectOpenAIFunctions(functions gjson.Result, segments *[]string) {
-	if !functions.Exists() || !functions.IsArray() {
+func collectOpenAIFunctions(functions any, segments *[]string) {
+	functionArray, ok := functions.([]any)
+	if !ok {
 		return
 	}
-	functions.ForEach(func(_, function gjson.Result) bool {
-		addIfNotEmpty(segments, function.Get("name").String())
-		addIfNotEmpty(segments, function.Get("description").String())
-		if params := function.Get("parameters"); params.Exists() {
-			addIfNotEmpty(segments, params.Raw)
+	for _, functionValue := range functionArray {
+		function, ok := functionValue.(map[string]any)
+		if !ok {
+			continue
 		}
-		return true
-	})
-}
-
-func collectOpenAIToolChoice(choice gjson.Result, segments *[]string) {
-	if !choice.Exists() {
-		return
-	}
-	if choice.Type == gjson.String {
-		addIfNotEmpty(segments, choice.String())
-		return
-	}
-	addIfNotEmpty(segments, choice.Raw)
-}
-
-func collectOpenAIResponseFormat(format gjson.Result, segments *[]string) {
-	if !format.Exists() {
-		return
-	}
-	addIfNotEmpty(segments, format.Get("type").String())
-	addIfNotEmpty(segments, format.Get("name").String())
-	if schema := format.Get("json_schema"); schema.Exists() {
-		addIfNotEmpty(segments, schema.Raw)
-	}
-	if schema := format.Get("schema"); schema.Exists() {
-		addIfNotEmpty(segments, schema.Raw)
-	}
-}
-
-func appendToolPayload(tool gjson.Result, segments *[]string) {
-	if !tool.Exists() {
-		return
-	}
-	addIfNotEmpty(segments, tool.Get("type").String())
-	addIfNotEmpty(segments, tool.Get("name").String())
-	addIfNotEmpty(segments, tool.Get("description").String())
-	if function := tool.Get("function"); function.Exists() {
-		addIfNotEmpty(segments, function.Get("name").String())
-		addIfNotEmpty(segments, function.Get("description").String())
-		if params := function.Get("parameters"); params.Exists() {
-			addIfNotEmpty(segments, params.Raw)
+		addIfNotEmpty(segments, jsonTextValue(function["name"]))
+		addIfNotEmpty(segments, jsonTextValue(function["description"]))
+		if params, ok := function["parameters"]; ok {
+			addIfNotEmpty(segments, jsonTextValue(params))
 		}
+	}
+}
+
+func collectOpenAIToolChoice(choice any, segments *[]string) {
+	if choice == nil {
+		return
+	}
+	if choiceString, ok := choice.(string); ok {
+		addIfNotEmpty(segments, choiceString)
+		return
+	}
+	addIfNotEmpty(segments, jsonTextValue(choice))
+}
+
+func collectOpenAIResponseFormat(format any, segments *[]string) {
+	formatObject, ok := format.(map[string]any)
+	if !ok {
+		return
+	}
+	addIfNotEmpty(segments, jsonTextValue(formatObject["type"]))
+	addIfNotEmpty(segments, jsonTextValue(formatObject["name"]))
+	if schema, ok := formatObject["json_schema"]; ok {
+		addIfNotEmpty(segments, jsonTextValue(schema))
+	}
+	if schema, ok := formatObject["schema"]; ok {
+		addIfNotEmpty(segments, jsonTextValue(schema))
+	}
+}
+
+func appendToolPayload(tool any, segments *[]string) {
+	toolObject, ok := tool.(map[string]any)
+	if !ok {
+		return
+	}
+	addIfNotEmpty(segments, jsonTextValue(toolObject["type"]))
+	addIfNotEmpty(segments, jsonTextValue(toolObject["name"]))
+	addIfNotEmpty(segments, jsonTextValue(toolObject["description"]))
+	if function, ok := toolObject["function"].(map[string]any); ok {
+		addIfNotEmpty(segments, jsonTextValue(function["name"]))
+		addIfNotEmpty(segments, jsonTextValue(function["description"]))
+		if params, ok := function["parameters"]; ok {
+			addIfNotEmpty(segments, jsonTextValue(params))
+		}
+	}
+}
+
+func jsonTextValue(value any) string {
+	if value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case json.Number:
+		return typed.String()
+	case bool:
+		if typed {
+			return "true"
+		}
+		return "false"
+	default:
+		out, errMarshal := json.Marshal(typed)
+		if errMarshal != nil {
+			return fmt.Sprint(typed)
+		}
+		return string(out)
 	}
 }
 

@@ -6,13 +6,13 @@
 package claude
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // ConvertClaudeRequestToCodex parses and transforms a Claude Code API request into the internal client format.
@@ -34,72 +34,42 @@ import (
 // Returns:
 //   - []byte: The transformed request data in internal client format
 func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) []byte {
-	rawJSON := inputRawJSON
+	root := jsonutil.ParseObjectBytesOrEmpty(inputRawJSON)
+	outRoot := map[string]any{
+		"model":        modelName,
+		"instructions": "",
+		"input":        []any{},
+	}
 
-	template := `{"model":"","instructions":"","input":[]}`
+	shortMap := claudeCodexShortMap(root)
+	inputItems := make([]any, 0)
 
-	rootResult := gjson.ParseBytes(rawJSON)
-	template, _ = sjson.Set(template, "model", modelName)
-
-	// Process system messages and convert them to input content format.
-	systemsResult := rootResult.Get("system")
-	if systemsResult.Exists() {
-		message := `{"type":"message","role":"developer","content":[]}`
-		contentIndex := 0
-
-		appendSystemText := func(text string) {
-			if text == "" || strings.HasPrefix(text, "x-anthropic-billing-header: ") {
-				return
-			}
-
-			message, _ = sjson.Set(message, fmt.Sprintf("content.%d.type", contentIndex), "input_text")
-			message, _ = sjson.Set(message, fmt.Sprintf("content.%d.text", contentIndex), text)
-			contentIndex++
-		}
-
-		if systemsResult.Type == gjson.String {
-			appendSystemText(systemsResult.String())
-		} else if systemsResult.IsArray() {
-			systemResults := systemsResult.Array()
-			for i := 0; i < len(systemResults); i++ {
-				systemResult := systemResults[i]
-				if systemResult.Get("type").String() == "text" {
-					appendSystemText(systemResult.Get("text").String())
-				}
-			}
-		}
-
-		if contentIndex > 0 {
-			template, _ = sjson.SetRaw(template, "input.-1", message)
+	if systemValue, ok := jsonutil.Get(root, "system"); ok {
+		if systemMessage, ok := claudeCodexSystemMessage(systemValue); ok {
+			inputItems = append(inputItems, systemMessage)
 		}
 	}
 
-	// Process messages and transform their contents to appropriate formats.
-	messagesResult := rootResult.Get("messages")
-	if messagesResult.IsArray() {
-		messageResults := messagesResult.Array()
-
-		for i := 0; i < len(messageResults); i++ {
-			messageResult := messageResults[i]
-			messageRole := messageResult.Get("role").String()
-
-			newMessage := func() string {
-				msg := `{"type": "message","role":"","content":[]}`
-				msg, _ = sjson.Set(msg, "role", messageRole)
-				return msg
+	if messages, ok := jsonutil.Array(root, "messages"); ok {
+		for _, messageValue := range messages {
+			messageObject, ok := messageValue.(map[string]any)
+			if !ok {
+				continue
 			}
 
-			message := newMessage()
-			contentIndex := 0
-			hasContent := false
+			messageRole, _ := jsonutil.String(messageObject, "role")
+			contentParts := make([]any, 0)
 
 			flushMessage := func() {
-				if hasContent {
-					template, _ = sjson.SetRaw(template, "input.-1", message)
-					message = newMessage()
-					contentIndex = 0
-					hasContent = false
+				if len(contentParts) == 0 {
+					return
 				}
+				inputItems = append(inputItems, map[string]any{
+					"type":    "message",
+					"role":    messageRole,
+					"content": contentParts,
+				})
+				contentParts = make([]any, 0)
 			}
 
 			appendTextContent := func(text string) {
@@ -107,199 +77,144 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 				if messageRole == "assistant" {
 					partType = "output_text"
 				}
-				message, _ = sjson.Set(message, fmt.Sprintf("content.%d.type", contentIndex), partType)
-				message, _ = sjson.Set(message, fmt.Sprintf("content.%d.text", contentIndex), text)
-				contentIndex++
-				hasContent = true
+				contentParts = append(contentParts, map[string]any{
+					"type": partType,
+					"text": text,
+				})
 			}
 
 			appendImageContent := func(dataURL string) {
-				message, _ = sjson.Set(message, fmt.Sprintf("content.%d.type", contentIndex), "input_image")
-				message, _ = sjson.Set(message, fmt.Sprintf("content.%d.image_url", contentIndex), dataURL)
-				contentIndex++
-				hasContent = true
+				contentParts = append(contentParts, map[string]any{
+					"type":      "input_image",
+					"image_url": dataURL,
+				})
 			}
 
-			messageContentsResult := messageResult.Get("content")
-			if messageContentsResult.IsArray() {
-				messageContentResults := messageContentsResult.Array()
-				for j := 0; j < len(messageContentResults); j++ {
-					messageContentResult := messageContentResults[j]
-					contentType := messageContentResult.Get("type").String()
+			if messageContents, ok := jsonutil.Array(messageObject, "content"); ok {
+				for _, contentValue := range messageContents {
+					content, ok := contentValue.(map[string]any)
+					if !ok {
+						continue
+					}
 
+					contentType, _ := jsonutil.String(content, "type")
 					switch contentType {
 					case "text":
-						appendTextContent(messageContentResult.Get("text").String())
+						if text, ok := jsonutil.String(content, "text"); ok {
+							appendTextContent(text)
+						}
 					case "image":
-						sourceResult := messageContentResult.Get("source")
-						if sourceResult.Exists() {
-							data := sourceResult.Get("data").String()
-							if data == "" {
-								data = sourceResult.Get("base64").String()
-							}
-							if data != "" {
-								mediaType := sourceResult.Get("media_type").String()
-								if mediaType == "" {
-									mediaType = sourceResult.Get("mime_type").String()
-								}
-								if mediaType == "" {
-									mediaType = "application/octet-stream"
-								}
-								dataURL := fmt.Sprintf("data:%s;base64,%s", mediaType, data)
-								appendImageContent(dataURL)
-							}
+						if dataURL, ok := claudeCodexImageDataURL(content); ok {
+							appendImageContent(dataURL)
 						}
 					case "tool_use":
 						flushMessage()
-						functionCallMessage := `{"type":"function_call"}`
-						functionCallMessage, _ = sjson.Set(functionCallMessage, "call_id", messageContentResult.Get("id").String())
-						{
-							name := messageContentResult.Get("name").String()
-							toolMap := buildReverseMapFromClaudeOriginalToShort(rawJSON)
-							if short, ok := toolMap[name]; ok {
-								name = short
-							} else {
-								name = shortenNameIfNeeded(name)
-							}
-							functionCallMessage, _ = sjson.Set(functionCallMessage, "name", name)
+						functionCall := map[string]any{
+							"type":    "function_call",
+							"call_id": claudeCodexContentString(content["id"]),
 						}
-						functionCallMessage, _ = sjson.Set(functionCallMessage, "arguments", messageContentResult.Get("input").Raw)
-						template, _ = sjson.SetRaw(template, "input.-1", functionCallMessage)
+						if name, ok := jsonutil.String(content, "name"); ok {
+							if short, ok := shortMap[name]; ok {
+								functionCall["name"] = short
+							} else {
+								functionCall["name"] = shortenNameIfNeeded(name)
+							}
+						}
+						if inputValue, ok := jsonutil.Get(content, "input"); ok {
+							functionCall["arguments"] = claudeCodexJSONText(inputValue)
+						}
+						inputItems = append(inputItems, functionCall)
 					case "tool_result":
 						flushMessage()
-						functionCallOutputMessage := `{"type":"function_call_output"}`
-						functionCallOutputMessage, _ = sjson.Set(functionCallOutputMessage, "call_id", messageContentResult.Get("tool_use_id").String())
-
-						contentResult := messageContentResult.Get("content")
-						if contentResult.IsArray() {
-							toolResultContentIndex := 0
-							toolResultContent := `[]`
-							contentResults := contentResult.Array()
-							for k := 0; k < len(contentResults); k++ {
-								toolResultContentType := contentResults[k].Get("type").String()
-								if toolResultContentType == "image" {
-									sourceResult := contentResults[k].Get("source")
-									if sourceResult.Exists() {
-										data := sourceResult.Get("data").String()
-										if data == "" {
-											data = sourceResult.Get("base64").String()
-										}
-										if data != "" {
-											mediaType := sourceResult.Get("media_type").String()
-											if mediaType == "" {
-												mediaType = sourceResult.Get("mime_type").String()
-											}
-											if mediaType == "" {
-												mediaType = "application/octet-stream"
-											}
-											dataURL := fmt.Sprintf("data:%s;base64,%s", mediaType, data)
-
-											toolResultContent, _ = sjson.Set(toolResultContent, fmt.Sprintf("%d.type", toolResultContentIndex), "input_image")
-											toolResultContent, _ = sjson.Set(toolResultContent, fmt.Sprintf("%d.image_url", toolResultContentIndex), dataURL)
-											toolResultContentIndex++
-										}
-									}
-								} else if toolResultContentType == "text" {
-									toolResultContent, _ = sjson.Set(toolResultContent, fmt.Sprintf("%d.type", toolResultContentIndex), "input_text")
-									toolResultContent, _ = sjson.Set(toolResultContent, fmt.Sprintf("%d.text", toolResultContentIndex), contentResults[k].Get("text").String())
-									toolResultContentIndex++
-								}
-							}
-							if toolResultContent != `[]` {
-								functionCallOutputMessage, _ = sjson.SetRaw(functionCallOutputMessage, "output", toolResultContent)
-							} else {
-								functionCallOutputMessage, _ = sjson.Set(functionCallOutputMessage, "output", messageContentResult.Get("content").String())
-							}
-						} else {
-							functionCallOutputMessage, _ = sjson.Set(functionCallOutputMessage, "output", messageContentResult.Get("content").String())
+						functionOutput := map[string]any{
+							"type":    "function_call_output",
+							"call_id": claudeCodexContentString(content["tool_use_id"]),
 						}
 
-						template, _ = sjson.SetRaw(template, "input.-1", functionCallOutputMessage)
+						if resultValue, ok := jsonutil.Get(content, "content"); ok {
+							if resultArray, ok := resultValue.([]any); ok {
+								if outputParts := claudeCodexToolResultOutput(resultArray); len(outputParts) > 0 {
+									functionOutput["output"] = outputParts
+								} else {
+									functionOutput["output"] = claudeCodexContentString(resultValue)
+								}
+							} else {
+								functionOutput["output"] = claudeCodexContentString(resultValue)
+							}
+						} else {
+							functionOutput["output"] = ""
+						}
+						inputItems = append(inputItems, functionOutput)
 					}
 				}
 				flushMessage()
-			} else if messageContentsResult.Type == gjson.String {
-				appendTextContent(messageContentsResult.String())
+				continue
+			}
+
+			if contentText, ok := jsonutil.String(messageObject, "content"); ok {
+				appendTextContent(contentText)
 				flushMessage()
 			}
 		}
-
 	}
+	outRoot["input"] = inputItems
 
-	// Convert tools declarations to the expected format for the Codex API.
-	toolsResult := rootResult.Get("tools")
-	if toolsResult.IsArray() {
-		template, _ = sjson.SetRaw(template, "tools", `[]`)
-		template, _ = sjson.Set(template, "tool_choice", `auto`)
-		toolResults := toolsResult.Array()
-		// Build short name map from declared tools
-		var names []string
-		for i := 0; i < len(toolResults); i++ {
-			n := toolResults[i].Get("name").String()
-			if n != "" {
-				names = append(names, n)
-			}
-		}
-		shortMap := buildShortNameMap(names)
-		for i := 0; i < len(toolResults); i++ {
-			toolResult := toolResults[i]
-			// Special handling: map Claude web search tool to Codex web_search
-			if toolResult.Get("type").String() == "web_search_20250305" {
-				// Replace the tool content entirely with {"type":"web_search"}
-				template, _ = sjson.SetRaw(template, "tools.-1", `{"type":"web_search"}`)
+	if tools, ok := jsonutil.Array(root, "tools"); ok {
+		codexTools := make([]any, 0, len(tools))
+		for _, toolValue := range tools {
+			tool, ok := toolValue.(map[string]any)
+			if !ok {
 				continue
 			}
-			tool := toolResult.Raw
-			tool, _ = sjson.Set(tool, "type", "function")
-			// Apply shortened name if needed
-			if v := toolResult.Get("name"); v.Exists() {
-				name := v.String()
-				if short, ok := shortMap[name]; ok {
-					name = short
-				} else {
-					name = shortenNameIfNeeded(name)
-				}
-				tool, _ = sjson.Set(tool, "name", name)
+			if toolType, _ := jsonutil.String(tool, "type"); toolType == "web_search_20250305" {
+				codexTools = append(codexTools, map[string]any{"type": "web_search"})
+				continue
 			}
-			tool, _ = sjson.SetRaw(tool, "parameters", normalizeToolParameters(toolResult.Get("input_schema").Raw))
-			tool, _ = sjson.Delete(tool, "input_schema")
-			tool, _ = sjson.Delete(tool, "parameters.$schema")
-			tool, _ = sjson.Delete(tool, "cache_control")
-			tool, _ = sjson.Delete(tool, "defer_loading")
-			tool, _ = sjson.Set(tool, "strict", false)
-			template, _ = sjson.SetRaw(template, "tools.-1", tool)
+
+			codexTool := map[string]any{
+				"type":       "function",
+				"parameters": normalizeToolParametersValue(tool["input_schema"]),
+				"strict":     false,
+			}
+			if name, ok := jsonutil.String(tool, "name"); ok {
+				if short, ok := shortMap[name]; ok {
+					codexTool["name"] = short
+				} else {
+					codexTool["name"] = shortenNameIfNeeded(name)
+				}
+			}
+			if description, ok := jsonutil.String(tool, "description"); ok {
+				codexTool["description"] = description
+			}
+			codexTools = append(codexTools, codexTool)
 		}
+		outRoot["tools"] = codexTools
+		outRoot["tool_choice"] = "auto"
 	}
 
-	// Default to parallel tool calls unless tool_choice explicitly disables them.
 	parallelToolCalls := true
-	if disableParallelToolUse := rootResult.Get("tool_choice.disable_parallel_tool_use"); disableParallelToolUse.Exists() {
-		parallelToolCalls = !disableParallelToolUse.Bool()
+	if disableParallelToolUse, ok := jsonutil.Bool(root, "tool_choice.disable_parallel_tool_use"); ok {
+		parallelToolCalls = !disableParallelToolUse
 	}
+	outRoot["parallel_tool_calls"] = parallelToolCalls
 
-	// Add additional configuration parameters for the Codex API.
-	template, _ = sjson.Set(template, "parallel_tool_calls", parallelToolCalls)
-
-	// Convert thinking.budget_tokens to reasoning.effort.
 	reasoningEffort := "medium"
-	if thinkingConfig := rootResult.Get("thinking"); thinkingConfig.Exists() && thinkingConfig.IsObject() {
-		switch thinkingConfig.Get("type").String() {
+	if thinkingConfig, ok := jsonutil.Object(root, "thinking"); ok {
+		switch thinkingType, _ := jsonutil.String(thinkingConfig, "type"); thinkingType {
 		case "enabled":
-			if budgetTokens := thinkingConfig.Get("budget_tokens"); budgetTokens.Exists() {
-				budget := int(budgetTokens.Int())
-				if effort, ok := thinking.ConvertBudgetToLevel(budget); ok && effort != "" {
+			if budgetTokens, ok := jsonutil.Int64(thinkingConfig, "budget_tokens"); ok {
+				if effort, ok := thinking.ConvertBudgetToLevel(int(budgetTokens)); ok && effort != "" {
 					reasoningEffort = effort
 				}
 			}
 		case "adaptive", "auto":
-			// Adaptive thinking can carry an explicit effort in output_config.effort (Claude 4.6).
-			// Pass through directly; ApplyThinking handles clamping to target model's levels.
-			effort := ""
-			if v := rootResult.Get("output_config.effort"); v.Exists() && v.Type == gjson.String {
-				effort = strings.ToLower(strings.TrimSpace(v.String()))
-			}
-			if effort != "" {
-				reasoningEffort = effort
+			if effort, ok := jsonutil.String(root, "output_config.effort"); ok {
+				effort = strings.ToLower(strings.TrimSpace(effort))
+				if effort != "" {
+					reasoningEffort = effort
+				} else {
+					reasoningEffort = string(thinking.LevelXHigh)
+				}
 			} else {
 				reasoningEffort = string(thinking.LevelXHigh)
 			}
@@ -309,13 +224,150 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 			}
 		}
 	}
-	template, _ = sjson.Set(template, "reasoning.effort", reasoningEffort)
-	template, _ = sjson.Set(template, "reasoning.summary", "auto")
-	template, _ = sjson.Set(template, "stream", true)
-	template, _ = sjson.Set(template, "store", false)
-	template, _ = sjson.Set(template, "include", []string{"reasoning.encrypted_content"})
 
-	return []byte(template)
+	outRoot["reasoning"] = map[string]any{
+		"effort":  reasoningEffort,
+		"summary": "auto",
+	}
+	outRoot["stream"] = true
+	outRoot["store"] = false
+	outRoot["include"] = []string{"reasoning.encrypted_content"}
+
+	return jsonutil.MarshalOrOriginal(inputRawJSON, outRoot)
+}
+
+func claudeCodexShortMap(root map[string]any) map[string]string {
+	names := make([]string, 0)
+	if tools, ok := jsonutil.Array(root, "tools"); ok {
+		for _, toolValue := range tools {
+			tool, ok := toolValue.(map[string]any)
+			if !ok {
+				continue
+			}
+			if name, ok := jsonutil.String(tool, "name"); ok && name != "" {
+				names = append(names, name)
+			}
+		}
+	}
+	if len(names) == 0 {
+		return map[string]string{}
+	}
+	return buildShortNameMap(names)
+}
+
+func claudeCodexSystemMessage(systemValue any) (map[string]any, bool) {
+	contentParts := make([]any, 0)
+	appendText := func(text string) {
+		if text == "" || strings.HasPrefix(text, "x-anthropic-billing-header: ") {
+			return
+		}
+		contentParts = append(contentParts, map[string]any{
+			"type": "input_text",
+			"text": text,
+		})
+	}
+
+	switch typed := systemValue.(type) {
+	case string:
+		appendText(typed)
+	case []any:
+		for _, itemValue := range typed {
+			item, ok := itemValue.(map[string]any)
+			if !ok {
+				continue
+			}
+			if itemType, _ := jsonutil.String(item, "type"); itemType == "text" {
+				if text, ok := jsonutil.String(item, "text"); ok {
+					appendText(text)
+				}
+			}
+		}
+	}
+
+	if len(contentParts) == 0 {
+		return nil, false
+	}
+	return map[string]any{
+		"type":    "message",
+		"role":    "developer",
+		"content": contentParts,
+	}, true
+}
+
+func claudeCodexImageDataURL(content map[string]any) (string, bool) {
+	source, ok := jsonutil.Object(content, "source")
+	if !ok {
+		return "", false
+	}
+
+	data, _ := jsonutil.String(source, "data")
+	if data == "" {
+		data, _ = jsonutil.String(source, "base64")
+	}
+	if data == "" {
+		return "", false
+	}
+
+	mediaType, _ := jsonutil.String(source, "media_type")
+	if mediaType == "" {
+		mediaType, _ = jsonutil.String(source, "mime_type")
+	}
+	if mediaType == "" {
+		mediaType = "application/octet-stream"
+	}
+
+	return fmt.Sprintf("data:%s;base64,%s", mediaType, data), true
+}
+
+func claudeCodexToolResultOutput(content []any) []any {
+	outputParts := make([]any, 0)
+	for _, itemValue := range content {
+		item, ok := itemValue.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		itemType, _ := jsonutil.String(item, "type")
+		switch itemType {
+		case "image":
+			if dataURL, ok := claudeCodexImageDataURL(item); ok {
+				outputParts = append(outputParts, map[string]any{
+					"type":      "input_image",
+					"image_url": dataURL,
+				})
+			}
+		case "text":
+			if text, ok := jsonutil.String(item, "text"); ok {
+				outputParts = append(outputParts, map[string]any{
+					"type": "input_text",
+					"text": text,
+				})
+			}
+		}
+	}
+	return outputParts
+}
+
+func claudeCodexJSONText(value any) string {
+	return string(jsonutil.MarshalOrOriginal(nil, value))
+}
+
+func claudeCodexContentString(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return typed
+	case json.Number:
+		return typed.String()
+	case bool:
+		if typed {
+			return "true"
+		}
+		return "false"
+	default:
+		return string(jsonutil.MarshalOrOriginal(nil, typed))
+	}
 }
 
 // shortenNameIfNeeded applies a simple shortening rule for a single name.
@@ -393,40 +445,38 @@ func buildShortNameMap(names []string) map[string]string {
 
 // buildReverseMapFromClaudeOriginalToShort builds original->short map, used to map tool_use names to short.
 func buildReverseMapFromClaudeOriginalToShort(original []byte) map[string]string {
-	tools := gjson.GetBytes(original, "tools")
-	m := map[string]string{}
-	if !tools.IsArray() {
-		return m
-	}
-	var names []string
-	arr := tools.Array()
-	for i := 0; i < len(arr); i++ {
-		n := arr[i].Get("name").String()
-		if n != "" {
-			names = append(names, n)
-		}
-	}
-	if len(names) > 0 {
-		m = buildShortNameMap(names)
-	}
-	return m
+	root := jsonutil.ParseObjectBytesOrEmpty(original)
+	return claudeCodexShortMap(root)
 }
 
 // normalizeToolParameters ensures object schemas contain at least an empty properties map.
 func normalizeToolParameters(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" || raw == "null" || !gjson.Valid(raw) {
-		return `{"type":"object","properties":{}}`
+	root, errParse := jsonutil.ParseAnyBytes([]byte(raw))
+	if errParse != nil {
+		return string(jsonutil.MarshalOrOriginal(nil, normalizeToolParametersValue(nil)))
 	}
-	schema := raw
-	result := gjson.Parse(raw)
-	schemaType := result.Get("type").String()
+	return string(jsonutil.MarshalOrOriginal(nil, normalizeToolParametersValue(root)))
+}
+
+func normalizeToolParametersValue(value any) map[string]any {
+	schema, ok := value.(map[string]any)
+	if !ok {
+		return map[string]any{
+			"type":       "object",
+			"properties": map[string]any{},
+		}
+	}
+
+	delete(schema, "$schema")
+	schemaType, _ := schema["type"].(string)
 	if schemaType == "" {
-		schema, _ = sjson.Set(schema, "type", "object")
 		schemaType = "object"
+		schema["type"] = schemaType
 	}
-	if schemaType == "object" && !result.Get("properties").Exists() {
-		schema, _ = sjson.SetRaw(schema, "properties", `{}`)
+	if strings.EqualFold(schemaType, "object") {
+		if _, ok := schema["properties"]; !ok {
+			schema["properties"] = map[string]any{}
+		}
 	}
 	return schema
 }

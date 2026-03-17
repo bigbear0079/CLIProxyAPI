@@ -1,321 +1,398 @@
-// Package gemini provides request translation functionality for Gemini to OpenAI API.
-// It handles parsing and transforming Gemini API requests into OpenAI Chat Completions API format,
-// extracting model information, generation config, message contents, and tool declarations.
-// The package performs JSON data transformation to ensure compatibility
-// between Gemini API format and OpenAI API's expected format.
+// Package gemini provides request translation functionality for Gemini to
+// OpenAI API using standard JSON trees.
 package gemini
 
 import (
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
-// ConvertGeminiRequestToOpenAI parses and transforms a Gemini API request into OpenAI Chat Completions API format.
-// It extracts the model name, generation config, message contents, and tool declarations
-// from the raw JSON request and returns them in the format expected by the OpenAI API.
+// ConvertGeminiRequestToOpenAI parses and transforms a Gemini API request into
+// OpenAI Chat Completions API format.
 func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream bool) []byte {
-	rawJSON := inputRawJSON
-	// Base OpenAI Chat Completions API template
-	out := `{"model":"","messages":[]}`
+	root := jsonutil.ParseObjectBytesOrEmpty(inputRawJSON)
 
-	root := gjson.ParseBytes(rawJSON)
-
-	// Helper for generating tool call IDs in the form: call_<alphanum>
-	genToolCallID := func() string {
-		const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-		var b strings.Builder
-		// 24 chars random suffix
-		for i := 0; i < 24; i++ {
-			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
-			b.WriteByte(letters[n.Int64()])
-		}
-		return "call_" + b.String()
+	outRoot := map[string]any{
+		"model":    modelName,
+		"messages": []any{},
+		"stream":   stream,
 	}
 
-	// Model mapping
-	out, _ = sjson.Set(out, "model", modelName)
-
-	// Generation config mapping
-	if genConfig := root.Get("generationConfig"); genConfig.Exists() {
-		// Temperature
-		if temp := genConfig.Get("temperature"); temp.Exists() {
-			out, _ = sjson.Set(out, "temperature", temp.Float())
+	if generationConfig, ok := jsonutil.Object(root, "generationConfig"); ok {
+		if value, ok := jsonutil.Get(generationConfig, "temperature"); ok {
+			outRoot["temperature"] = value
 		}
-
-		// Max tokens
-		if maxTokens := genConfig.Get("maxOutputTokens"); maxTokens.Exists() {
-			out, _ = sjson.Set(out, "max_tokens", maxTokens.Int())
+		if value, ok := jsonutil.Get(generationConfig, "maxOutputTokens"); ok {
+			outRoot["max_tokens"] = value
 		}
-
-		// Top P
-		if topP := genConfig.Get("topP"); topP.Exists() {
-			out, _ = sjson.Set(out, "top_p", topP.Float())
+		if value, ok := jsonutil.Get(generationConfig, "topP"); ok {
+			outRoot["top_p"] = value
 		}
-
-		// Top K (OpenAI doesn't have direct equivalent, but we can map it)
-		if topK := genConfig.Get("topK"); topK.Exists() {
-			// Store as custom parameter for potential use
-			out, _ = sjson.Set(out, "top_k", topK.Int())
+		if value, ok := jsonutil.Get(generationConfig, "topK"); ok {
+			outRoot["top_k"] = value
 		}
-
-		// Stop sequences
-		if stopSequences := genConfig.Get("stopSequences"); stopSequences.Exists() && stopSequences.IsArray() {
-			var stops []string
-			stopSequences.ForEach(func(_, value gjson.Result) bool {
-				stops = append(stops, value.String())
-				return true
-			})
+		if stopSequences, ok := jsonutil.Array(generationConfig, "stopSequences"); ok {
+			stops := make([]string, 0, len(stopSequences))
+			for _, stopValue := range stopSequences {
+				if stop, ok := stopValue.(string); ok {
+					stops = append(stops, stop)
+				}
+			}
 			if len(stops) > 0 {
-				out, _ = sjson.Set(out, "stop", stops)
+				outRoot["stop"] = stops
 			}
 		}
-
-		// Candidate count (OpenAI 'n' parameter)
-		if candidateCount := genConfig.Get("candidateCount"); candidateCount.Exists() {
-			out, _ = sjson.Set(out, "n", candidateCount.Int())
+		if value, ok := jsonutil.Get(generationConfig, "candidateCount"); ok {
+			outRoot["n"] = value
 		}
 
-		// Map Gemini thinkingConfig to OpenAI reasoning_effort.
-		// Always perform conversion to support allowCompat models that may not be in registry.
-		// Note: Google official Python SDK sends snake_case fields (thinking_level/thinking_budget).
-		if thinkingConfig := genConfig.Get("thinkingConfig"); thinkingConfig.Exists() && thinkingConfig.IsObject() {
-			thinkingLevel := thinkingConfig.Get("thinkingLevel")
-			if !thinkingLevel.Exists() {
-				thinkingLevel = thinkingConfig.Get("thinking_level")
-			}
-			if thinkingLevel.Exists() {
-				effort := strings.ToLower(strings.TrimSpace(thinkingLevel.String()))
-				if effort != "" {
-					out, _ = sjson.Set(out, "reasoning_effort", effort)
-				}
-			} else {
-				thinkingBudget := thinkingConfig.Get("thinkingBudget")
-				if !thinkingBudget.Exists() {
-					thinkingBudget = thinkingConfig.Get("thinking_budget")
-				}
-				if thinkingBudget.Exists() {
-					if effort, ok := thinking.ConvertBudgetToLevel(int(thinkingBudget.Int())); ok {
-						out, _ = sjson.Set(out, "reasoning_effort", effort)
-					}
-				}
-			}
+		if thinkingConfig, ok := jsonutil.Object(generationConfig, "thinkingConfig"); ok {
+			geminiThinkingToOpenAIReasoning(outRoot, thinkingConfig)
+		} else if thinkingConfig, ok := jsonutil.Object(generationConfig, "thinking_config"); ok {
+			geminiThinkingToOpenAIReasoning(outRoot, thinkingConfig)
 		}
 	}
 
-	// Stream parameter
-	out, _ = sjson.Set(out, "stream", stream)
-
-	// Process contents (Gemini messages) -> OpenAI messages
-	var toolCallIDs []string // Track tool call IDs for matching with tool results
-
-	// System instruction -> OpenAI system message
-	// Gemini may provide `systemInstruction` or `system_instruction`; support both keys.
-	systemInstruction := root.Get("systemInstruction")
-	if !systemInstruction.Exists() {
-		systemInstruction = root.Get("system_instruction")
-	}
-	if systemInstruction.Exists() {
-		parts := systemInstruction.Get("parts")
-		msg := `{"role":"system","content":[]}`
-		hasContent := false
-
-		if parts.Exists() && parts.IsArray() {
-			parts.ForEach(func(_, part gjson.Result) bool {
-				// Handle text parts
-				if text := part.Get("text"); text.Exists() {
-					contentPart := `{"type":"text","text":""}`
-					contentPart, _ = sjson.Set(contentPart, "text", text.String())
-					msg, _ = sjson.SetRaw(msg, "content.-1", contentPart)
-					hasContent = true
-				}
-
-				// Handle inline data (e.g., images)
-				if inlineData := part.Get("inlineData"); inlineData.Exists() {
-					mimeType := inlineData.Get("mimeType").String()
-					if mimeType == "" {
-						mimeType = "application/octet-stream"
-					}
-					data := inlineData.Get("data").String()
-					imageURL := fmt.Sprintf("data:%s;base64,%s", mimeType, data)
-
-					contentPart := `{"type":"image_url","image_url":{"url":""}}`
-					contentPart, _ = sjson.Set(contentPart, "image_url.url", imageURL)
-					msg, _ = sjson.SetRaw(msg, "content.-1", contentPart)
-					hasContent = true
-				}
-				return true
-			})
+	messages := make([]any, 0)
+	if systemInstruction, ok := jsonutil.Object(root, "systemInstruction"); ok {
+		if systemMessage, ok := geminiSystemInstructionToOpenAIMessage(systemInstruction); ok {
+			messages = append(messages, systemMessage)
 		}
-
-		if hasContent {
-			out, _ = sjson.SetRaw(out, "messages.-1", msg)
+	} else if systemInstruction, ok := jsonutil.Object(root, "system_instruction"); ok {
+		if systemMessage, ok := geminiSystemInstructionToOpenAIMessage(systemInstruction); ok {
+			messages = append(messages, systemMessage)
 		}
 	}
 
-	if contents := root.Get("contents"); contents.Exists() && contents.IsArray() {
-		contents.ForEach(func(_, content gjson.Result) bool {
-			role := content.Get("role").String()
-			parts := content.Get("parts")
+	pendingToolIDs := make([]string, 0)
+	if contents, ok := jsonutil.Array(root, "contents"); ok {
+		for _, contentValue := range contents {
+			content, ok := contentValue.(map[string]any)
+			if !ok {
+				continue
+			}
 
-			// Convert role: model -> assistant
+			role, _ := jsonutil.String(content, "role")
 			if role == "model" {
 				role = "assistant"
 			}
 
-			msg := `{"role":"","content":""}`
-			msg, _ = sjson.Set(msg, "role", role)
-
+			contentParts := make([]any, 0)
+			toolCalls := make([]any, 0)
+			toolMessages := make([]any, 0)
 			var textBuilder strings.Builder
-			contentWrapper := `{"arr":[]}`
-			contentPartsCount := 0
 			onlyTextContent := true
-			toolCallsWrapper := `{"arr":[]}`
-			toolCallsCount := 0
 
-			if parts.Exists() && parts.IsArray() {
-				parts.ForEach(func(_, part gjson.Result) bool {
-					// Handle text parts
-					if text := part.Get("text"); text.Exists() {
-						formattedText := text.String()
-						textBuilder.WriteString(formattedText)
-						contentPart := `{"type":"text","text":""}`
-						contentPart, _ = sjson.Set(contentPart, "text", formattedText)
-						contentWrapper, _ = sjson.SetRaw(contentWrapper, "arr.-1", contentPart)
-						contentPartsCount++
+			if parts, ok := jsonutil.Array(content, "parts"); ok {
+				for _, partValue := range parts {
+					part, ok := partValue.(map[string]any)
+					if !ok {
+						continue
 					}
 
-					// Handle inline data (e.g., images)
-					if inlineData := part.Get("inlineData"); inlineData.Exists() {
+					if text, ok := jsonutil.String(part, "text"); ok {
+						textBuilder.WriteString(text)
+						contentParts = append(contentParts, map[string]any{
+							"type": "text",
+							"text": text,
+						})
+						continue
+					}
+
+					if imagePart, ok := geminiInlineDataToOpenAIImagePart(part); ok {
 						onlyTextContent = false
-
-						mimeType := inlineData.Get("mimeType").String()
-						if mimeType == "" {
-							mimeType = "application/octet-stream"
-						}
-						data := inlineData.Get("data").String()
-						imageURL := fmt.Sprintf("data:%s;base64,%s", mimeType, data)
-
-						contentPart := `{"type":"image_url","image_url":{"url":""}}`
-						contentPart, _ = sjson.Set(contentPart, "image_url.url", imageURL)
-						contentWrapper, _ = sjson.SetRaw(contentWrapper, "arr.-1", contentPart)
-						contentPartsCount++
+						contentParts = append(contentParts, imagePart)
+						continue
 					}
 
-					// Handle function calls (Gemini) -> tool calls (OpenAI)
-					if functionCall := part.Get("functionCall"); functionCall.Exists() {
-						toolCallID := genToolCallID()
-						toolCallIDs = append(toolCallIDs, toolCallID)
+					if functionCall, ok := jsonutil.Object(part, "functionCall"); ok {
+						toolCallID, _ := jsonutil.String(functionCall, "id")
+						if toolCallID == "" {
+							toolCallID = geminiOpenAIToolCallID()
+						}
+						pendingToolIDs = append(pendingToolIDs, toolCallID)
 
-						toolCall := `{"id":"","type":"function","function":{"name":"","arguments":""}}`
-						toolCall, _ = sjson.Set(toolCall, "id", toolCallID)
-						toolCall, _ = sjson.Set(toolCall, "function.name", functionCall.Get("name").String())
-
-						// Convert args to arguments JSON string
-						if args := functionCall.Get("args"); args.Exists() {
-							toolCall, _ = sjson.Set(toolCall, "function.arguments", args.Raw)
-						} else {
-							toolCall, _ = sjson.Set(toolCall, "function.arguments", "{}")
+						arguments := "{}"
+						if argsValue, ok := jsonutil.Get(functionCall, "args"); ok {
+							arguments = string(jsonutil.MarshalOrOriginal(nil, argsValue))
 						}
 
-						toolCallsWrapper, _ = sjson.SetRaw(toolCallsWrapper, "arr.-1", toolCall)
-						toolCallsCount++
+						toolCall := map[string]any{
+							"id":   toolCallID,
+							"type": "function",
+							"function": map[string]any{
+								"name":      geminiString(functionCall, "name"),
+								"arguments": arguments,
+							},
+						}
+						toolCalls = append(toolCalls, toolCall)
+						continue
 					}
 
-					// Handle function responses (Gemini) -> tool role messages (OpenAI)
-					if functionResponse := part.Get("functionResponse"); functionResponse.Exists() {
-						// Create tool message for function response
-						toolMsg := `{"role":"tool","tool_call_id":"","content":""}`
-
-						// Convert response.content to JSON string
-						if response := functionResponse.Get("response"); response.Exists() {
-							if contentField := response.Get("content"); contentField.Exists() {
-								toolMsg, _ = sjson.Set(toolMsg, "content", contentField.Raw)
-							} else {
-								toolMsg, _ = sjson.Set(toolMsg, "content", response.Raw)
-							}
+					if functionResponse, ok := jsonutil.Object(part, "functionResponse"); ok {
+						toolCallID := geminiFunctionResponseToolCallID(functionResponse, pendingToolIDs)
+						if len(pendingToolIDs) > 0 {
+							pendingToolIDs = pendingToolIDs[:len(pendingToolIDs)-1]
 						}
 
-						// Try to match with previous tool call ID
-						_ = functionResponse.Get("name").String() // functionName not used for now
-						if len(toolCallIDs) > 0 {
-							// Use the last tool call ID (simple matching by function name)
-							// In a real implementation, you might want more sophisticated matching
-							toolMsg, _ = sjson.Set(toolMsg, "tool_call_id", toolCallIDs[len(toolCallIDs)-1])
-						} else {
-							// Generate a tool call ID if none available
-							toolMsg, _ = sjson.Set(toolMsg, "tool_call_id", genToolCallID())
-						}
-
-						out, _ = sjson.SetRaw(out, "messages.-1", toolMsg)
+						toolMessages = append(toolMessages, map[string]any{
+							"role":         "tool",
+							"tool_call_id": toolCallID,
+							"content":      geminiFunctionResponseContent(functionResponse),
+						})
+						continue
 					}
-
-					return true
-				})
-			}
-
-			// Set content
-			if contentPartsCount > 0 {
-				if onlyTextContent {
-					msg, _ = sjson.Set(msg, "content", textBuilder.String())
-				} else {
-					msg, _ = sjson.SetRaw(msg, "content", gjson.Get(contentWrapper, "arr").Raw)
 				}
 			}
 
-			// Set tool calls if any
-			if toolCallsCount > 0 {
-				msg, _ = sjson.SetRaw(msg, "tool_calls", gjson.Get(toolCallsWrapper, "arr").Raw)
+			message := map[string]any{
+				"role": role,
+			}
+			hasMessageContent := false
+			if len(contentParts) > 0 {
+				hasMessageContent = true
+				if onlyTextContent && len(toolCalls) == 0 {
+					message["content"] = textBuilder.String()
+				} else {
+					message["content"] = contentParts
+				}
+			}
+			if len(toolCalls) > 0 {
+				hasMessageContent = true
+				message["tool_calls"] = toolCalls
 			}
 
-			out, _ = sjson.SetRaw(out, "messages.-1", msg)
-			return true
-		})
-	}
-
-	// Tools mapping: Gemini tools -> OpenAI tools
-	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
-		tools.ForEach(func(_, tool gjson.Result) bool {
-			if functionDeclarations := tool.Get("functionDeclarations"); functionDeclarations.Exists() && functionDeclarations.IsArray() {
-				functionDeclarations.ForEach(func(_, funcDecl gjson.Result) bool {
-					openAITool := `{"type":"function","function":{"name":"","description":""}}`
-					openAITool, _ = sjson.Set(openAITool, "function.name", funcDecl.Get("name").String())
-					openAITool, _ = sjson.Set(openAITool, "function.description", funcDecl.Get("description").String())
-
-					// Convert parameters schema
-					if parameters := funcDecl.Get("parameters"); parameters.Exists() {
-						openAITool, _ = sjson.SetRaw(openAITool, "function.parameters", parameters.Raw)
-					} else if parameters := funcDecl.Get("parametersJsonSchema"); parameters.Exists() {
-						openAITool, _ = sjson.SetRaw(openAITool, "function.parameters", parameters.Raw)
-					}
-
-					out, _ = sjson.SetRaw(out, "tools.-1", openAITool)
-					return true
-				})
+			if hasMessageContent {
+				messages = append(messages, message)
 			}
-			return true
-		})
-	}
-
-	// Tool choice mapping (Gemini doesn't have direct equivalent, but we can handle it)
-	if toolConfig := root.Get("toolConfig"); toolConfig.Exists() {
-		if functionCallingConfig := toolConfig.Get("functionCallingConfig"); functionCallingConfig.Exists() {
-			mode := functionCallingConfig.Get("mode").String()
-			switch mode {
-			case "NONE":
-				out, _ = sjson.Set(out, "tool_choice", "none")
-			case "AUTO":
-				out, _ = sjson.Set(out, "tool_choice", "auto")
-			case "ANY":
-				out, _ = sjson.Set(out, "tool_choice", "required")
-			}
+			messages = append(messages, toolMessages...)
 		}
 	}
 
-	return []byte(out)
+	outRoot["messages"] = messages
+
+	if tools, ok := jsonutil.Array(root, "tools"); ok {
+		openAITools := make([]any, 0)
+		for _, toolValue := range tools {
+			tool, ok := toolValue.(map[string]any)
+			if !ok {
+				continue
+			}
+			functionDeclarations, ok := jsonutil.Array(tool, "functionDeclarations")
+			if !ok {
+				continue
+			}
+			for _, declarationValue := range functionDeclarations {
+				declaration, ok := declarationValue.(map[string]any)
+				if !ok {
+					continue
+				}
+				function := map[string]any{}
+				if name, ok := jsonutil.String(declaration, "name"); ok {
+					function["name"] = name
+				}
+				if description, ok := jsonutil.String(declaration, "description"); ok {
+					function["description"] = description
+				}
+				if parameters, ok := jsonutil.Get(declaration, "parameters"); ok {
+					function["parameters"] = parameters
+				} else if parameters, ok := jsonutil.Get(declaration, "parametersJsonSchema"); ok {
+					function["parameters"] = parameters
+				}
+
+				openAITools = append(openAITools, map[string]any{
+					"type":     "function",
+					"function": function,
+				})
+			}
+		}
+		if len(openAITools) > 0 {
+			outRoot["tools"] = openAITools
+		}
+	}
+
+	if toolConfig, ok := jsonutil.Object(root, "toolConfig"); ok {
+		applyGeminiToolChoice(outRoot, toolConfig)
+	} else if toolConfig, ok := jsonutil.Object(root, "tool_config"); ok {
+		applyGeminiToolChoice(outRoot, toolConfig)
+	}
+
+	return jsonutil.MarshalOrOriginal(inputRawJSON, outRoot)
+}
+
+func geminiThinkingToOpenAIReasoning(outRoot map[string]any, thinkingConfig map[string]any) {
+	if level, ok := jsonutil.String(thinkingConfig, "thinkingLevel"); ok {
+		level = strings.ToLower(strings.TrimSpace(level))
+		if level != "" {
+			outRoot["reasoning_effort"] = level
+			return
+		}
+	}
+	if level, ok := jsonutil.String(thinkingConfig, "thinking_level"); ok {
+		level = strings.ToLower(strings.TrimSpace(level))
+		if level != "" {
+			outRoot["reasoning_effort"] = level
+			return
+		}
+	}
+
+	if budget, ok := jsonutil.Int64(thinkingConfig, "thinkingBudget"); ok {
+		if effort, ok := thinking.ConvertBudgetToLevel(int(budget)); ok {
+			outRoot["reasoning_effort"] = effort
+		}
+		return
+	}
+	if budget, ok := jsonutil.Int64(thinkingConfig, "thinking_budget"); ok {
+		if effort, ok := thinking.ConvertBudgetToLevel(int(budget)); ok {
+			outRoot["reasoning_effort"] = effort
+		}
+	}
+}
+
+func geminiSystemInstructionToOpenAIMessage(systemInstruction map[string]any) (map[string]any, bool) {
+	parts, ok := jsonutil.Array(systemInstruction, "parts")
+	if !ok {
+		return nil, false
+	}
+
+	content := make([]any, 0)
+	for _, partValue := range parts {
+		part, ok := partValue.(map[string]any)
+		if !ok {
+			continue
+		}
+		if text, ok := jsonutil.String(part, "text"); ok {
+			content = append(content, map[string]any{
+				"type": "text",
+				"text": text,
+			})
+			continue
+		}
+		if imagePart, ok := geminiInlineDataToOpenAIImagePart(part); ok {
+			content = append(content, imagePart)
+		}
+	}
+	if len(content) == 0 {
+		return nil, false
+	}
+	return map[string]any{
+		"role":    "system",
+		"content": content,
+	}, true
+}
+
+func geminiInlineDataToOpenAIImagePart(part map[string]any) (map[string]any, bool) {
+	inlineData, ok := jsonutil.Object(part, "inlineData")
+	if !ok {
+		inlineData, ok = jsonutil.Object(part, "inline_data")
+		if !ok {
+			return nil, false
+		}
+	}
+
+	mimeType, _ := jsonutil.String(inlineData, "mimeType")
+	if mimeType == "" {
+		mimeType, _ = jsonutil.String(inlineData, "mime_type")
+	}
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	data, _ := jsonutil.String(inlineData, "data")
+	if data == "" {
+		return nil, false
+	}
+
+	return map[string]any{
+		"type": "image_url",
+		"image_url": map[string]any{
+			"url": fmt.Sprintf("data:%s;base64,%s", mimeType, data),
+		},
+	}, true
+}
+
+func geminiOpenAIToolCallID() string {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	var builder strings.Builder
+	for index := 0; index < 24; index++ {
+		number, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
+		builder.WriteByte(letters[number.Int64()])
+	}
+	return "call_" + builder.String()
+}
+
+func geminiString(root map[string]any, path string) string {
+	value, _ := jsonutil.String(root, path)
+	return value
+}
+
+func geminiFunctionResponseToolCallID(functionResponse map[string]any, pendingToolIDs []string) string {
+	if toolCallID, ok := jsonutil.String(functionResponse, "id"); ok && toolCallID != "" {
+		return toolCallID
+	}
+	if len(pendingToolIDs) > 0 {
+		return pendingToolIDs[len(pendingToolIDs)-1]
+	}
+	return geminiOpenAIToolCallID()
+}
+
+func geminiFunctionResponseContent(functionResponse map[string]any) string {
+	if contentValue, ok := jsonutil.Get(functionResponse, "response.content"); ok {
+		return geminiJSONString(contentValue)
+	}
+	if responseValue, ok := jsonutil.Get(functionResponse, "response"); ok {
+		return geminiJSONString(responseValue)
+	}
+	return ""
+}
+
+func geminiJSONString(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return typed
+	default:
+		bytes, errMarshal := json.Marshal(typed)
+		if errMarshal != nil {
+			return ""
+		}
+		return string(bytes)
+	}
+}
+
+func applyGeminiToolChoice(outRoot map[string]any, toolConfig map[string]any) {
+	functionCallingConfig, ok := jsonutil.Object(toolConfig, "functionCallingConfig")
+	if !ok {
+		functionCallingConfig, ok = jsonutil.Object(toolConfig, "function_calling_config")
+		if !ok {
+			return
+		}
+	}
+
+	mode, _ := jsonutil.String(functionCallingConfig, "mode")
+	switch mode {
+	case "NONE":
+		outRoot["tool_choice"] = "none"
+	case "AUTO":
+		outRoot["tool_choice"] = "auto"
+	case "ANY":
+		if allowed, ok := jsonutil.Array(functionCallingConfig, "allowedFunctionNames"); ok && len(allowed) == 1 {
+			if functionName, ok := allowed[0].(string); ok && functionName != "" {
+				outRoot["tool_choice"] = map[string]any{
+					"type": "function",
+					"function": map[string]any{
+						"name": functionName,
+					},
+				}
+				return
+			}
+		}
+		outRoot["tool_choice"] = "required"
+	}
 }

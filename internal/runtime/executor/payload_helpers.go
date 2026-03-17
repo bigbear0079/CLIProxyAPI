@@ -5,10 +5,9 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // applyPayloadConfigWithRoot behaves like applyPayloadConfig but treats all parameter
@@ -30,10 +29,17 @@ func applyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 		return payload
 	}
 	candidates := payloadModelCandidates(model, requestedModel)
-	out := payload
+	outRoot, errParse := jsonutil.ParseObjectBytes(payload)
+	if errParse != nil {
+		return payload
+	}
+	sourceRoot := outRoot
 	source := original
 	if len(source) == 0 {
 		source = payload
+	}
+	if parsedSource, errParseSource := jsonutil.ParseObjectBytes(source); errParseSource == nil {
+		sourceRoot = parsedSource
 	}
 	appliedDefaults := make(map[string]struct{})
 	// Apply default rules: first write wins per field across all matching rules.
@@ -47,17 +53,15 @@ func applyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 			if fullPath == "" {
 				continue
 			}
-			if gjson.GetBytes(source, fullPath).Exists() {
+			if jsonutil.Exists(sourceRoot, fullPath) {
 				continue
 			}
 			if _, ok := appliedDefaults[fullPath]; ok {
 				continue
 			}
-			updated, errSet := sjson.SetBytes(out, fullPath, value)
-			if errSet != nil {
+			if errSet := jsonutil.Set(outRoot, fullPath, value); errSet != nil {
 				continue
 			}
-			out = updated
 			appliedDefaults[fullPath] = struct{}{}
 		}
 	}
@@ -72,7 +76,7 @@ func applyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 			if fullPath == "" {
 				continue
 			}
-			if gjson.GetBytes(source, fullPath).Exists() {
+			if jsonutil.Exists(sourceRoot, fullPath) {
 				continue
 			}
 			if _, ok := appliedDefaults[fullPath]; ok {
@@ -82,11 +86,9 @@ func applyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 			if !ok {
 				continue
 			}
-			updated, errSet := sjson.SetRawBytes(out, fullPath, rawValue)
-			if errSet != nil {
+			if errSet := jsonutil.SetRawBytes(outRoot, fullPath, rawValue); errSet != nil {
 				continue
 			}
-			out = updated
 			appliedDefaults[fullPath] = struct{}{}
 		}
 	}
@@ -101,11 +103,9 @@ func applyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 			if fullPath == "" {
 				continue
 			}
-			updated, errSet := sjson.SetBytes(out, fullPath, value)
-			if errSet != nil {
+			if errSet := jsonutil.Set(outRoot, fullPath, value); errSet != nil {
 				continue
 			}
-			out = updated
 		}
 	}
 	// Apply override raw rules: last write wins per field across all matching rules.
@@ -123,11 +123,9 @@ func applyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 			if !ok {
 				continue
 			}
-			updated, errSet := sjson.SetRawBytes(out, fullPath, rawValue)
-			if errSet != nil {
+			if errSet := jsonutil.SetRawBytes(outRoot, fullPath, rawValue); errSet != nil {
 				continue
 			}
-			out = updated
 		}
 	}
 	// Apply filter rules: remove matching paths from payload.
@@ -141,14 +139,12 @@ func applyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 			if fullPath == "" {
 				continue
 			}
-			updated, errDel := sjson.DeleteBytes(out, fullPath)
-			if errDel != nil {
+			if errDel := jsonutil.Delete(outRoot, fullPath); errDel != nil {
 				continue
 			}
-			out = updated
 		}
 	}
-	return out
+	return jsonutil.MarshalOrOriginal(payload, outRoot)
 }
 
 func payloadModelRulesMatch(rules []config.PayloadModelRule, protocol string, models []string) bool {

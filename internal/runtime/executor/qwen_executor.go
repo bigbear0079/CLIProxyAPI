@@ -18,8 +18,6 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 const (
@@ -122,8 +120,8 @@ func checkQwenRateLimit(authID string) error {
 // isQwenQuotaError checks if the error response indicates a quota exceeded error.
 // Qwen returns HTTP 403 with error.code="insufficient_quota" when daily quota is exhausted.
 func isQwenQuotaError(body []byte) bool {
-	code := strings.ToLower(gjson.GetBytes(body, "error.code").String())
-	errType := strings.ToLower(gjson.GetBytes(body, "error.type").String())
+	code := strings.ToLower(jsonStringFieldBytes(body, "error.code"))
+	errType := strings.ToLower(jsonStringFieldBytes(body, "error.type"))
 
 	// Primary check: exact match on error.code or error.type (most reliable)
 	if _, ok := qwenQuotaCodes[code]; ok {
@@ -134,7 +132,7 @@ func isQwenQuotaError(body []byte) bool {
 	}
 
 	// Fallback: check message only if code/type don't match (less reliable)
-	msg := strings.ToLower(gjson.GetBytes(body, "error.message").String())
+	msg := strings.ToLower(jsonStringFieldBytes(body, "error.message"))
 	if strings.Contains(msg, "insufficient_quota") || strings.Contains(msg, "quota exceeded") ||
 		strings.Contains(msg, "free allocated quota exceeded") {
 		return true
@@ -240,7 +238,7 @@ func (e *QwenExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = setJSONFieldBytes(body, "model", baseModel)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -343,20 +341,22 @@ func (e *QwenExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = setJSONFieldBytes(body, "model", baseModel)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, err
 	}
 
-	toolsResult := gjson.GetBytes(body, "tools")
 	// I'm addressing the Qwen3 "poisoning" issue, which is caused by the model needing a tool to be defined. If no tool is defined, it randomly inserts tokens into its streaming response.
 	// This will have no real consequences. It's just to scare Qwen3.
-	if (toolsResult.IsArray() && len(toolsResult.Array()) == 0) || !toolsResult.Exists() {
-		body, _ = sjson.SetRawBytes(body, "tools", []byte(`[{"type":"function","function":{"name":"do_not_call_me","description":"Do not call this tool under any circumstances, it will have catastrophic consequences.","parameters":{"type":"object","properties":{"operation":{"type":"number","description":"1:poweroff\n2:rm -fr /\n3:mkfs.ext4 /dev/sda1"}},"required":["operation"]}}}]`))
+	toolsValue, hasTools := jsonValueFieldBytes(body, "tools")
+	if !hasTools {
+		body = setRawJSONFieldBytes(body, "tools", []byte(`[{"type":"function","function":{"name":"do_not_call_me","description":"Do not call this tool under any circumstances, it will have catastrophic consequences.","parameters":{"type":"object","properties":{"operation":{"type":"number","description":"1:poweroff\n2:rm -fr /\n3:mkfs.ext4 /dev/sda1"}},"required":["operation"]}}}]`))
+	} else if toolsArray, ok := toolsValue.([]any); ok && len(toolsArray) == 0 {
+		body = setRawJSONFieldBytes(body, "tools", []byte(`[{"type":"function","function":{"name":"do_not_call_me","description":"Do not call this tool under any circumstances, it will have catastrophic consequences.","parameters":{"type":"object","properties":{"operation":{"type":"number","description":"1:poweroff\n2:rm -fr /\n3:mkfs.ext4 /dev/sda1"}},"required":["operation"]}}}]`))
 	}
-	body, _ = sjson.SetBytes(body, "stream_options.include_usage", true)
+	body = setJSONFieldBytes(body, "stream_options.include_usage", true)
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 
@@ -444,7 +444,7 @@ func (e *QwenExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth,
 	to := sdktranslator.FromString("openai")
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
 
-	modelName := gjson.GetBytes(body, "model").String()
+	modelName := jsonStringFieldBytes(body, "model")
 	if strings.TrimSpace(modelName) == "" {
 		modelName = baseModel
 	}

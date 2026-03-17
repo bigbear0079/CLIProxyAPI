@@ -6,8 +6,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 )
 
 // zeroWidthSpace is the Unicode zero-width space character used for obfuscation.
@@ -87,90 +86,102 @@ func obfuscateSensitiveWords(payload []byte, matcher *SensitiveWordMatcher) []by
 	if matcher == nil || matcher.regex == nil {
 		return payload
 	}
+	root, errParse := jsonutil.ParseObjectBytes(payload)
+	if errParse != nil {
+		return payload
+	}
 
-	// Obfuscate in system blocks
-	payload = obfuscateSystemBlocks(payload, matcher)
-
-	// Obfuscate in messages
-	payload = obfuscateMessages(payload, matcher)
-
-	return payload
+	modifiedSystem := obfuscateSystemBlocks(root, matcher)
+	modifiedMessages := obfuscateMessages(root, matcher)
+	if !modifiedSystem && !modifiedMessages {
+		return payload
+	}
+	return jsonutil.MarshalOrOriginal(payload, root)
 }
 
 // obfuscateSystemBlocks obfuscates sensitive words in system blocks.
-func obfuscateSystemBlocks(payload []byte, matcher *SensitiveWordMatcher) []byte {
-	system := gjson.GetBytes(payload, "system")
-	if !system.Exists() {
-		return payload
+func obfuscateSystemBlocks(root map[string]any, matcher *SensitiveWordMatcher) bool {
+	systemValue, ok := root["system"]
+	if !ok {
+		return false
 	}
 
-	if system.IsArray() {
+	if systemArray, ok := systemValue.([]any); ok {
 		modified := false
-		system.ForEach(func(key, value gjson.Result) bool {
-			if value.Get("type").String() == "text" {
-				text := value.Get("text").String()
+		for _, value := range systemArray {
+			block, ok := value.(map[string]any)
+			if !ok {
+				continue
+			}
+			if blockType, _ := block["type"].(string); blockType == "text" {
+				text, _ := block["text"].(string)
 				obfuscated := matcher.obfuscateText(text)
 				if obfuscated != text {
-					path := "system." + key.String() + ".text"
-					payload, _ = sjson.SetBytes(payload, path, obfuscated)
+					block["text"] = obfuscated
 					modified = true
 				}
 			}
-			return true
-		})
-		if modified {
-			return payload
 		}
-	} else if system.Type == gjson.String {
-		text := system.String()
+		return modified
+	}
+	if text, ok := systemValue.(string); ok {
 		obfuscated := matcher.obfuscateText(text)
 		if obfuscated != text {
-			payload, _ = sjson.SetBytes(payload, "system", obfuscated)
+			root["system"] = obfuscated
+			return true
 		}
 	}
 
-	return payload
+	return false
 }
 
 // obfuscateMessages obfuscates sensitive words in message content.
-func obfuscateMessages(payload []byte, matcher *SensitiveWordMatcher) []byte {
-	messages := gjson.GetBytes(payload, "messages")
-	if !messages.Exists() || !messages.IsArray() {
-		return payload
+func obfuscateMessages(root map[string]any, matcher *SensitiveWordMatcher) bool {
+	messagesValue, ok := root["messages"]
+	if !ok {
+		return false
+	}
+	messages, ok := messagesValue.([]any)
+	if !ok {
+		return false
 	}
 
-	messages.ForEach(func(msgKey, msg gjson.Result) bool {
-		content := msg.Get("content")
-		if !content.Exists() {
-			return true
+	modified := false
+	for _, msgValue := range messages {
+		msg, ok := msgValue.(map[string]any)
+		if !ok {
+			continue
 		}
 
-		msgPath := "messages." + msgKey.String()
-
-		if content.Type == gjson.String {
+		content, ok := msg["content"]
+		if !ok {
+			continue
+		}
+		if text, ok := content.(string); ok {
 			// Simple string content
-			text := content.String()
 			obfuscated := matcher.obfuscateText(text)
 			if obfuscated != text {
-				payload, _ = sjson.SetBytes(payload, msgPath+".content", obfuscated)
+				msg["content"] = obfuscated
+				modified = true
 			}
-		} else if content.IsArray() {
+		} else if contentArray, ok := content.([]any); ok {
 			// Array of content blocks
-			content.ForEach(func(blockKey, block gjson.Result) bool {
-				if block.Get("type").String() == "text" {
-					text := block.Get("text").String()
+			for _, blockValue := range contentArray {
+				block, ok := blockValue.(map[string]any)
+				if !ok {
+					continue
+				}
+				if blockType, _ := block["type"].(string); blockType == "text" {
+					text, _ := block["text"].(string)
 					obfuscated := matcher.obfuscateText(text)
 					if obfuscated != text {
-						path := msgPath + ".content." + blockKey.String() + ".text"
-						payload, _ = sjson.SetBytes(payload, path, obfuscated)
+						block["text"] = obfuscated
+						modified = true
 					}
 				}
-				return true
-			})
+			}
 		}
+	}
 
-		return true
-	})
-
-	return payload
+	return modified
 }

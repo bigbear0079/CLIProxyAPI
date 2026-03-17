@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -19,8 +21,6 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 	"github.com/tiktoken-go/tokenizer"
 
 	"github.com/gin-gonic/gin"
@@ -108,14 +108,16 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body, _ = sjson.SetBytes(body, "stream", true)
-	body, _ = sjson.DeleteBytes(body, "previous_response_id")
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	if !gjson.GetBytes(body, "instructions").Exists() {
-		body, _ = sjson.SetBytes(body, "instructions", "")
-	}
+	body = mutateJSONObjectBytes(body, func(root map[string]any) {
+		_ = jsonutil.Set(root, "model", baseModel)
+		_ = jsonutil.Set(root, "stream", true)
+		_ = jsonutil.Delete(root, "previous_response_id")
+		_ = jsonutil.Delete(root, "prompt_cache_retention")
+		_ = jsonutil.Delete(root, "safety_identifier")
+		if !jsonutil.Exists(root, "instructions") {
+			_ = jsonutil.Set(root, "instructions", "")
+		}
+	})
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -173,7 +175,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 
 		line = bytes.TrimSpace(line[5:])
-		if gjson.GetBytes(line, "type").String() != "response.completed" {
+		if jsonStringFieldBytes(line, "type") != "response.completed" {
 			continue
 		}
 
@@ -218,8 +220,10 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body, _ = sjson.DeleteBytes(body, "stream")
+	body = mutateJSONObjectBytes(body, func(root map[string]any) {
+		_ = jsonutil.Set(root, "model", baseModel)
+		_ = jsonutil.Delete(root, "stream")
+	})
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -308,13 +312,15 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-	body, _ = sjson.DeleteBytes(body, "previous_response_id")
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	if !gjson.GetBytes(body, "instructions").Exists() {
-		body, _ = sjson.SetBytes(body, "instructions", "")
-	}
+	body = mutateJSONObjectBytes(body, func(root map[string]any) {
+		_ = jsonutil.Delete(root, "previous_response_id")
+		_ = jsonutil.Delete(root, "prompt_cache_retention")
+		_ = jsonutil.Delete(root, "safety_identifier")
+		_ = jsonutil.Set(root, "model", baseModel)
+		if !jsonutil.Exists(root, "instructions") {
+			_ = jsonutil.Set(root, "instructions", "")
+		}
+	})
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -378,7 +384,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
-				if gjson.GetBytes(data, "type").String() == "response.completed" {
+				if jsonStringFieldBytes(data, "type") == "response.completed" {
 					if detail, ok := parseCodexUsage(data); ok {
 						reporter.publish(ctx, detail)
 					}
@@ -411,14 +417,16 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 		return cliproxyexecutor.Response{}, err
 	}
 
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body, _ = sjson.DeleteBytes(body, "previous_response_id")
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	body, _ = sjson.SetBytes(body, "stream", false)
-	if !gjson.GetBytes(body, "instructions").Exists() {
-		body, _ = sjson.SetBytes(body, "instructions", "")
-	}
+	body = mutateJSONObjectBytes(body, func(root map[string]any) {
+		_ = jsonutil.Set(root, "model", baseModel)
+		_ = jsonutil.Delete(root, "previous_response_id")
+		_ = jsonutil.Delete(root, "prompt_cache_retention")
+		_ = jsonutil.Delete(root, "safety_identifier")
+		_ = jsonutil.Set(root, "stream", false)
+		if !jsonutil.Exists(root, "instructions") {
+			_ = jsonutil.Set(root, "instructions", "")
+		}
+	})
 
 	enc, err := tokenizerForCodexModel(baseModel)
 	if err != nil {
@@ -463,84 +471,81 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 		return 0, nil
 	}
 
-	root := gjson.ParseBytes(body)
+	root, errParse := jsonutil.ParseObjectBytes(body)
+	if errParse != nil {
+		return 0, nil
+	}
 	var segments []string
 
-	if inst := strings.TrimSpace(root.Get("instructions").String()); inst != "" {
+	if inst, ok := jsonutil.String(root, "instructions"); ok && strings.TrimSpace(inst) != "" {
 		segments = append(segments, inst)
 	}
 
-	inputItems := root.Get("input")
-	if inputItems.IsArray() {
-		arr := inputItems.Array()
-		for i := range arr {
-			item := arr[i]
-			switch item.Get("type").String() {
+	if inputItems, ok := jsonutil.Array(root, "input"); ok {
+		for i := range inputItems {
+			item, ok := inputItems[i].(map[string]any)
+			if !ok {
+				continue
+			}
+			switch jsonStringField(item, "type") {
 			case "message":
-				content := item.Get("content")
-				if content.IsArray() {
-					parts := content.Array()
-					for j := range parts {
-						part := parts[j]
-						if text := strings.TrimSpace(part.Get("text").String()); text != "" {
+				if content, ok := jsonutil.Array(item, "content"); ok {
+					for j := range content {
+						part, ok := content[j].(map[string]any)
+						if !ok {
+							continue
+						}
+						if text := strings.TrimSpace(jsonStringField(part, "text")); text != "" {
 							segments = append(segments, text)
 						}
 					}
 				}
 			case "function_call":
-				if name := strings.TrimSpace(item.Get("name").String()); name != "" {
+				if name := strings.TrimSpace(jsonStringField(item, "name")); name != "" {
 					segments = append(segments, name)
 				}
-				if args := strings.TrimSpace(item.Get("arguments").String()); args != "" {
+				if args := strings.TrimSpace(jsonStringField(item, "arguments")); args != "" {
 					segments = append(segments, args)
 				}
 			case "function_call_output":
-				if out := strings.TrimSpace(item.Get("output").String()); out != "" {
-					segments = append(segments, out)
+				if output := strings.TrimSpace(jsonStringField(item, "output")); output != "" {
+					segments = append(segments, output)
 				}
 			default:
-				if text := strings.TrimSpace(item.Get("text").String()); text != "" {
+				if text := strings.TrimSpace(jsonStringField(item, "text")); text != "" {
 					segments = append(segments, text)
 				}
 			}
 		}
 	}
 
-	tools := root.Get("tools")
-	if tools.IsArray() {
-		tarr := tools.Array()
-		for i := range tarr {
-			tool := tarr[i]
-			if name := strings.TrimSpace(tool.Get("name").String()); name != "" {
+	if tools, ok := jsonutil.Array(root, "tools"); ok {
+		for i := range tools {
+			tool, ok := tools[i].(map[string]any)
+			if !ok {
+				continue
+			}
+			if name := strings.TrimSpace(jsonStringField(tool, "name")); name != "" {
 				segments = append(segments, name)
 			}
-			if desc := strings.TrimSpace(tool.Get("description").String()); desc != "" {
+			if desc := strings.TrimSpace(jsonStringField(tool, "description")); desc != "" {
 				segments = append(segments, desc)
 			}
-			if params := tool.Get("parameters"); params.Exists() {
-				val := params.Raw
-				if params.Type == gjson.String {
-					val = params.String()
-				}
-				if trimmed := strings.TrimSpace(val); trimmed != "" {
-					segments = append(segments, trimmed)
+			if params, ok := tool["parameters"]; ok {
+				if segment := strings.TrimSpace(codexTokenSegment(params)); segment != "" {
+					segments = append(segments, segment)
 				}
 			}
 		}
 	}
 
-	textFormat := root.Get("text.format")
-	if textFormat.Exists() {
-		if name := strings.TrimSpace(textFormat.Get("name").String()); name != "" {
+	if textFormat, ok := jsonutil.Object(root, "text.format"); ok {
+		if name := strings.TrimSpace(jsonStringField(textFormat, "name")); name != "" {
 			segments = append(segments, name)
 		}
-		if schema := textFormat.Get("schema"); schema.Exists() {
-			val := schema.Raw
-			if schema.Type == gjson.String {
-				val = schema.String()
-			}
-			if trimmed := strings.TrimSpace(val); trimmed != "" {
-				segments = append(segments, trimmed)
+		if schema, ok := textFormat["schema"]; ok {
+			if segment := strings.TrimSpace(codexTokenSegment(schema)); segment != "" {
+				segments = append(segments, segment)
 			}
 		}
 	}
@@ -555,6 +560,21 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 		return 0, err
 	}
 	return int64(count), nil
+}
+
+func codexTokenSegment(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return typed
+	default:
+		encoded, errMarshal := json.Marshal(typed)
+		if errMarshal != nil {
+			return ""
+		}
+		return string(encoded)
+	}
 }
 
 func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
@@ -599,9 +619,8 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, req cliproxyexecutor.Request, rawJSON []byte) (*http.Request, error) {
 	var cache codexCache
 	if from == "claude" {
-		userIDResult := gjson.GetBytes(req.Payload, "metadata.user_id")
-		if userIDResult.Exists() {
-			key := fmt.Sprintf("%s-%s", req.Model, userIDResult.String())
+		if userID := jsonStringFieldBytes(req.Payload, "metadata.user_id"); userID != "" {
+			key := fmt.Sprintf("%s-%s", req.Model, userID)
 			var ok bool
 			if cache, ok = getCodexCache(key); !ok {
 				cache = codexCache{
@@ -612,9 +631,8 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 			}
 		}
 	} else if from == "openai-response" {
-		promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key")
-		if promptCacheKey.Exists() {
-			cache.ID = promptCacheKey.String()
+		if promptCacheKey := jsonStringFieldBytes(req.Payload, "prompt_cache_key"); promptCacheKey != "" {
+			cache.ID = promptCacheKey
 		}
 	} else if from == "openai" {
 		if apiKey := strings.TrimSpace(apiKeyFromContext(ctx)); apiKey != "" {
@@ -623,7 +641,9 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	}
 
 	if cache.ID != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
+		rawJSON = mutateJSONObjectBytes(rawJSON, func(root map[string]any) {
+			_ = jsonutil.Set(root, "prompt_cache_key", cache.ID)
+		})
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
 	if err != nil {
@@ -690,23 +710,27 @@ func parseCodexRetryAfter(statusCode int, errorBody []byte, now time.Time) *time
 	if statusCode != http.StatusTooManyRequests || len(errorBody) == 0 {
 		return nil
 	}
-	if strings.TrimSpace(gjson.GetBytes(errorBody, "error.type").String()) != "usage_limit_reached" {
+
+	root, errParse := jsonutil.ParseObjectBytes(errorBody)
+	if errParse != nil {
 		return nil
 	}
-	if resetsAt := gjson.GetBytes(errorBody, "error.resets_at").Int(); resetsAt > 0 {
+	if errorType, ok := jsonutil.String(root, "error.type"); !ok || strings.TrimSpace(errorType) != "usage_limit_reached" {
+		return nil
+	}
+	if resetsAt, ok := jsonutil.Int64(root, "error.resets_at"); ok && resetsAt > 0 {
 		resetAtTime := time.Unix(resetsAt, 0)
 		if resetAtTime.After(now) {
 			retryAfter := resetAtTime.Sub(now)
 			return &retryAfter
 		}
 	}
-	if resetsInSeconds := gjson.GetBytes(errorBody, "error.resets_in_seconds").Int(); resetsInSeconds > 0 {
+	if resetsInSeconds, ok := jsonutil.Int64(root, "error.resets_in_seconds"); ok && resetsInSeconds > 0 {
 		retryAfter := time.Duration(resetsInSeconds) * time.Second
 		return &retryAfter
 	}
 	return nil
 }
-
 func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 	if a == nil {
 		return "", ""

@@ -16,11 +16,10 @@ import (
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	responsesconverter "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/openai/openai/responses"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // OpenAIAPIHandler contains the handlers for OpenAI API endpoints.
@@ -108,36 +107,41 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 		return
 	}
 
-	// Check if the client requested a streaming response.
-	streamResult := gjson.GetBytes(rawJSON, "stream")
-	stream := streamResult.Type == gjson.True
+	stream := false
+	modelName := ""
+	root, errParse := jsonutil.ParseObjectBytes(rawJSON)
+	if errParse == nil {
+		stream = jsonBoolField(root, "stream")
+		modelName = jsonStringField(root, "model")
 
-	// Some clients send OpenAI Responses-format payloads to /v1/chat/completions.
-	// Convert them to Chat Completions so downstream translators preserve tool metadata.
-	if shouldTreatAsResponsesFormat(rawJSON) {
-		modelName := gjson.GetBytes(rawJSON, "model").String()
-		rawJSON = responsesconverter.ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName, rawJSON, stream)
-		stream = gjson.GetBytes(rawJSON, "stream").Bool()
+		// Some clients send OpenAI Responses-format payloads to /v1/chat/completions.
+		// Convert them to Chat Completions so downstream translators preserve tool metadata.
+		if shouldTreatAsResponsesFormat(root) {
+			rawJSON = responsesconverter.ConvertOpenAIResponsesRequestObjectToOpenAIChatCompletions(modelName, root, stream)
+		}
 	}
 
 	if stream {
-		h.handleStreamingResponse(c, rawJSON)
+		h.handleStreamingResponse(c, rawJSON, modelName)
 	} else {
-		h.handleNonStreamingResponse(c, rawJSON)
+		h.handleNonStreamingResponse(c, rawJSON, modelName)
 	}
 
 }
 
 // shouldTreatAsResponsesFormat detects OpenAI Responses-style payloads that are
 // accidentally sent to the Chat Completions endpoint.
-func shouldTreatAsResponsesFormat(rawJSON []byte) bool {
-	if gjson.GetBytes(rawJSON, "messages").Exists() {
+func shouldTreatAsResponsesFormat(root map[string]any) bool {
+	if root == nil {
 		return false
 	}
-	if gjson.GetBytes(rawJSON, "input").Exists() {
+	if jsonutil.Exists(root, "messages") {
+		return false
+	}
+	if jsonutil.Exists(root, "input") {
 		return true
 	}
-	if gjson.GetBytes(rawJSON, "instructions").Exists() {
+	if jsonutil.Exists(root, "instructions") {
 		return true
 	}
 	return false
@@ -163,12 +167,17 @@ func (h *OpenAIAPIHandler) Completions(c *gin.Context) {
 		return
 	}
 
-	// Check if the client requested a streaming response.
-	streamResult := gjson.GetBytes(rawJSON, "stream")
-	if streamResult.Type == gjson.True {
-		h.handleCompletionsStreamingResponse(c, rawJSON)
+	root, errParse := jsonutil.ParseObjectBytes(rawJSON)
+	stream := false
+	chatCompletionsJSON, modelName := convertCompletionsRequestToChatCompletions(root)
+	if errParse == nil {
+		stream = jsonBoolField(root, "stream")
+	}
+
+	if stream {
+		h.handleCompletionsStreamingResponse(c, chatCompletionsJSON, modelName)
 	} else {
-		h.handleCompletionsNonStreamingResponse(c, rawJSON)
+		h.handleCompletionsNonStreamingResponse(c, chatCompletionsJSON, modelName)
 	}
 
 }
@@ -181,68 +190,46 @@ func (h *OpenAIAPIHandler) Completions(c *gin.Context) {
 //
 // Returns:
 //   - []byte: The converted chat completions request
-func convertCompletionsRequestToChatCompletions(rawJSON []byte) []byte {
-	root := gjson.ParseBytes(rawJSON)
-
-	// Extract prompt from completions request
-	prompt := root.Get("prompt").String()
+func convertCompletionsRequestToChatCompletions(root map[string]any) ([]byte, string) {
+	// Extract prompt from completions request.
+	prompt := jsonStringField(root, "prompt")
 	if prompt == "" {
 		prompt = "Complete this:"
 	}
 
-	// Create chat completions structure
-	out := `{"model":"","messages":[{"role":"user","content":""}]}`
-
-	// Set model
-	if model := root.Get("model"); model.Exists() {
-		out, _ = sjson.Set(out, "model", model.String())
+	modelName := jsonStringField(root, "model")
+	out := map[string]any{
+		"model": modelName,
+		"messages": []any{
+			map[string]any{
+				"role":    "user",
+				"content": prompt,
+			},
+		},
 	}
 
-	// Set the prompt as user message content
-	out, _ = sjson.Set(out, "messages.0.content", prompt)
-
-	// Copy other parameters from completions to chat completions
-	if maxTokens := root.Get("max_tokens"); maxTokens.Exists() {
-		out, _ = sjson.Set(out, "max_tokens", maxTokens.Int())
+	for _, key := range []string{
+		"max_tokens",
+		"temperature",
+		"top_p",
+		"frequency_penalty",
+		"presence_penalty",
+		"stop",
+		"stream",
+		"logprobs",
+		"top_logprobs",
+		"echo",
+	} {
+		if value, ok := root[key]; ok {
+			out[key] = value
+		}
 	}
 
-	if temperature := root.Get("temperature"); temperature.Exists() {
-		out, _ = sjson.Set(out, "temperature", temperature.Float())
+	payload, errMarshal := json.Marshal(out)
+	if errMarshal != nil {
+		return []byte(`{"model":"","messages":[{"role":"user","content":"Complete this:"}]}`), modelName
 	}
-
-	if topP := root.Get("top_p"); topP.Exists() {
-		out, _ = sjson.Set(out, "top_p", topP.Float())
-	}
-
-	if frequencyPenalty := root.Get("frequency_penalty"); frequencyPenalty.Exists() {
-		out, _ = sjson.Set(out, "frequency_penalty", frequencyPenalty.Float())
-	}
-
-	if presencePenalty := root.Get("presence_penalty"); presencePenalty.Exists() {
-		out, _ = sjson.Set(out, "presence_penalty", presencePenalty.Float())
-	}
-
-	if stop := root.Get("stop"); stop.Exists() {
-		out, _ = sjson.SetRaw(out, "stop", stop.Raw)
-	}
-
-	if stream := root.Get("stream"); stream.Exists() {
-		out, _ = sjson.Set(out, "stream", stream.Bool())
-	}
-
-	if logprobs := root.Get("logprobs"); logprobs.Exists() {
-		out, _ = sjson.Set(out, "logprobs", logprobs.Bool())
-	}
-
-	if topLogprobs := root.Get("top_logprobs"); topLogprobs.Exists() {
-		out, _ = sjson.Set(out, "top_logprobs", topLogprobs.Int())
-	}
-
-	if echo := root.Get("echo"); echo.Exists() {
-		out, _ = sjson.Set(out, "echo", echo.Bool())
-	}
-
-	return []byte(out)
+	return payload, modelName
 }
 
 // convertChatCompletionsResponseToCompletions converts chat completions API response back to completions format.
@@ -254,69 +241,65 @@ func convertCompletionsRequestToChatCompletions(rawJSON []byte) []byte {
 // Returns:
 //   - []byte: The converted completions response
 func convertChatCompletionsResponseToCompletions(rawJSON []byte) []byte {
-	root := gjson.ParseBytes(rawJSON)
-
-	// Base completions response structure
-	out := `{"id":"","object":"text_completion","created":0,"model":"","choices":[]}`
-
-	// Copy basic fields
-	if id := root.Get("id"); id.Exists() {
-		out, _ = sjson.Set(out, "id", id.String())
+	root, errParse := jsonutil.ParseObjectBytes(rawJSON)
+	out := map[string]any{
+		"id":      "",
+		"object":  "text_completion",
+		"created": int64(0),
+		"model":   "",
+		"choices": make([]any, 0),
+	}
+	if errParse != nil {
+		return marshalOpenAICompletionsPayload(rawJSON, out)
 	}
 
-	if created := root.Get("created"); created.Exists() {
-		out, _ = sjson.Set(out, "created", created.Int())
+	if value, ok := root["id"]; ok {
+		out["id"] = value
+	}
+	if value, ok := root["created"]; ok {
+		out["created"] = value
+	}
+	if value, ok := root["model"]; ok {
+		out["model"] = value
+	}
+	if value, ok := root["usage"]; ok {
+		out["usage"] = value
 	}
 
-	if model := root.Get("model"); model.Exists() {
-		out, _ = sjson.Set(out, "model", model.String())
-	}
-
-	if usage := root.Get("usage"); usage.Exists() {
-		out, _ = sjson.SetRaw(out, "usage", usage.Raw)
-	}
-
-	// Convert choices from chat completions to completions format
-	var choices []interface{}
-	if chatChoices := root.Get("choices"); chatChoices.Exists() && chatChoices.IsArray() {
-		chatChoices.ForEach(func(_, choice gjson.Result) bool {
-			completionsChoice := map[string]interface{}{
-				"index": choice.Get("index").Int(),
+	choices := make([]any, 0)
+	if chatChoices, ok := root["choices"].([]any); ok {
+		for _, choiceValue := range chatChoices {
+			choice, ok := choiceValue.(map[string]any)
+			if !ok {
+				continue
 			}
 
-			// Extract text content from message.content
-			if message := choice.Get("message"); message.Exists() {
-				if content := message.Get("content"); content.Exists() {
-					completionsChoice["text"] = content.String()
+			completionsChoice := map[string]any{
+				"index": choice["index"],
+			}
+
+			if message, ok := choice["message"].(map[string]any); ok {
+				if content, ok := message["content"]; ok {
+					completionsChoice["text"] = jsonStringValue(content)
 				}
-			} else if delta := choice.Get("delta"); delta.Exists() {
-				// For streaming responses, use delta.content
-				if content := delta.Get("content"); content.Exists() {
-					completionsChoice["text"] = content.String()
+			} else if delta, ok := choice["delta"].(map[string]any); ok {
+				if content, ok := delta["content"]; ok {
+					completionsChoice["text"] = jsonStringValue(content)
 				}
 			}
 
-			// Copy finish_reason
-			if finishReason := choice.Get("finish_reason"); finishReason.Exists() {
-				completionsChoice["finish_reason"] = finishReason.String()
+			if finishReason, ok := choice["finish_reason"]; ok && finishReason != nil {
+				completionsChoice["finish_reason"] = jsonStringValue(finishReason)
 			}
-
-			// Copy logprobs if present
-			if logprobs := choice.Get("logprobs"); logprobs.Exists() {
-				completionsChoice["logprobs"] = logprobs.Value()
+			if logprobs, ok := choice["logprobs"]; ok {
+				completionsChoice["logprobs"] = logprobs
 			}
 
 			choices = append(choices, completionsChoice)
-			return true
-		})
+		}
 	}
-
-	if len(choices) > 0 {
-		choicesJSON, _ := json.Marshal(choices)
-		out, _ = sjson.SetRaw(out, "choices", string(choicesJSON))
-	}
-
-	return []byte(out)
+	out["choices"] = choices
+	return marshalOpenAICompletionsPayload(rawJSON, out)
 }
 
 // convertChatCompletionsStreamChunkToCompletions converts a streaming chat completions chunk to completions format.
@@ -328,95 +311,116 @@ func convertChatCompletionsResponseToCompletions(rawJSON []byte) []byte {
 // Returns:
 //   - []byte: The converted completions stream chunk, or nil if should be filtered out
 func convertChatCompletionsStreamChunkToCompletions(chunkData []byte) []byte {
-	root := gjson.ParseBytes(chunkData)
-
-	// Check if this chunk has any meaningful content
-	hasContent := false
-	hasUsage := root.Get("usage").Exists()
-	if chatChoices := root.Get("choices"); chatChoices.Exists() && chatChoices.IsArray() {
-		chatChoices.ForEach(func(_, choice gjson.Result) bool {
-			// Check if delta has content or finish_reason
-			if delta := choice.Get("delta"); delta.Exists() {
-				if content := delta.Get("content"); content.Exists() && content.String() != "" {
-					hasContent = true
-					return false // Break out of forEach
-				}
-			}
-			// Also check for finish_reason to ensure we don't skip final chunks
-			if finishReason := choice.Get("finish_reason"); finishReason.Exists() && finishReason.String() != "" && finishReason.String() != "null" {
-				hasContent = true
-				return false // Break out of forEach
-			}
-			return true
-		})
+	root, errParse := jsonutil.ParseObjectBytes(chunkData)
+	if errParse != nil {
+		return nil
 	}
 
-	// If no meaningful content and no usage, return nil to indicate this chunk should be skipped
+	chatChoices, _ := root["choices"].([]any)
+	hasUsage := jsonutil.Exists(root, "usage")
+	hasContent := false
+	for _, choiceValue := range chatChoices {
+		choice, ok := choiceValue.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if delta, ok := choice["delta"].(map[string]any); ok {
+			if content := jsonStringValue(delta["content"]); content != "" {
+				hasContent = true
+				break
+			}
+		}
+
+		finishReason := jsonStringValue(choice["finish_reason"])
+		if finishReason != "" && finishReason != "null" {
+			hasContent = true
+			break
+		}
+	}
 	if !hasContent && !hasUsage {
 		return nil
 	}
 
-	// Base completions stream response structure
-	out := `{"id":"","object":"text_completion","created":0,"model":"","choices":[]}`
-
-	// Copy basic fields
-	if id := root.Get("id"); id.Exists() {
-		out, _ = sjson.Set(out, "id", id.String())
+	out := map[string]any{
+		"id":      "",
+		"object":  "text_completion",
+		"created": int64(0),
+		"model":   "",
+		"choices": make([]any, 0),
+	}
+	if value, ok := root["id"]; ok {
+		out["id"] = value
+	}
+	if value, ok := root["created"]; ok {
+		out["created"] = value
+	}
+	if value, ok := root["model"]; ok {
+		out["model"] = value
 	}
 
-	if created := root.Get("created"); created.Exists() {
-		out, _ = sjson.Set(out, "created", created.Int())
+	choices := make([]any, 0, len(chatChoices))
+	for _, choiceValue := range chatChoices {
+		choice, ok := choiceValue.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		completionsChoice := map[string]any{
+			"index": choice["index"],
+			"text":  "",
+		}
+		if delta, ok := choice["delta"].(map[string]any); ok {
+			completionsChoice["text"] = jsonStringValue(delta["content"])
+		}
+
+		finishReason := jsonStringValue(choice["finish_reason"])
+		if finishReason != "" && finishReason != "null" {
+			completionsChoice["finish_reason"] = finishReason
+		}
+		if logprobs, ok := choice["logprobs"]; ok {
+			completionsChoice["logprobs"] = logprobs
+		}
+
+		choices = append(choices, completionsChoice)
+	}
+	out["choices"] = choices
+	if usage, ok := root["usage"]; ok {
+		out["usage"] = usage
 	}
 
-	if model := root.Get("model"); model.Exists() {
-		out, _ = sjson.Set(out, "model", model.String())
+	return marshalOpenAICompletionsPayload(chunkData, out)
+}
+
+func marshalOpenAICompletionsPayload(original []byte, payload map[string]any) []byte {
+	out, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return original
 	}
+	return out
+}
 
-	// Convert choices from chat completions delta to completions format
-	var choices []interface{}
-	if chatChoices := root.Get("choices"); chatChoices.Exists() && chatChoices.IsArray() {
-		chatChoices.ForEach(func(_, choice gjson.Result) bool {
-			completionsChoice := map[string]interface{}{
-				"index": choice.Get("index").Int(),
-			}
-
-			// Extract text content from delta.content
-			if delta := choice.Get("delta"); delta.Exists() {
-				if content := delta.Get("content"); content.Exists() && content.String() != "" {
-					completionsChoice["text"] = content.String()
-				} else {
-					completionsChoice["text"] = ""
-				}
-			} else {
-				completionsChoice["text"] = ""
-			}
-
-			// Copy finish_reason
-			if finishReason := choice.Get("finish_reason"); finishReason.Exists() && finishReason.String() != "null" {
-				completionsChoice["finish_reason"] = finishReason.String()
-			}
-
-			// Copy logprobs if present
-			if logprobs := choice.Get("logprobs"); logprobs.Exists() {
-				completionsChoice["logprobs"] = logprobs.Value()
-			}
-
-			choices = append(choices, completionsChoice)
-			return true
-		})
+func jsonStringValue(value any) string {
+	if value == nil {
+		return ""
 	}
-
-	if len(choices) > 0 {
-		choicesJSON, _ := json.Marshal(choices)
-		out, _ = sjson.SetRaw(out, "choices", string(choicesJSON))
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case json.Number:
+		return typed.String()
+	case bool:
+		if typed {
+			return "true"
+		}
+		return "false"
+	default:
+		out, errMarshal := json.Marshal(typed)
+		if errMarshal != nil {
+			return ""
+		}
+		return string(out)
 	}
-
-	// Copy usage if present
-	if usage := root.Get("usage"); usage.Exists() {
-		out, _ = sjson.SetRaw(out, "usage", usage.Raw)
-	}
-
-	return []byte(out)
 }
 
 // handleNonStreamingResponse handles non-streaming chat completion responses
@@ -426,10 +430,12 @@ func convertChatCompletionsStreamChunkToCompletions(chunkData []byte) []byte {
 // Parameters:
 //   - c: The Gin context containing the HTTP request and response
 //   - rawJSON: The raw JSON bytes of the OpenAI-compatible request
-func (h *OpenAIAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []byte) {
+func (h *OpenAIAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []byte, modelName string) {
 	c.Header("Content-Type", "application/json")
 
-	modelName := gjson.GetBytes(rawJSON, "model").String()
+	if modelName == "" {
+		modelName = jsonStringFieldBytes(rawJSON, "model")
+	}
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
 	if errMsg != nil {
@@ -449,7 +455,7 @@ func (h *OpenAIAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []
 // Parameters:
 //   - c: The Gin context containing the HTTP request and response
 //   - rawJSON: The raw JSON bytes of the OpenAI-compatible request
-func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byte) {
+func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byte, modelName string) {
 	// Get the http.Flusher interface to manually flush the response.
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
@@ -462,7 +468,9 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 		return
 	}
 
-	modelName := gjson.GetBytes(rawJSON, "model").String()
+	if modelName == "" {
+		modelName = jsonStringFieldBytes(rawJSON, "model")
+	}
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
 
@@ -525,13 +533,12 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 // Parameters:
 //   - c: The Gin context containing the HTTP request and response
 //   - rawJSON: The raw JSON bytes of the OpenAI-compatible completions request
-func (h *OpenAIAPIHandler) handleCompletionsNonStreamingResponse(c *gin.Context, rawJSON []byte) {
+func (h *OpenAIAPIHandler) handleCompletionsNonStreamingResponse(c *gin.Context, chatCompletionsJSON []byte, modelName string) {
 	c.Header("Content-Type", "application/json")
 
-	// Convert completions request to chat completions format
-	chatCompletionsJSON := convertCompletionsRequestToChatCompletions(rawJSON)
-
-	modelName := gjson.GetBytes(chatCompletionsJSON, "model").String()
+	if modelName == "" {
+		modelName = jsonStringFieldBytes(chatCompletionsJSON, "model")
+	}
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, chatCompletionsJSON, "")
@@ -554,7 +561,7 @@ func (h *OpenAIAPIHandler) handleCompletionsNonStreamingResponse(c *gin.Context,
 // Parameters:
 //   - c: The Gin context containing the HTTP request and response
 //   - rawJSON: The raw JSON bytes of the OpenAI-compatible completions request
-func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, rawJSON []byte) {
+func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, chatCompletionsJSON []byte, modelName string) {
 	// Get the http.Flusher interface to manually flush the response.
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
@@ -567,10 +574,9 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 		return
 	}
 
-	// Convert completions request to chat completions format
-	chatCompletionsJSON := convertCompletionsRequestToChatCompletions(rawJSON)
-
-	modelName := gjson.GetBytes(chatCompletionsJSON, "model").String()
+	if modelName == "" {
+		modelName = jsonStringFieldBytes(chatCompletionsJSON, "model")
+	}
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, chatCompletionsJSON, "")
 

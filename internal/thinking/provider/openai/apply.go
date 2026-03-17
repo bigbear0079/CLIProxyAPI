@@ -6,10 +6,9 @@
 package openai
 
 import (
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // Applier implements thinking.ProviderApplier for OpenAI models.
@@ -51,13 +50,13 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		return body, nil
 	}
 
-	if len(body) == 0 || !gjson.ValidBytes(body) {
-		body = []byte(`{}`)
-	}
+	root := jsonutil.ParseObjectBytesOrEmpty(body)
 
 	if config.Mode == thinking.ModeLevel {
-		result, _ := sjson.SetBytes(body, "reasoning_effort", string(config.Level))
-		return result, nil
+		if errSet := jsonutil.Set(root, "reasoning_effort", string(config.Level)); errSet != nil {
+			return body, nil
+		}
+		return jsonutil.MarshalOrOriginal(body, root), nil
 	}
 
 	effort := ""
@@ -77,14 +76,14 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		return body, nil
 	}
 
-	result, _ := sjson.SetBytes(body, "reasoning_effort", effort)
-	return result, nil
+	if errSet := jsonutil.Set(root, "reasoning_effort", effort); errSet != nil {
+		return body, nil
+	}
+	return jsonutil.MarshalOrOriginal(body, root), nil
 }
 
 func applyCompatibleOpenAI(body []byte, config thinking.ThinkingConfig) ([]byte, error) {
-	if len(body) == 0 || !gjson.ValidBytes(body) {
-		body = []byte(`{}`)
-	}
+	root := jsonutil.ParseObjectBytesOrEmpty(body)
 
 	var effort string
 	switch config.Mode {
@@ -112,6 +111,8 @@ func applyCompatibleOpenAI(body []byte, config thinking.ThinkingConfig) ([]byte,
 		return body, nil
 	}
 
-	result, _ := sjson.SetBytes(body, "reasoning_effort", effort)
-	return result, nil
+	if errSet := jsonutil.Set(root, "reasoning_effort", effort); errSet != nil {
+		return body, nil
+	}
+	return jsonutil.MarshalOrOriginal(body, root), nil
 }

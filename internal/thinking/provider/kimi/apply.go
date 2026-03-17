@@ -7,10 +7,9 @@ package kimi
 import (
 	"fmt"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // Applier implements thinking.ProviderApplier for Kimi models.
@@ -55,10 +54,6 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		return body, nil
 	}
 
-	if len(body) == 0 || !gjson.ValidBytes(body) {
-		body = []byte(`{}`)
-	}
-
 	var effort string
 	switch config.Mode {
 	case thinking.ModeLevel:
@@ -96,10 +91,6 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 
 // applyCompatibleKimi applies thinking config for user-defined Kimi models.
 func applyCompatibleKimi(body []byte, config thinking.ThinkingConfig) ([]byte, error) {
-	if len(body) == 0 || !gjson.ValidBytes(body) {
-		body = []byte(`{}`)
-	}
-
 	var effort string
 	switch config.Mode {
 	case thinking.ModeLevel:
@@ -131,29 +122,28 @@ func applyCompatibleKimi(body []byte, config thinking.ThinkingConfig) ([]byte, e
 }
 
 func applyReasoningEffort(body []byte, effort string) ([]byte, error) {
-	result, errDeleteThinking := sjson.DeleteBytes(body, "thinking")
-	if errDeleteThinking != nil {
+	root := jsonutil.ParseObjectBytesOrEmpty(body)
+
+	if errDeleteThinking := jsonutil.Delete(root, "thinking"); errDeleteThinking != nil {
 		return body, fmt.Errorf("kimi thinking: failed to clear thinking object: %w", errDeleteThinking)
 	}
-	result, errSetEffort := sjson.SetBytes(result, "reasoning_effort", effort)
-	if errSetEffort != nil {
+	if errSetEffort := jsonutil.Set(root, "reasoning_effort", effort); errSetEffort != nil {
 		return body, fmt.Errorf("kimi thinking: failed to set reasoning_effort: %w", errSetEffort)
 	}
-	return result, nil
+	return jsonutil.MarshalOrOriginal(body, root), nil
 }
 
 func applyDisabledThinking(body []byte) ([]byte, error) {
-	result, errDeleteThinking := sjson.DeleteBytes(body, "thinking")
-	if errDeleteThinking != nil {
+	root := jsonutil.ParseObjectBytesOrEmpty(body)
+
+	if errDeleteThinking := jsonutil.Delete(root, "thinking"); errDeleteThinking != nil {
 		return body, fmt.Errorf("kimi thinking: failed to clear thinking object: %w", errDeleteThinking)
 	}
-	result, errDeleteEffort := sjson.DeleteBytes(result, "reasoning_effort")
-	if errDeleteEffort != nil {
+	if errDeleteEffort := jsonutil.Delete(root, "reasoning_effort"); errDeleteEffort != nil {
 		return body, fmt.Errorf("kimi thinking: failed to clear reasoning_effort: %w", errDeleteEffort)
 	}
-	result, errSetType := sjson.SetBytes(result, "thinking.type", "disabled")
-	if errSetType != nil {
+	if errSetType := jsonutil.Set(root, "thinking.type", "disabled"); errSetType != nil {
 		return body, fmt.Errorf("kimi thinking: failed to set thinking.type: %w", errSetType)
 	}
-	return result, nil
+	return jsonutil.MarshalOrOriginal(body, root), nil
 }

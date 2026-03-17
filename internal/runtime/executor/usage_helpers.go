@@ -3,16 +3,16 @@ package executor
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 type usageReporter struct {
@@ -175,96 +175,147 @@ func resolveUsageSource(auth *cliproxyauth.Auth, ctxAPIKey string) string {
 	return ""
 }
 
+func jsonObjectAtPaths(root map[string]any, paths ...string) map[string]any {
+	for _, path := range paths {
+		value, ok := jsonutil.Get(root, path)
+		if !ok {
+			continue
+		}
+		object, ok := value.(map[string]any)
+		if ok {
+			return object
+		}
+	}
+	return nil
+}
+
+func jsonStringAtPaths(root map[string]any, paths ...string) string {
+	for _, path := range paths {
+		value, ok := jsonutil.Get(root, path)
+		if !ok || value == nil {
+			continue
+		}
+		switch typed := value.(type) {
+		case string:
+			return typed
+		case json.Number:
+			return typed.String()
+		case bool:
+			if typed {
+				return "true"
+			}
+			return "false"
+		default:
+			out, errMarshal := json.Marshal(typed)
+			if errMarshal == nil {
+				return string(out)
+			}
+		}
+	}
+	return ""
+}
+
+func jsonInt64AtPaths(root map[string]any, paths ...string) int64 {
+	for _, path := range paths {
+		value, ok := jsonutil.Get(root, path)
+		if !ok || value == nil {
+			continue
+		}
+		switch typed := value.(type) {
+		case json.Number:
+			intValue, errInt := typed.Int64()
+			if errInt == nil {
+				return intValue
+			}
+		case int64:
+			return typed
+		case int:
+			return int64(typed)
+		case float64:
+			return int64(typed)
+		}
+	}
+	return 0
+}
+
 func parseCodexUsage(data []byte) (usage.Detail, bool) {
-	usageNode := gjson.ParseBytes(data).Get("response.usage")
-	if !usageNode.Exists() {
+	root, errParse := jsonutil.ParseObjectBytes(data)
+	if errParse != nil {
+		return usage.Detail{}, false
+	}
+	usageNode := jsonObjectAtPaths(root, "response.usage")
+	if usageNode == nil {
 		return usage.Detail{}, false
 	}
 	detail := usage.Detail{
-		InputTokens:  usageNode.Get("input_tokens").Int(),
-		OutputTokens: usageNode.Get("output_tokens").Int(),
-		TotalTokens:  usageNode.Get("total_tokens").Int(),
+		InputTokens:  jsonInt64AtPaths(usageNode, "input_tokens"),
+		OutputTokens: jsonInt64AtPaths(usageNode, "output_tokens"),
+		TotalTokens:  jsonInt64AtPaths(usageNode, "total_tokens"),
 	}
-	if cached := usageNode.Get("input_tokens_details.cached_tokens"); cached.Exists() {
-		detail.CachedTokens = cached.Int()
-	}
-	if reasoning := usageNode.Get("output_tokens_details.reasoning_tokens"); reasoning.Exists() {
-		detail.ReasoningTokens = reasoning.Int()
-	}
+	detail.CachedTokens = jsonInt64AtPaths(usageNode, "input_tokens_details.cached_tokens")
+	detail.ReasoningTokens = jsonInt64AtPaths(usageNode, "output_tokens_details.reasoning_tokens")
 	return detail, true
 }
 
 func parseOpenAIUsage(data []byte) usage.Detail {
-	usageNode := gjson.ParseBytes(data).Get("usage")
-	if !usageNode.Exists() {
+	root, errParse := jsonutil.ParseObjectBytes(data)
+	if errParse != nil {
 		return usage.Detail{}
 	}
-	inputNode := usageNode.Get("prompt_tokens")
-	if !inputNode.Exists() {
-		inputNode = usageNode.Get("input_tokens")
-	}
-	outputNode := usageNode.Get("completion_tokens")
-	if !outputNode.Exists() {
-		outputNode = usageNode.Get("output_tokens")
+	usageNode := jsonObjectAtPaths(root, "usage")
+	if usageNode == nil {
+		return usage.Detail{}
 	}
 	detail := usage.Detail{
-		InputTokens:  inputNode.Int(),
-		OutputTokens: outputNode.Int(),
-		TotalTokens:  usageNode.Get("total_tokens").Int(),
+		InputTokens:  jsonInt64AtPaths(usageNode, "prompt_tokens", "input_tokens"),
+		OutputTokens: jsonInt64AtPaths(usageNode, "completion_tokens", "output_tokens"),
+		TotalTokens:  jsonInt64AtPaths(usageNode, "total_tokens"),
 	}
-	cached := usageNode.Get("prompt_tokens_details.cached_tokens")
-	if !cached.Exists() {
-		cached = usageNode.Get("input_tokens_details.cached_tokens")
-	}
-	if cached.Exists() {
-		detail.CachedTokens = cached.Int()
-	}
-	reasoning := usageNode.Get("completion_tokens_details.reasoning_tokens")
-	if !reasoning.Exists() {
-		reasoning = usageNode.Get("output_tokens_details.reasoning_tokens")
-	}
-	if reasoning.Exists() {
-		detail.ReasoningTokens = reasoning.Int()
-	}
+	detail.CachedTokens = jsonInt64AtPaths(usageNode, "prompt_tokens_details.cached_tokens", "input_tokens_details.cached_tokens")
+	detail.ReasoningTokens = jsonInt64AtPaths(usageNode, "completion_tokens_details.reasoning_tokens", "output_tokens_details.reasoning_tokens")
 	return detail
 }
 
 func parseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
 	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if len(payload) == 0 {
 		return usage.Detail{}, false
 	}
-	usageNode := gjson.GetBytes(payload, "usage")
-	if !usageNode.Exists() {
+	root, errParse := jsonutil.ParseObjectBytes(payload)
+	if errParse != nil {
+		return usage.Detail{}, false
+	}
+	usageNode := jsonObjectAtPaths(root, "usage")
+	if usageNode == nil {
 		return usage.Detail{}, false
 	}
 	detail := usage.Detail{
-		InputTokens:  usageNode.Get("prompt_tokens").Int(),
-		OutputTokens: usageNode.Get("completion_tokens").Int(),
-		TotalTokens:  usageNode.Get("total_tokens").Int(),
+		InputTokens:  jsonInt64AtPaths(usageNode, "prompt_tokens"),
+		OutputTokens: jsonInt64AtPaths(usageNode, "completion_tokens"),
+		TotalTokens:  jsonInt64AtPaths(usageNode, "total_tokens"),
 	}
-	if cached := usageNode.Get("prompt_tokens_details.cached_tokens"); cached.Exists() {
-		detail.CachedTokens = cached.Int()
-	}
-	if reasoning := usageNode.Get("completion_tokens_details.reasoning_tokens"); reasoning.Exists() {
-		detail.ReasoningTokens = reasoning.Int()
-	}
+	detail.CachedTokens = jsonInt64AtPaths(usageNode, "prompt_tokens_details.cached_tokens")
+	detail.ReasoningTokens = jsonInt64AtPaths(usageNode, "completion_tokens_details.reasoning_tokens")
 	return detail, true
 }
 
 func parseClaudeUsage(data []byte) usage.Detail {
-	usageNode := gjson.ParseBytes(data).Get("usage")
-	if !usageNode.Exists() {
+	root, errParse := jsonutil.ParseObjectBytes(data)
+	if errParse != nil {
+		return usage.Detail{}
+	}
+	usageNode := jsonObjectAtPaths(root, "usage")
+	if usageNode == nil {
 		return usage.Detail{}
 	}
 	detail := usage.Detail{
-		InputTokens:  usageNode.Get("input_tokens").Int(),
-		OutputTokens: usageNode.Get("output_tokens").Int(),
-		CachedTokens: usageNode.Get("cache_read_input_tokens").Int(),
+		InputTokens:  jsonInt64AtPaths(usageNode, "input_tokens"),
+		OutputTokens: jsonInt64AtPaths(usageNode, "output_tokens"),
+		CachedTokens: jsonInt64AtPaths(usageNode, "cache_read_input_tokens"),
 	}
 	if detail.CachedTokens == 0 {
 		// fall back to creation tokens when read tokens are absent
-		detail.CachedTokens = usageNode.Get("cache_creation_input_tokens").Int()
+		detail.CachedTokens = jsonInt64AtPaths(usageNode, "cache_creation_input_tokens")
 	}
 	detail.TotalTokens = detail.InputTokens + detail.OutputTokens
 	return detail
@@ -272,32 +323,36 @@ func parseClaudeUsage(data []byte) usage.Detail {
 
 func parseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if len(payload) == 0 {
 		return usage.Detail{}, false
 	}
-	usageNode := gjson.GetBytes(payload, "usage")
-	if !usageNode.Exists() {
+	root, errParse := jsonutil.ParseObjectBytes(payload)
+	if errParse != nil {
+		return usage.Detail{}, false
+	}
+	usageNode := jsonObjectAtPaths(root, "usage")
+	if usageNode == nil {
 		return usage.Detail{}, false
 	}
 	detail := usage.Detail{
-		InputTokens:  usageNode.Get("input_tokens").Int(),
-		OutputTokens: usageNode.Get("output_tokens").Int(),
-		CachedTokens: usageNode.Get("cache_read_input_tokens").Int(),
+		InputTokens:  jsonInt64AtPaths(usageNode, "input_tokens"),
+		OutputTokens: jsonInt64AtPaths(usageNode, "output_tokens"),
+		CachedTokens: jsonInt64AtPaths(usageNode, "cache_read_input_tokens"),
 	}
 	if detail.CachedTokens == 0 {
-		detail.CachedTokens = usageNode.Get("cache_creation_input_tokens").Int()
+		detail.CachedTokens = jsonInt64AtPaths(usageNode, "cache_creation_input_tokens")
 	}
 	detail.TotalTokens = detail.InputTokens + detail.OutputTokens
 	return detail, true
 }
 
-func parseGeminiFamilyUsageDetail(node gjson.Result) usage.Detail {
+func parseGeminiFamilyUsageDetail(node map[string]any) usage.Detail {
 	detail := usage.Detail{
-		InputTokens:     node.Get("promptTokenCount").Int(),
-		OutputTokens:    node.Get("candidatesTokenCount").Int(),
-		ReasoningTokens: node.Get("thoughtsTokenCount").Int(),
-		TotalTokens:     node.Get("totalTokenCount").Int(),
-		CachedTokens:    node.Get("cachedContentTokenCount").Int(),
+		InputTokens:     jsonInt64AtPaths(node, "promptTokenCount"),
+		OutputTokens:    jsonInt64AtPaths(node, "candidatesTokenCount"),
+		ReasoningTokens: jsonInt64AtPaths(node, "thoughtsTokenCount"),
+		TotalTokens:     jsonInt64AtPaths(node, "totalTokenCount"),
+		CachedTokens:    jsonInt64AtPaths(node, "cachedContentTokenCount"),
 	}
 	if detail.TotalTokens == 0 {
 		detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
@@ -306,24 +361,24 @@ func parseGeminiFamilyUsageDetail(node gjson.Result) usage.Detail {
 }
 
 func parseGeminiCLIUsage(data []byte) usage.Detail {
-	usageNode := gjson.ParseBytes(data)
-	node := usageNode.Get("response.usageMetadata")
-	if !node.Exists() {
-		node = usageNode.Get("response.usage_metadata")
+	root, errParse := jsonutil.ParseObjectBytes(data)
+	if errParse != nil {
+		return usage.Detail{}
 	}
-	if !node.Exists() {
+	node := jsonObjectAtPaths(root, "response.usageMetadata", "response.usage_metadata")
+	if node == nil {
 		return usage.Detail{}
 	}
 	return parseGeminiFamilyUsageDetail(node)
 }
 
 func parseGeminiUsage(data []byte) usage.Detail {
-	usageNode := gjson.ParseBytes(data)
-	node := usageNode.Get("usageMetadata")
-	if !node.Exists() {
-		node = usageNode.Get("usage_metadata")
+	root, errParse := jsonutil.ParseObjectBytes(data)
+	if errParse != nil {
+		return usage.Detail{}
 	}
-	if !node.Exists() {
+	node := jsonObjectAtPaths(root, "usageMetadata", "usage_metadata")
+	if node == nil {
 		return usage.Detail{}
 	}
 	return parseGeminiFamilyUsageDetail(node)
@@ -331,14 +386,15 @@ func parseGeminiUsage(data []byte) usage.Detail {
 
 func parseGeminiStreamUsage(line []byte) (usage.Detail, bool) {
 	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if len(payload) == 0 {
 		return usage.Detail{}, false
 	}
-	node := gjson.GetBytes(payload, "usageMetadata")
-	if !node.Exists() {
-		node = gjson.GetBytes(payload, "usage_metadata")
+	root, errParse := jsonutil.ParseObjectBytes(payload)
+	if errParse != nil {
+		return usage.Detail{}, false
 	}
-	if !node.Exists() {
+	node := jsonObjectAtPaths(root, "usageMetadata", "usage_metadata")
+	if node == nil {
 		return usage.Detail{}, false
 	}
 	return parseGeminiFamilyUsageDetail(node), true
@@ -346,29 +402,27 @@ func parseGeminiStreamUsage(line []byte) (usage.Detail, bool) {
 
 func parseGeminiCLIStreamUsage(line []byte) (usage.Detail, bool) {
 	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if len(payload) == 0 {
 		return usage.Detail{}, false
 	}
-	node := gjson.GetBytes(payload, "response.usageMetadata")
-	if !node.Exists() {
-		node = gjson.GetBytes(payload, "usage_metadata")
+	root, errParse := jsonutil.ParseObjectBytes(payload)
+	if errParse != nil {
+		return usage.Detail{}, false
 	}
-	if !node.Exists() {
+	node := jsonObjectAtPaths(root, "response.usageMetadata", "usage_metadata")
+	if node == nil {
 		return usage.Detail{}, false
 	}
 	return parseGeminiFamilyUsageDetail(node), true
 }
 
 func parseAntigravityUsage(data []byte) usage.Detail {
-	usageNode := gjson.ParseBytes(data)
-	node := usageNode.Get("response.usageMetadata")
-	if !node.Exists() {
-		node = usageNode.Get("usageMetadata")
+	root, errParse := jsonutil.ParseObjectBytes(data)
+	if errParse != nil {
+		return usage.Detail{}
 	}
-	if !node.Exists() {
-		node = usageNode.Get("usage_metadata")
-	}
-	if !node.Exists() {
+	node := jsonObjectAtPaths(root, "response.usageMetadata", "usageMetadata", "usage_metadata")
+	if node == nil {
 		return usage.Detail{}
 	}
 	return parseGeminiFamilyUsageDetail(node)
@@ -376,17 +430,15 @@ func parseAntigravityUsage(data []byte) usage.Detail {
 
 func parseAntigravityStreamUsage(line []byte) (usage.Detail, bool) {
 	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if len(payload) == 0 {
 		return usage.Detail{}, false
 	}
-	node := gjson.GetBytes(payload, "response.usageMetadata")
-	if !node.Exists() {
-		node = gjson.GetBytes(payload, "usageMetadata")
+	root, errParse := jsonutil.ParseObjectBytes(payload)
+	if errParse != nil {
+		return usage.Detail{}, false
 	}
-	if !node.Exists() {
-		node = gjson.GetBytes(payload, "usage_metadata")
-	}
-	if !node.Exists() {
+	node := jsonObjectAtPaths(root, "response.usageMetadata", "usageMetadata", "usage_metadata")
+	if node == nil {
 		return usage.Detail{}, false
 	}
 	return parseGeminiFamilyUsageDetail(node), true
@@ -421,7 +473,10 @@ func FilterSSEUsageMetadata(payload []byte) []byte {
 			continue
 		}
 		rawJSON := bytes.TrimSpace(line[dataIdx+5:])
-		traceID := gjson.GetBytes(rawJSON, "traceId").String()
+		traceID := ""
+		if root, errParse := jsonutil.ParseObjectBytes(rawJSON); errParse == nil {
+			traceID = jsonStringAtPaths(root, "traceId")
+		}
 		if isStopChunkWithoutUsage(rawJSON) && traceID != "" {
 			rememberStopWithoutUsage(traceID)
 			continue
@@ -468,20 +523,19 @@ func FilterSSEUsageMetadata(payload []byte) []byte {
 // - Antigravity: response.candidates.0.finishReason
 func StripUsageMetadataFromJSON(rawJSON []byte) ([]byte, bool) {
 	jsonBytes := bytes.TrimSpace(rawJSON)
-	if len(jsonBytes) == 0 || !gjson.ValidBytes(jsonBytes) {
+	if len(jsonBytes) == 0 {
+		return rawJSON, false
+	}
+	root, errParse := jsonutil.ParseObjectBytes(jsonBytes)
+	if errParse != nil {
 		return rawJSON, false
 	}
 
 	// Check for finishReason in both aistudio and antigravity formats
-	finishReason := gjson.GetBytes(jsonBytes, "candidates.0.finishReason")
-	if !finishReason.Exists() {
-		finishReason = gjson.GetBytes(jsonBytes, "response.candidates.0.finishReason")
-	}
-	terminalReason := finishReason.Exists() && strings.TrimSpace(finishReason.String()) != ""
-
-	usageMetadata := gjson.GetBytes(jsonBytes, "usageMetadata")
-	if !usageMetadata.Exists() {
-		usageMetadata = gjson.GetBytes(jsonBytes, "response.usageMetadata")
+	terminalReason := strings.TrimSpace(jsonStringAtPaths(root, "candidates.0.finishReason", "response.candidates.0.finishReason")) != ""
+	usageMetadataValue, hasUsageMetadata := jsonutil.Get(root, "usageMetadata")
+	if !hasUsageMetadata {
+		usageMetadataValue, hasUsageMetadata = jsonutil.Get(root, "response.usageMetadata")
 	}
 
 	// Terminal chunk: keep as-is.
@@ -490,54 +544,48 @@ func StripUsageMetadataFromJSON(rawJSON []byte) ([]byte, bool) {
 	}
 
 	// Nothing to strip
-	if !usageMetadata.Exists() {
+	if !hasUsageMetadata {
 		return rawJSON, false
 	}
-
-	// Remove usageMetadata from both possible locations
-	cleaned := jsonBytes
 	var changed bool
 
-	if usageMetadata = gjson.GetBytes(cleaned, "usageMetadata"); usageMetadata.Exists() {
+	if _, ok := jsonutil.Get(root, "usageMetadata"); ok {
 		// Rename usageMetadata to cpaUsageMetadata in the message_start event of Claude
-		cleaned, _ = sjson.SetRawBytes(cleaned, "cpaUsageMetadata", []byte(usageMetadata.Raw))
-		cleaned, _ = sjson.DeleteBytes(cleaned, "usageMetadata")
-		changed = true
+		if errSet := jsonutil.Set(root, "cpaUsageMetadata", usageMetadataValue); errSet == nil {
+			_ = jsonutil.Delete(root, "usageMetadata")
+			changed = true
+		}
 	}
 
-	if usageMetadata = gjson.GetBytes(cleaned, "response.usageMetadata"); usageMetadata.Exists() {
+	if usageMetadataValue, ok := jsonutil.Get(root, "response.usageMetadata"); ok {
 		// Rename usageMetadata to cpaUsageMetadata in the message_start event of Claude
-		cleaned, _ = sjson.SetRawBytes(cleaned, "response.cpaUsageMetadata", []byte(usageMetadata.Raw))
-		cleaned, _ = sjson.DeleteBytes(cleaned, "response.usageMetadata")
-		changed = true
+		if errSet := jsonutil.Set(root, "response.cpaUsageMetadata", usageMetadataValue); errSet == nil {
+			_ = jsonutil.Delete(root, "response.usageMetadata")
+			changed = true
+		}
 	}
 
-	return cleaned, changed
+	if !changed {
+		return rawJSON, false
+	}
+	return jsonutil.MarshalOrOriginal(rawJSON, root), true
 }
 
 func hasUsageMetadata(jsonBytes []byte) bool {
-	if len(jsonBytes) == 0 || !gjson.ValidBytes(jsonBytes) {
+	root, errParse := jsonutil.ParseObjectBytes(jsonBytes)
+	if errParse != nil {
 		return false
 	}
-	if gjson.GetBytes(jsonBytes, "usageMetadata").Exists() {
-		return true
-	}
-	if gjson.GetBytes(jsonBytes, "response.usageMetadata").Exists() {
-		return true
-	}
-	return false
+	return jsonutil.Exists(root, "usageMetadata") || jsonutil.Exists(root, "response.usageMetadata")
 }
 
 func isStopChunkWithoutUsage(jsonBytes []byte) bool {
-	if len(jsonBytes) == 0 || !gjson.ValidBytes(jsonBytes) {
+	root, errParse := jsonutil.ParseObjectBytes(jsonBytes)
+	if errParse != nil {
 		return false
 	}
-	finishReason := gjson.GetBytes(jsonBytes, "candidates.0.finishReason")
-	if !finishReason.Exists() {
-		finishReason = gjson.GetBytes(jsonBytes, "response.candidates.0.finishReason")
-	}
-	trimmed := strings.TrimSpace(finishReason.String())
-	if !finishReason.Exists() || trimmed == "" {
+	trimmed := strings.TrimSpace(jsonStringAtPaths(root, "candidates.0.finishReason", "response.candidates.0.finishReason"))
+	if trimmed == "" {
 		return false
 	}
 	return !hasUsageMetadata(jsonBytes)

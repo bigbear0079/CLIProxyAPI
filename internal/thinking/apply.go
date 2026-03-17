@@ -2,11 +2,12 @@
 package thinking
 
 import (
+	"encoding/json"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 )
 
 // providerAppliers maps provider names to their ProviderApplier implementations.
@@ -314,28 +315,32 @@ func normalizeUserDefinedConfig(config ThinkingConfig, fromFormat, toFormat stri
 
 // extractThinkingConfig extracts provider-specific thinking config from request body.
 func extractThinkingConfig(body []byte, provider string) ThinkingConfig {
-	if len(body) == 0 || !gjson.ValidBytes(body) {
+	if len(body) == 0 {
+		return ThinkingConfig{}
+	}
+	root, errParse := jsonutil.ParseObjectBytes(body)
+	if errParse != nil {
 		return ThinkingConfig{}
 	}
 
 	switch provider {
 	case "claude":
-		return extractClaudeConfig(body)
+		return extractClaudeConfig(root)
 	case "gemini", "gemini-cli", "antigravity":
-		return extractGeminiConfig(body, provider)
+		return extractGeminiConfig(root, provider)
 	case "openai":
-		return extractOpenAIConfig(body)
+		return extractOpenAIConfig(root)
 	case "codex":
-		return extractCodexConfig(body)
+		return extractCodexConfig(root)
 	case "iflow":
-		config := extractIFlowConfig(body)
+		config := extractIFlowConfig(root)
 		if hasThinkingConfig(config) {
 			return config
 		}
-		return extractOpenAIConfig(body)
+		return extractOpenAIConfig(root)
 	case "kimi":
 		// Kimi uses OpenAI-compatible reasoning_effort format
-		return extractOpenAIConfig(body)
+		return extractOpenAIConfig(root)
 	default:
 		return ThinkingConfig{}
 	}
@@ -354,8 +359,8 @@ func hasThinkingConfig(config ThinkingConfig) bool {
 // Priority: thinking.type="disabled" takes precedence over budget_tokens.
 // When type="enabled" without budget_tokens, returns ModeAuto to indicate
 // the user wants thinking enabled but didn't specify a budget.
-func extractClaudeConfig(body []byte) ThinkingConfig {
-	thinkingType := gjson.GetBytes(body, "thinking.type").String()
+func extractClaudeConfig(root map[string]any) ThinkingConfig {
+	thinkingType, _ := thinkingString(root, "thinking.type")
 	if thinkingType == "disabled" {
 		return ThinkingConfig{Mode: ModeNone, Budget: 0}
 	}
@@ -363,8 +368,8 @@ func extractClaudeConfig(body []byte) ThinkingConfig {
 		// Claude adaptive thinking uses output_config.effort (low/medium/high/max).
 		// We only treat it as a thinking config when effort is explicitly present;
 		// otherwise we passthrough and let upstream defaults apply.
-		if effort := gjson.GetBytes(body, "output_config.effort"); effort.Exists() && effort.Type == gjson.String {
-			value := strings.ToLower(strings.TrimSpace(effort.String()))
+		if effort, ok := thinkingString(root, "output_config.effort"); ok {
+			value := strings.ToLower(strings.TrimSpace(effort))
 			if value == "" {
 				return ThinkingConfig{}
 			}
@@ -381,8 +386,7 @@ func extractClaudeConfig(body []byte) ThinkingConfig {
 	}
 
 	// Check budget_tokens
-	if budget := gjson.GetBytes(body, "thinking.budget_tokens"); budget.Exists() {
-		value := int(budget.Int())
+	if value, ok := thinkingInt(root, "thinking.budget_tokens"); ok {
 		switch value {
 		case 0:
 			return ThinkingConfig{Mode: ModeNone, Budget: 0}
@@ -411,20 +415,14 @@ func extractClaudeConfig(body []byte) ThinkingConfig {
 //
 // Priority: thinkingLevel is checked first (Gemini 3 format), then thinkingBudget (Gemini 2.5 format).
 // This allows newer Gemini 3 level-based configs to take precedence.
-func extractGeminiConfig(body []byte, provider string) ThinkingConfig {
+func extractGeminiConfig(root map[string]any, provider string) ThinkingConfig {
 	prefix := "generationConfig.thinkingConfig"
 	if provider == "gemini-cli" || provider == "antigravity" {
 		prefix = "request.generationConfig.thinkingConfig"
 	}
 
 	// Check thinkingLevel first (Gemini 3 format takes precedence)
-	level := gjson.GetBytes(body, prefix+".thinkingLevel")
-	if !level.Exists() {
-		// Google official Gemini Python SDK sends snake_case field names
-		level = gjson.GetBytes(body, prefix+".thinking_level")
-	}
-	if level.Exists() {
-		value := level.String()
+	if value, ok := thinkingString(root, prefix+".thinkingLevel", prefix+".thinking_level"); ok {
 		switch value {
 		case "none":
 			return ThinkingConfig{Mode: ModeNone, Budget: 0}
@@ -436,13 +434,7 @@ func extractGeminiConfig(body []byte, provider string) ThinkingConfig {
 	}
 
 	// Check thinkingBudget (Gemini 2.5 format)
-	budget := gjson.GetBytes(body, prefix+".thinkingBudget")
-	if !budget.Exists() {
-		// Google official Gemini Python SDK sends snake_case field names
-		budget = gjson.GetBytes(body, prefix+".thinking_budget")
-	}
-	if budget.Exists() {
-		value := int(budget.Int())
+	if value, ok := thinkingInt(root, prefix+".thinkingBudget", prefix+".thinking_budget"); ok {
 		switch value {
 		case 0:
 			return ThinkingConfig{Mode: ModeNone, Budget: 0}
@@ -463,10 +455,9 @@ func extractGeminiConfig(body []byte, provider string) ThinkingConfig {
 //
 // OpenAI uses level-based thinking configuration only, no numeric budget support.
 // The "none" value is treated specially to return ModeNone.
-func extractOpenAIConfig(body []byte) ThinkingConfig {
+func extractOpenAIConfig(root map[string]any) ThinkingConfig {
 	// Check reasoning_effort (OpenAI Chat Completions format)
-	if effort := gjson.GetBytes(body, "reasoning_effort"); effort.Exists() {
-		value := effort.String()
+	if value, ok := thinkingString(root, "reasoning_effort"); ok {
 		if value == "none" {
 			return ThinkingConfig{Mode: ModeNone, Budget: 0}
 		}
@@ -482,10 +473,9 @@ func extractOpenAIConfig(body []byte) ThinkingConfig {
 //   - reasoning.effort: "none", "low", "medium", "high"
 //
 // This is similar to OpenAI but uses nested field "reasoning.effort" instead of "reasoning_effort".
-func extractCodexConfig(body []byte) ThinkingConfig {
+func extractCodexConfig(root map[string]any) ThinkingConfig {
 	// Check reasoning.effort (Codex / OpenAI Responses API format)
-	if effort := gjson.GetBytes(body, "reasoning.effort"); effort.Exists() {
-		value := effort.String()
+	if value, ok := thinkingString(root, "reasoning.effort"); ok {
 		if value == "none" {
 			return ThinkingConfig{Mode: ModeNone, Budget: 0}
 		}
@@ -504,10 +494,10 @@ func extractCodexConfig(body []byte) ThinkingConfig {
 // Returns ModeBudget with Budget=1 as a sentinel value indicating "enabled".
 // The actual budget/configuration is determined by the iFlow applier based on model capabilities.
 // Budget=1 is used because iFlow models don't use numeric budgets; they only support on/off.
-func extractIFlowConfig(body []byte) ThinkingConfig {
+func extractIFlowConfig(root map[string]any) ThinkingConfig {
 	// GLM format: chat_template_kwargs.enable_thinking
-	if enabled := gjson.GetBytes(body, "chat_template_kwargs.enable_thinking"); enabled.Exists() {
-		if enabled.Bool() {
+	if enabled, ok := thinkingBool(root, "chat_template_kwargs.enable_thinking"); ok {
+		if enabled {
 			// Budget=1 is a sentinel meaning "enabled" (iFlow doesn't use numeric budgets)
 			return ThinkingConfig{Mode: ModeBudget, Budget: 1}
 		}
@@ -515,8 +505,8 @@ func extractIFlowConfig(body []byte) ThinkingConfig {
 	}
 
 	// MiniMax format: reasoning_split
-	if split := gjson.GetBytes(body, "reasoning_split"); split.Exists() {
-		if split.Bool() {
+	if split, ok := thinkingBool(root, "reasoning_split"); ok {
+		if split {
 			// Budget=1 is a sentinel meaning "enabled" (iFlow doesn't use numeric budgets)
 			return ThinkingConfig{Mode: ModeBudget, Budget: 1}
 		}
@@ -524,4 +514,62 @@ func extractIFlowConfig(body []byte) ThinkingConfig {
 	}
 
 	return ThinkingConfig{}
+}
+
+func thinkingString(root map[string]any, paths ...string) (string, bool) {
+	for _, path := range paths {
+		value, ok := jsonutil.Get(root, path)
+		if !ok || value == nil {
+			continue
+		}
+		switch typed := value.(type) {
+		case string:
+			return typed, true
+		case json.Number:
+			return typed.String(), true
+		case bool:
+			if typed {
+				return "true", true
+			}
+			return "false", true
+		}
+	}
+	return "", false
+}
+
+func thinkingInt(root map[string]any, paths ...string) (int, bool) {
+	for _, path := range paths {
+		value, ok := jsonutil.Get(root, path)
+		if !ok || value == nil {
+			continue
+		}
+		switch typed := value.(type) {
+		case json.Number:
+			intValue, errInt := typed.Int64()
+			if errInt == nil {
+				return int(intValue), true
+			}
+		case int:
+			return typed, true
+		case int64:
+			return int(typed), true
+		case float64:
+			return int(typed), true
+		}
+	}
+	return 0, false
+}
+
+func thinkingBool(root map[string]any, paths ...string) (bool, bool) {
+	for _, path := range paths {
+		value, ok := jsonutil.Get(root, path)
+		if !ok || value == nil {
+			continue
+		}
+		typed, ok := value.(bool)
+		if ok {
+			return typed, true
+		}
+	}
+	return false, false
 }

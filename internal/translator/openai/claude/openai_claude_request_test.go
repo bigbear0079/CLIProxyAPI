@@ -3,7 +3,7 @@ package claude
 import (
 	"testing"
 
-	"github.com/tidwall/gjson"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/testjson"
 )
 
 // TestConvertClaudeRequestToOpenAI_ThinkingToReasoningContent tests the mapping
@@ -179,7 +179,7 @@ func TestConvertClaudeRequestToOpenAI_ThinkingToReasoningContent(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := ConvertClaudeRequestToOpenAI("test-model", []byte(tt.inputJSON), false)
-			resultJSON := gjson.ParseBytes(result)
+			resultJSON := testjson.ParseBytes(result)
 
 			// Find the relevant message
 			messages := resultJSON.Get("messages").Array()
@@ -191,7 +191,7 @@ func TestConvertClaudeRequestToOpenAI_ThinkingToReasoningContent(t *testing.T) {
 			}
 
 			// Check the last non-system message
-			var targetMsg gjson.Result
+			var targetMsg testjson.Result
 			for i := len(messages) - 1; i >= 0; i-- {
 				if messages[i].Get("role").String() != "system" {
 					targetMsg = messages[i]
@@ -218,7 +218,7 @@ func TestConvertClaudeRequestToOpenAI_ThinkingToReasoningContent(t *testing.T) {
 			switch {
 			case content.IsArray():
 				gotHasContent = len(content.Array()) > 0
-			case content.Type == gjson.String:
+			case content.Type == testjson.String:
 				gotHasContent = content.String() != ""
 			default:
 				gotHasContent = false
@@ -231,7 +231,7 @@ func TestConvertClaudeRequestToOpenAI_ThinkingToReasoningContent(t *testing.T) {
 			if tt.wantHasContent && tt.wantContentText != "" {
 				// Find text content
 				var foundText string
-				content.ForEach(func(_, v gjson.Result) bool {
+				content.ForEach(func(_, v testjson.Result) bool {
 					if v.Get("type").String() == "text" {
 						foundText = v.Get("text").String()
 						return false
@@ -268,7 +268,7 @@ func TestConvertClaudeRequestToOpenAI_ThinkingOnlyMessagePreserved(t *testing.T)
 	}`
 
 	result := ConvertClaudeRequestToOpenAI("test-model", []byte(inputJSON), false)
-	resultJSON := gjson.ParseBytes(result)
+	resultJSON := testjson.ParseBytes(result)
 
 	messages := resultJSON.Get("messages").Array()
 
@@ -354,11 +354,11 @@ func TestConvertClaudeRequestToOpenAI_SystemMessageScenarios(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := ConvertClaudeRequestToOpenAI("test-model", []byte(tt.inputJSON), false)
-			resultJSON := gjson.ParseBytes(result)
+			resultJSON := testjson.ParseBytes(result)
 			messages := resultJSON.Get("messages").Array()
 
 			hasSys := false
-			var sysMsg gjson.Result
+			var sysMsg testjson.Result
 			if len(messages) > 0 && messages[0].Get("role").String() == "system" {
 				hasSys = true
 				sysMsg = messages[0]
@@ -412,7 +412,7 @@ func TestConvertClaudeRequestToOpenAI_ToolResultOrderAndContent(t *testing.T) {
 	}`
 
 	result := ConvertClaudeRequestToOpenAI("test-model", []byte(inputJSON), false)
-	resultJSON := gjson.ParseBytes(result)
+	resultJSON := testjson.ParseBytes(result)
 	messages := resultJSON.Get("messages").Array()
 
 	// OpenAI requires: tool messages MUST immediately follow assistant(tool_calls).
@@ -469,7 +469,7 @@ func TestConvertClaudeRequestToOpenAI_ToolResultObjectContent(t *testing.T) {
 	}`
 
 	result := ConvertClaudeRequestToOpenAI("test-model", []byte(inputJSON), false)
-	resultJSON := gjson.ParseBytes(result)
+	resultJSON := testjson.ParseBytes(result)
 	messages := resultJSON.Get("messages").Array()
 
 	// assistant(tool_calls) + tool(result)
@@ -482,7 +482,7 @@ func TestConvertClaudeRequestToOpenAI_ToolResultObjectContent(t *testing.T) {
 	}
 
 	toolContent := messages[1].Get("content").String()
-	parsed := gjson.Parse(toolContent)
+	parsed := testjson.Parse(toolContent)
 	if parsed.Get("foo").String() != "bar" {
 		t.Fatalf("Expected tool content JSON foo=bar, got %q", toolContent)
 	}
@@ -522,7 +522,7 @@ func TestConvertClaudeRequestToOpenAI_ToolResultTextAndImageContent(t *testing.T
 	}`
 
 	result := ConvertClaudeRequestToOpenAI("test-model", []byte(inputJSON), false)
-	resultJSON := gjson.ParseBytes(result)
+	resultJSON := testjson.ParseBytes(result)
 	messages := resultJSON.Get("messages").Array()
 
 	if len(messages) != 2 {
@@ -577,7 +577,7 @@ func TestConvertClaudeRequestToOpenAI_ToolResultURLImageOnly(t *testing.T) {
 	}`
 
 	result := ConvertClaudeRequestToOpenAI("test-model", []byte(inputJSON), false)
-	resultJSON := gjson.ParseBytes(result)
+	resultJSON := testjson.ParseBytes(result)
 	messages := resultJSON.Get("messages").Array()
 
 	if len(messages) != 2 {
@@ -612,7 +612,7 @@ func TestConvertClaudeRequestToOpenAI_AssistantTextToolUseTextOrder(t *testing.T
 	}`
 
 	result := ConvertClaudeRequestToOpenAI("test-model", []byte(inputJSON), false)
-	resultJSON := gjson.ParseBytes(result)
+	resultJSON := testjson.ParseBytes(result)
 	messages := resultJSON.Get("messages").Array()
 
 	// New behavior: content + tool_calls unified in single assistant message
@@ -664,7 +664,7 @@ func TestConvertClaudeRequestToOpenAI_AssistantThinkingToolUseThinkingSplit(t *t
 	}`
 
 	result := ConvertClaudeRequestToOpenAI("test-model", []byte(inputJSON), false)
-	resultJSON := gjson.ParseBytes(result)
+	resultJSON := testjson.ParseBytes(result)
 	messages := resultJSON.Get("messages").Array()
 
 	// New behavior: all content, thinking, and tool_calls unified in single assistant message

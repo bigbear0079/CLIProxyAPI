@@ -3,7 +3,7 @@ package claude
 import (
 	"testing"
 
-	"github.com/tidwall/gjson"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/testjson"
 )
 
 func TestConvertClaudeRequestToGemini_ToolChoice_SpecificTool(t *testing.T) {
@@ -32,12 +32,12 @@ func TestConvertClaudeRequestToGemini_ToolChoice_SpecificTool(t *testing.T) {
 
 	output := ConvertClaudeRequestToGemini("gemini-3-flash-preview", inputJSON, false)
 
-	if got := gjson.GetBytes(output, "toolConfig.functionCallingConfig.mode").String(); got != "ANY" {
+	if got := testjson.GetBytes(output, "toolConfig.functionCallingConfig.mode").String(); got != "ANY" {
 		t.Fatalf("Expected toolConfig.functionCallingConfig.mode 'ANY', got '%s'", got)
 	}
-	allowed := gjson.GetBytes(output, "toolConfig.functionCallingConfig.allowedFunctionNames").Array()
+	allowed := testjson.GetBytes(output, "toolConfig.functionCallingConfig.allowedFunctionNames").Array()
 	if len(allowed) != 1 || allowed[0].String() != "json" {
-		t.Fatalf("Expected allowedFunctionNames ['json'], got %s", gjson.GetBytes(output, "toolConfig.functionCallingConfig.allowedFunctionNames").Raw)
+		t.Fatalf("Expected allowedFunctionNames ['json'], got %s", testjson.GetBytes(output, "toolConfig.functionCallingConfig.allowedFunctionNames").Raw)
 	}
 }
 
@@ -64,7 +64,7 @@ func TestConvertClaudeRequestToGemini_ImageContent(t *testing.T) {
 
 	output := ConvertClaudeRequestToGemini("gemini-3-flash-preview", inputJSON, false)
 
-	parts := gjson.GetBytes(output, "contents.0.parts").Array()
+	parts := testjson.GetBytes(output, "contents.0.parts").Array()
 	if len(parts) != 2 {
 		t.Fatalf("Expected 2 parts, got %d", len(parts))
 	}

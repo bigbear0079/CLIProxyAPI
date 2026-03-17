@@ -4,9 +4,9 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/testjson"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/thinking/provider/claude"
-	"github.com/tidwall/gjson"
 )
 
 func TestApplyThinking_UserDefinedClaudePreservesAdaptiveLevel(t *testing.T) {
@@ -41,13 +41,13 @@ func TestApplyThinking_UserDefinedClaudePreservesAdaptiveLevel(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ApplyThinking() error = %v", err)
 			}
-			if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+			if got := testjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
 				t.Fatalf("thinking.type = %q, want %q, body=%s", got, "adaptive", string(out))
 			}
-			if got := gjson.GetBytes(out, "output_config.effort").String(); got != "high" {
+			if got := testjson.GetBytes(out, "output_config.effort").String(); got != "high" {
 				t.Fatalf("output_config.effort = %q, want %q, body=%s", got, "high", string(out))
 			}
-			if gjson.GetBytes(out, "thinking.budget_tokens").Exists() {
+			if testjson.GetBytes(out, "thinking.budget_tokens").Exists() {
 				t.Fatalf("thinking.budget_tokens should be removed, body=%s", string(out))
 			}
 		})

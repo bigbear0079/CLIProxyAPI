@@ -1,10 +1,10 @@
 package responses
 
 import (
+	"encoding/json"
 	"strings"
 
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 )
 
 // ConvertOpenAIResponsesRequestToOpenAIChatCompletions converts OpenAI responses format to OpenAI chat completions format.
@@ -27,188 +27,264 @@ import (
 // Returns:
 //   - []byte: The transformed request data in OpenAI chat completions format
 func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inputRawJSON []byte, stream bool) []byte {
-	rawJSON := inputRawJSON
-	// Base OpenAI chat completions template with default values
-	out := `{"model":"","messages":[],"stream":false}`
+	root, errParse := jsonutil.ParseObjectBytes(inputRawJSON)
+	if errParse != nil {
+		return marshalOpenAIChatCompletionsRequest(map[string]any{
+			"model":    modelName,
+			"messages": make([]any, 0),
+			"stream":   stream,
+		})
+	}
+	return ConvertOpenAIResponsesRequestObjectToOpenAIChatCompletions(modelName, root, stream)
+}
 
-	root := gjson.ParseBytes(rawJSON)
-
-	// Set model name
-	out, _ = sjson.Set(out, "model", modelName)
-
-	// Set stream configuration
-	out, _ = sjson.Set(out, "stream", stream)
-
-	// Map generation parameters from responses format to chat completions format
-	if maxTokens := root.Get("max_output_tokens"); maxTokens.Exists() {
-		out, _ = sjson.Set(out, "max_tokens", maxTokens.Int())
+// ConvertOpenAIResponsesRequestObjectToOpenAIChatCompletions converts a pre-parsed
+// OpenAI responses request object into the OpenAI chat completions format.
+func ConvertOpenAIResponsesRequestObjectToOpenAIChatCompletions(modelName string, root map[string]any, stream bool) []byte {
+	out := map[string]any{
+		"model":    modelName,
+		"messages": make([]any, 0),
+		"stream":   stream,
 	}
 
-	if parallelToolCalls := root.Get("parallel_tool_calls"); parallelToolCalls.Exists() {
-		out, _ = sjson.Set(out, "parallel_tool_calls", parallelToolCalls.Bool())
+	getString := func(value any) (string, bool) {
+		if value == nil {
+			return "", false
+		}
+		switch typed := value.(type) {
+		case string:
+			return typed, true
+		case json.Number:
+			return typed.String(), true
+		case bool:
+			if typed {
+				return "true", true
+			}
+			return "false", true
+		default:
+			marshaled, errMarshal := json.Marshal(typed)
+			if errMarshal != nil {
+				return "", false
+			}
+			return string(marshaled), true
+		}
 	}
 
-	// Convert instructions to system message
-	if instructions := root.Get("instructions"); instructions.Exists() {
-		systemMessage := `{"role":"system","content":""}`
-		systemMessage, _ = sjson.Set(systemMessage, "content", instructions.String())
-		out, _ = sjson.SetRaw(out, "messages.-1", systemMessage)
+	getObject := func(value any) (map[string]any, bool) {
+		object, ok := value.(map[string]any)
+		return object, ok
 	}
 
-	// Convert input array to messages
-	if input := root.Get("input"); input.Exists() && input.IsArray() {
-		input.ForEach(func(_, item gjson.Result) bool {
-			itemType := item.Get("type").String()
-			if itemType == "" && item.Get("role").String() != "" {
+	getArray := func(value any) ([]any, bool) {
+		array, ok := value.([]any)
+		return array, ok
+	}
+
+	getBool := func(value any) (bool, bool) {
+		boolean, ok := value.(bool)
+		return boolean, ok
+	}
+
+	getInt64 := func(value any) (int64, bool) {
+		switch typed := value.(type) {
+		case json.Number:
+			intValue, errInt := typed.Int64()
+			if errInt != nil {
+				return 0, false
+			}
+			return intValue, true
+		default:
+			return 0, false
+		}
+	}
+
+	messages := out["messages"].([]any)
+
+	// Map generation parameters from responses format to chat completions format.
+	if maxTokens, ok := getInt64(root["max_output_tokens"]); ok {
+		out["max_tokens"] = maxTokens
+	}
+
+	if parallelToolCalls, ok := getBool(root["parallel_tool_calls"]); ok {
+		out["parallel_tool_calls"] = parallelToolCalls
+	}
+
+	// Convert instructions to system message.
+	if instructions, ok := getString(root["instructions"]); ok {
+		messages = append(messages, map[string]any{
+			"role":    "system",
+			"content": instructions,
+		})
+	}
+
+	// Convert input array to messages.
+	if inputArray, ok := getArray(root["input"]); ok {
+		for _, itemValue := range inputArray {
+			item, ok := getObject(itemValue)
+			if !ok {
+				continue
+			}
+
+			itemType, _ := getString(item["type"])
+			role, _ := getString(item["role"])
+			if itemType == "" && role != "" {
 				itemType = "message"
 			}
 
 			switch itemType {
 			case "message", "":
-				// Handle regular message conversion
-				role := item.Get("role").String()
 				if role == "developer" {
 					role = "user"
 				}
-				message := `{"role":"","content":[]}`
-				message, _ = sjson.Set(message, "role", role)
 
-				if content := item.Get("content"); content.Exists() && content.IsArray() {
-					var messageContent string
-					var toolCalls []interface{}
+				message := map[string]any{
+					"role": role,
+				}
 
-					content.ForEach(func(_, contentItem gjson.Result) bool {
-						contentType := contentItem.Get("type").String()
+				if contentArray, ok := getArray(item["content"]); ok {
+					parts := make([]any, 0, len(contentArray))
+					for _, contentValue := range contentArray {
+						contentItem, ok := getObject(contentValue)
+						if !ok {
+							continue
+						}
+
+						contentType, _ := getString(contentItem["type"])
 						if contentType == "" {
 							contentType = "input_text"
 						}
 
 						switch contentType {
 						case "input_text", "output_text":
-							text := contentItem.Get("text").String()
-							contentPart := `{"type":"text","text":""}`
-							contentPart, _ = sjson.Set(contentPart, "text", text)
-							message, _ = sjson.SetRaw(message, "content.-1", contentPart)
+							text, ok := getString(contentItem["text"])
+							if !ok {
+								continue
+							}
+							parts = append(parts, map[string]any{
+								"type": "text",
+								"text": text,
+							})
 						case "input_image":
-							imageURL := contentItem.Get("image_url").String()
-							contentPart := `{"type":"image_url","image_url":{"url":""}}`
-							contentPart, _ = sjson.Set(contentPart, "image_url.url", imageURL)
-							message, _ = sjson.SetRaw(message, "content.-1", contentPart)
+							imageURL, ok := getString(contentItem["image_url"])
+							if !ok {
+								continue
+							}
+							parts = append(parts, map[string]any{
+								"type": "image_url",
+								"image_url": map[string]any{
+									"url": imageURL,
+								},
+							})
 						}
-						return true
-					})
-
-					if messageContent != "" {
-						message, _ = sjson.Set(message, "content", messageContent)
 					}
-
-					if len(toolCalls) > 0 {
-						message, _ = sjson.Set(message, "tool_calls", toolCalls)
-					}
-				} else if content.Type == gjson.String {
-					message, _ = sjson.Set(message, "content", content.String())
+					message["content"] = parts
+				} else if content, ok := getString(item["content"]); ok {
+					message["content"] = content
 				}
 
-				out, _ = sjson.SetRaw(out, "messages.-1", message)
-
+				messages = append(messages, message)
 			case "function_call":
-				// Handle function call conversion to assistant message with tool_calls
-				assistantMessage := `{"role":"assistant","tool_calls":[]}`
-
-				toolCall := `{"id":"","type":"function","function":{"name":"","arguments":""}}`
-
-				if callId := item.Get("call_id"); callId.Exists() {
-					toolCall, _ = sjson.Set(toolCall, "id", callId.String())
+				function := map[string]any{}
+				if name, ok := getString(item["name"]); ok {
+					function["name"] = name
+				}
+				if arguments, ok := getString(item["arguments"]); ok {
+					function["arguments"] = arguments
 				}
 
-				if name := item.Get("name"); name.Exists() {
-					toolCall, _ = sjson.Set(toolCall, "function.name", name.String())
+				toolCall := map[string]any{
+					"type":     "function",
+					"function": function,
+				}
+				if callID, ok := getString(item["call_id"]); ok {
+					toolCall["id"] = callID
 				}
 
-				if arguments := item.Get("arguments"); arguments.Exists() {
-					toolCall, _ = sjson.Set(toolCall, "function.arguments", arguments.String())
-				}
-
-				assistantMessage, _ = sjson.SetRaw(assistantMessage, "tool_calls.0", toolCall)
-				out, _ = sjson.SetRaw(out, "messages.-1", assistantMessage)
-
+				messages = append(messages, map[string]any{
+					"role":       "assistant",
+					"tool_calls": []any{toolCall},
+				})
 			case "function_call_output":
-				// Handle function call output conversion to tool message
-				toolMessage := `{"role":"tool","tool_call_id":"","content":""}`
-
-				if callId := item.Get("call_id"); callId.Exists() {
-					toolMessage, _ = sjson.Set(toolMessage, "tool_call_id", callId.String())
+				toolMessage := map[string]any{
+					"role": "tool",
+				}
+				if callID, ok := getString(item["call_id"]); ok {
+					toolMessage["tool_call_id"] = callID
+				}
+				if output, ok := getString(item["output"]); ok {
+					toolMessage["content"] = output
 				}
 
-				if output := item.Get("output"); output.Exists() {
-					toolMessage, _ = sjson.Set(toolMessage, "content", output.String())
-				}
-
-				out, _ = sjson.SetRaw(out, "messages.-1", toolMessage)
+				messages = append(messages, toolMessage)
 			}
-
-			return true
+		}
+	} else if inputText, ok := getString(root["input"]); ok {
+		messages = append(messages, map[string]any{
+			"role":    "user",
+			"content": inputText,
 		})
-	} else if input.Type == gjson.String {
-		msg := "{}"
-		msg, _ = sjson.Set(msg, "role", "user")
-		msg, _ = sjson.Set(msg, "content", input.String())
-		out, _ = sjson.SetRaw(out, "messages.-1", msg)
 	}
 
-	// Convert tools from responses format to chat completions format
-	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
-		var chatCompletionsTools []interface{}
+	out["messages"] = messages
 
-		tools.ForEach(func(_, tool gjson.Result) bool {
-			// Built-in tools (e.g. {"type":"web_search"}) are already compatible with the Chat Completions schema.
-			// Only function tools need structural conversion because Chat Completions nests details under "function".
-			toolType := tool.Get("type").String()
-			if toolType != "" && toolType != "function" && tool.IsObject() {
-				// Almost all providers lack built-in tools, so we just ignore them.
-				// chatCompletionsTools = append(chatCompletionsTools, tool.Value())
-				return true
+	// Convert tools from responses format to chat completions format.
+	if tools, ok := getArray(root["tools"]); ok {
+		chatCompletionsTools := make([]any, 0, len(tools))
+		for _, toolValue := range tools {
+			tool, ok := getObject(toolValue)
+			if !ok {
+				continue
 			}
 
-			chatTool := `{"type":"function","function":{}}`
-
-			// Convert tool structure from responses format to chat completions format
-			function := `{"name":"","description":"","parameters":{}}`
-
-			if name := tool.Get("name"); name.Exists() {
-				function, _ = sjson.Set(function, "name", name.String())
+			// Built-in tools are intentionally ignored because most upstream chat-completions providers do not support them.
+			toolType, _ := getString(tool["type"])
+			if toolType != "" && toolType != "function" {
+				continue
 			}
 
-			if description := tool.Get("description"); description.Exists() {
-				function, _ = sjson.Set(function, "description", description.String())
+			function := map[string]any{}
+			if name, ok := getString(tool["name"]); ok {
+				function["name"] = name
+			}
+			if description, ok := getString(tool["description"]); ok {
+				function["description"] = description
+			}
+			if parameters, ok := tool["parameters"]; ok {
+				function["parameters"] = parameters
 			}
 
-			if parameters := tool.Get("parameters"); parameters.Exists() {
-				function, _ = sjson.SetRaw(function, "parameters", parameters.Raw)
-			}
-
-			chatTool, _ = sjson.SetRaw(chatTool, "function", function)
-			chatCompletionsTools = append(chatCompletionsTools, gjson.Parse(chatTool).Value())
-
-			return true
-		})
+			chatCompletionsTools = append(chatCompletionsTools, map[string]any{
+				"type":     "function",
+				"function": function,
+			})
+		}
 
 		if len(chatCompletionsTools) > 0 {
-			out, _ = sjson.Set(out, "tools", chatCompletionsTools)
+			out["tools"] = chatCompletionsTools
 		}
 	}
 
-	if reasoningEffort := root.Get("reasoning.effort"); reasoningEffort.Exists() {
-		effort := strings.ToLower(strings.TrimSpace(reasoningEffort.String()))
-		if effort != "" {
-			out, _ = sjson.Set(out, "reasoning_effort", effort)
+	if reasoning, ok := getObject(root["reasoning"]); ok {
+		if effort, ok := getString(reasoning["effort"]); ok {
+			effort = strings.ToLower(strings.TrimSpace(effort))
+			if effort != "" {
+				out["reasoning_effort"] = effort
+			}
 		}
 	}
 
-	// Convert tool_choice if present
-	if toolChoice := root.Get("tool_choice"); toolChoice.Exists() {
-		out, _ = sjson.Set(out, "tool_choice", toolChoice.String())
+	// Preserve tool_choice shape so object values stay objects instead of turning into JSON strings.
+	if toolChoice, ok := root["tool_choice"]; ok {
+		out["tool_choice"] = toolChoice
 	}
 
-	return []byte(out)
+	return marshalOpenAIChatCompletionsRequest(out)
+}
+
+func marshalOpenAIChatCompletionsRequest(payload map[string]any) []byte {
+	out, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return []byte(`{"model":"","messages":[],"stream":false}`)
+	}
+	return out
 }

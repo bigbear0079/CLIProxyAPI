@@ -16,13 +16,12 @@ import (
 
 	vertexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/vertex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
@@ -55,16 +54,28 @@ func getVertexAction(model string, isStream bool) string {
 // so it can be processed by the standard translation pipeline.
 // This ensures Imagen models return responses in the same format as gemini-3-pro-image-preview.
 func convertImagenToGeminiResponse(data []byte, model string) []byte {
-	predictions := gjson.GetBytes(data, "predictions")
-	if !predictions.Exists() || !predictions.IsArray() {
+	root, errParse := jsonutil.ParseObjectBytes(data)
+	if errParse != nil {
+		return data
+	}
+	predictionsValue, ok := root["predictions"]
+	if !ok {
+		return data
+	}
+	predictions, ok := predictionsValue.([]any)
+	if !ok {
 		return data
 	}
 
 	// Build Gemini-compatible response with inlineData
 	parts := make([]map[string]any, 0)
-	for _, pred := range predictions.Array() {
-		imageData := pred.Get("bytesBase64Encoded").String()
-		mimeType := pred.Get("mimeType").String()
+	for _, predValue := range predictions {
+		pred, okPred := predValue.(map[string]any)
+		if !okPred {
+			continue
+		}
+		imageData := jsonStringField(pred, "bytesBase64Encoded")
+		mimeType := jsonStringField(pred, "mimeType")
 		if mimeType == "" {
 			mimeType = "image/png"
 		}
@@ -109,23 +120,29 @@ func convertImagenToGeminiResponse(data []byte, model string) []byte {
 // convertToImagenRequest converts a Gemini-style request to Imagen API format.
 // Imagen API uses a different structure: instances[].prompt instead of contents[].
 func convertToImagenRequest(payload []byte) ([]byte, error) {
+	root, errParse := jsonutil.ParseObjectBytes(payload)
+	if errParse != nil {
+		return nil, fmt.Errorf("imagen: no prompt found in request")
+	}
 	// Extract prompt from Gemini-style contents
 	prompt := ""
 
 	// Try to get prompt from contents[0].parts[0].text
-	contentsText := gjson.GetBytes(payload, "contents.0.parts.0.text")
-	if contentsText.Exists() {
-		prompt = contentsText.String()
-	}
+	prompt = jsonStringField(root, "contents.0.parts.0.text")
 
 	// If no contents, try messages format (OpenAI-compatible)
 	if prompt == "" {
-		messagesText := gjson.GetBytes(payload, "messages.#.content")
-		if messagesText.Exists() && messagesText.IsArray() {
-			for _, msg := range messagesText.Array() {
-				if msg.String() != "" {
-					prompt = msg.String()
-					break
+		if messagesValue, ok := jsonutil.Get(root, "messages"); ok {
+			if messages, okMessages := messagesValue.([]any); okMessages {
+				for _, msgValue := range messages {
+					msg, okMsg := msgValue.(map[string]any)
+					if !okMsg {
+						continue
+					}
+					if content := jsonStringField(msg, "content"); content != "" {
+						prompt = content
+						break
+					}
 				}
 			}
 		}
@@ -133,10 +150,7 @@ func convertToImagenRequest(payload []byte) ([]byte, error) {
 
 	// If still no prompt, try direct prompt field
 	if prompt == "" {
-		directPrompt := gjson.GetBytes(payload, "prompt")
-		if directPrompt.Exists() {
-			prompt = directPrompt.String()
-		}
+		prompt = jsonStringField(root, "prompt")
 	}
 
 	if prompt == "" {
@@ -156,14 +170,14 @@ func convertToImagenRequest(payload []byte) ([]byte, error) {
 	}
 
 	// Extract optional parameters
-	if aspectRatio := gjson.GetBytes(payload, "aspectRatio"); aspectRatio.Exists() {
-		imagenReq["parameters"].(map[string]any)["aspectRatio"] = aspectRatio.String()
+	if aspectRatio := jsonStringField(root, "aspectRatio"); aspectRatio != "" {
+		imagenReq["parameters"].(map[string]any)["aspectRatio"] = aspectRatio
 	}
-	if sampleCount := gjson.GetBytes(payload, "sampleCount"); sampleCount.Exists() {
-		imagenReq["parameters"].(map[string]any)["sampleCount"] = int(sampleCount.Int())
+	if sampleCount, ok := jsonInt64Field(root, "sampleCount"); ok && sampleCount != 0 {
+		imagenReq["parameters"].(map[string]any)["sampleCount"] = int(sampleCount)
 	}
-	if negativePrompt := gjson.GetBytes(payload, "negativePrompt"); negativePrompt.Exists() {
-		imagenReq["instances"].([]map[string]any)[0]["negativePrompt"] = negativePrompt.String()
+	if negativePrompt := jsonStringField(root, "negativePrompt"); negativePrompt != "" {
+		imagenReq["instances"].([]map[string]any)[0]["negativePrompt"] = negativePrompt
 	}
 
 	return json.Marshal(imagenReq)
@@ -334,7 +348,7 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 		body = fixGeminiImageAspectRatio(baseModel, body)
 		requestedModel := payloadRequestedModel(opts, req.Model)
 		body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-		body, _ = sjson.SetBytes(body, "model", baseModel)
+		body = setJSONFieldBytes(body, "model", baseModel)
 	}
 
 	action := getVertexAction(baseModel, false)
@@ -348,7 +362,7 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 	if opts.Alt != "" && action != "countTokens" {
 		url = url + fmt.Sprintf("?$alt=%s", opts.Alt)
 	}
-	body, _ = sjson.DeleteBytes(body, "session_id")
+	body = deleteJSONFieldBytes(body, "session_id")
 
 	httpReq, errNewReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if errNewReq != nil {
@@ -449,7 +463,7 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 	body = fixGeminiImageAspectRatio(baseModel, body)
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = setJSONFieldBytes(body, "model", baseModel)
 
 	action := getVertexAction(baseModel, false)
 	if req.Metadata != nil {
@@ -466,7 +480,7 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 	if opts.Alt != "" && action != "countTokens" {
 		url = url + fmt.Sprintf("?$alt=%s", opts.Alt)
 	}
-	body, _ = sjson.DeleteBytes(body, "session_id")
+	body = deleteJSONFieldBytes(body, "session_id")
 
 	httpReq, errNewReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if errNewReq != nil {
@@ -554,7 +568,7 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 	body = fixGeminiImageAspectRatio(baseModel, body)
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = setJSONFieldBytes(body, "model", baseModel)
 
 	action := getVertexAction(baseModel, true)
 	baseURL := vertexBaseURL(location)
@@ -567,7 +581,7 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 			url = url + fmt.Sprintf("?$alt=%s", opts.Alt)
 		}
 	}
-	body, _ = sjson.DeleteBytes(body, "session_id")
+	body = deleteJSONFieldBytes(body, "session_id")
 
 	httpReq, errNewReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if errNewReq != nil {
@@ -678,7 +692,7 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 	body = fixGeminiImageAspectRatio(baseModel, body)
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = setJSONFieldBytes(body, "model", baseModel)
 
 	action := getVertexAction(baseModel, true)
 	// For API key auth, use simpler URL format without project/location
@@ -694,7 +708,7 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 			url = url + fmt.Sprintf("?$alt=%s", opts.Alt)
 		}
 	}
-	body, _ = sjson.DeleteBytes(body, "session_id")
+	body = deleteJSONFieldBytes(body, "session_id")
 
 	httpReq, errNewReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if errNewReq != nil {
@@ -791,11 +805,11 @@ func (e *GeminiVertexExecutor) countTokensWithServiceAccount(ctx context.Context
 	}
 
 	translatedReq = fixGeminiImageAspectRatio(baseModel, translatedReq)
-	translatedReq, _ = sjson.SetBytes(translatedReq, "model", baseModel)
+	translatedReq = setJSONFieldBytes(translatedReq, "model", baseModel)
 	respCtx := context.WithValue(ctx, "alt", opts.Alt)
-	translatedReq, _ = sjson.DeleteBytes(translatedReq, "tools")
-	translatedReq, _ = sjson.DeleteBytes(translatedReq, "generationConfig")
-	translatedReq, _ = sjson.DeleteBytes(translatedReq, "safetySettings")
+	translatedReq = deleteJSONFieldBytes(translatedReq, "tools")
+	translatedReq = deleteJSONFieldBytes(translatedReq, "generationConfig")
+	translatedReq = deleteJSONFieldBytes(translatedReq, "safetySettings")
 
 	baseURL := vertexBaseURL(location)
 	url := fmt.Sprintf("%s/%s/projects/%s/locations/%s/publishers/google/models/%s:%s", baseURL, vertexAPIVersion, projectID, location, baseModel, "countTokens")
@@ -855,7 +869,7 @@ func (e *GeminiVertexExecutor) countTokensWithServiceAccount(ctx context.Context
 		return cliproxyexecutor.Response{}, errRead
 	}
 	appendAPIResponseChunk(ctx, e.cfg, data)
-	count := gjson.GetBytes(data, "totalTokens").Int()
+	count, _ := jsonInt64FieldBytes(data, "totalTokens")
 	out := sdktranslator.TranslateTokenCount(ctx, to, from, count, data)
 	return cliproxyexecutor.Response{Payload: []byte(out), Headers: httpResp.Header.Clone()}, nil
 }
@@ -875,11 +889,11 @@ func (e *GeminiVertexExecutor) countTokensWithAPIKey(ctx context.Context, auth *
 	}
 
 	translatedReq = fixGeminiImageAspectRatio(baseModel, translatedReq)
-	translatedReq, _ = sjson.SetBytes(translatedReq, "model", baseModel)
+	translatedReq = setJSONFieldBytes(translatedReq, "model", baseModel)
 	respCtx := context.WithValue(ctx, "alt", opts.Alt)
-	translatedReq, _ = sjson.DeleteBytes(translatedReq, "tools")
-	translatedReq, _ = sjson.DeleteBytes(translatedReq, "generationConfig")
-	translatedReq, _ = sjson.DeleteBytes(translatedReq, "safetySettings")
+	translatedReq = deleteJSONFieldBytes(translatedReq, "tools")
+	translatedReq = deleteJSONFieldBytes(translatedReq, "generationConfig")
+	translatedReq = deleteJSONFieldBytes(translatedReq, "safetySettings")
 
 	// For API key auth, use simpler URL format without project/location
 	if baseURL == "" {
@@ -939,7 +953,7 @@ func (e *GeminiVertexExecutor) countTokensWithAPIKey(ctx context.Context, auth *
 		return cliproxyexecutor.Response{}, errRead
 	}
 	appendAPIResponseChunk(ctx, e.cfg, data)
-	count := gjson.GetBytes(data, "totalTokens").Int()
+	count, _ := jsonInt64FieldBytes(data, "totalTokens")
 	out := sdktranslator.TranslateTokenCount(ctx, to, from, count, data)
 	return cliproxyexecutor.Response{Payload: []byte(out), Headers: httpResp.Header.Clone()}, nil
 }

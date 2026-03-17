@@ -1,5 +1,5 @@
 // Package openai provides utilities to translate OpenAI Chat Completions
-// request JSON into OpenAI Responses API request JSON using gjson/sjson.
+// request JSON into OpenAI Responses API request JSON using standard JSON trees.
 // It supports tools, multimodal text/image inputs, and Structured Outputs.
 // The package handles the conversion of OpenAI API requests into the format
 // expected by the OpenAI Responses API, including proper mapping of messages,
@@ -10,8 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 )
 
 // ConvertOpenAIRequestToCodex converts an OpenAI Chat Completions request JSON
@@ -27,336 +26,299 @@ import (
 // Returns:
 //   - []byte: The transformed request data in OpenAI Responses API format
 func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream bool) []byte {
-	rawJSON := inputRawJSON
-	// Start with empty JSON object
-	out := `{"instructions":""}`
+	root := jsonutil.ParseObjectBytesOrEmpty(inputRawJSON)
 
-	// Stream must be set to true
-	out, _ = sjson.Set(out, "stream", stream)
-
-	// Codex not support temperature, top_p, top_k, max_output_tokens, so comment them
-	// if v := gjson.GetBytes(rawJSON, "temperature"); v.Exists() {
-	// 	out, _ = sjson.Set(out, "temperature", v.Value())
-	// }
-	// if v := gjson.GetBytes(rawJSON, "top_p"); v.Exists() {
-	// 	out, _ = sjson.Set(out, "top_p", v.Value())
-	// }
-	// if v := gjson.GetBytes(rawJSON, "top_k"); v.Exists() {
-	// 	out, _ = sjson.Set(out, "top_k", v.Value())
-	// }
-
-	// Map token limits
-	// if v := gjson.GetBytes(rawJSON, "max_tokens"); v.Exists() {
-	// 	out, _ = sjson.Set(out, "max_output_tokens", v.Value())
-	// }
-	// if v := gjson.GetBytes(rawJSON, "max_completion_tokens"); v.Exists() {
-	// 	out, _ = sjson.Set(out, "max_output_tokens", v.Value())
-	// }
-
-	// Map reasoning effort
-	if v := gjson.GetBytes(rawJSON, "reasoning_effort"); v.Exists() {
-		out, _ = sjson.Set(out, "reasoning.effort", v.Value())
-	} else {
-		out, _ = sjson.Set(out, "reasoning.effort", "medium")
+	outRoot := map[string]any{
+		"instructions":        "",
+		"stream":              stream,
+		"parallel_tool_calls": true,
+		"include":             []string{"reasoning.encrypted_content"},
+		"model":               modelName,
+		"store":               false,
+		"input":               []any{},
+		"reasoning":           map[string]any{"effort": "medium", "summary": "auto"},
 	}
-	out, _ = sjson.Set(out, "parallel_tool_calls", true)
-	out, _ = sjson.Set(out, "reasoning.summary", "auto")
-	out, _ = sjson.Set(out, "include", []string{"reasoning.encrypted_content"})
 
-	// Model
-	out, _ = sjson.Set(out, "model", modelName)
+	if effort, ok := jsonutil.Get(root, "reasoning_effort"); ok {
+		outRoot["reasoning"].(map[string]any)["effort"] = effort
+	}
 
-	// Build tool name shortening map from original tools (if any)
 	originalToolNameMap := map[string]string{}
-	{
-		tools := gjson.GetBytes(rawJSON, "tools")
-		if tools.IsArray() && len(tools.Array()) > 0 {
-			// Collect original tool names
-			var names []string
-			arr := tools.Array()
-			for i := 0; i < len(arr); i++ {
-				t := arr[i]
-				if t.Get("type").String() == "function" {
-					fn := t.Get("function")
-					if fn.Exists() {
-						if v := fn.Get("name"); v.Exists() {
-							names = append(names, v.String())
-						}
-					}
-				}
+	if tools, ok := jsonutil.Array(root, "tools"); ok && len(tools) > 0 {
+		names := make([]string, 0, len(tools))
+		for _, toolValue := range tools {
+			tool, ok := toolValue.(map[string]any)
+			if !ok {
+				continue
 			}
-			if len(names) > 0 {
-				originalToolNameMap = buildShortNameMap(names)
+			toolType, _ := jsonutil.String(tool, "type")
+			if toolType != "function" {
+				continue
 			}
+			function, ok := jsonutil.Object(tool, "function")
+			if !ok {
+				continue
+			}
+			if name, ok := jsonutil.String(function, "name"); ok && name != "" {
+				names = append(names, name)
+			}
+		}
+		if len(names) > 0 {
+			originalToolNameMap = buildShortNameMap(names)
 		}
 	}
 
-	// Extract system instructions from first system message (string or text object)
-	messages := gjson.GetBytes(rawJSON, "messages")
-	// if messages.IsArray() {
-	// 	arr := messages.Array()
-	// 	for i := 0; i < len(arr); i++ {
-	// 		m := arr[i]
-	// 		if m.Get("role").String() == "system" {
-	// 			c := m.Get("content")
-	// 			if c.Type == gjson.String {
-	// 				out, _ = sjson.Set(out, "instructions", c.String())
-	// 			} else if c.IsObject() && c.Get("type").String() == "text" {
-	// 				out, _ = sjson.Set(out, "instructions", c.Get("text").String())
-	// 			}
-	// 			break
-	// 		}
-	// 	}
-	// }
+	inputItems := make([]any, 0)
+	if messages, ok := jsonutil.Array(root, "messages"); ok {
+		for _, messageValue := range messages {
+			message, ok := messageValue.(map[string]any)
+			if !ok {
+				continue
+			}
 
-	// Build input from messages, handling all message types including tool calls
-	out, _ = sjson.SetRaw(out, "input", `[]`)
-	if messages.IsArray() {
-		arr := messages.Array()
-		for i := 0; i < len(arr); i++ {
-			m := arr[i]
-			role := m.Get("role").String()
-
+			role, _ := jsonutil.String(message, "role")
 			switch role {
 			case "tool":
-				// Handle tool response messages as top-level function_call_output objects
-				toolCallID := m.Get("tool_call_id").String()
-				content := m.Get("content").String()
-
-				// Create function_call_output object
-				funcOutput := `{}`
-				funcOutput, _ = sjson.Set(funcOutput, "type", "function_call_output")
-				funcOutput, _ = sjson.Set(funcOutput, "call_id", toolCallID)
-				funcOutput, _ = sjson.Set(funcOutput, "output", content)
-				out, _ = sjson.SetRaw(out, "input.-1", funcOutput)
+				toolCallID, _ := jsonutil.String(message, "tool_call_id")
+				content, _ := jsonutil.String(message, "content")
+				inputItems = append(inputItems, map[string]any{
+					"type":    "function_call_output",
+					"call_id": toolCallID,
+					"output":  content,
+				})
 
 			default:
-				// Handle regular messages
-				msg := `{}`
-				msg, _ = sjson.Set(msg, "type", "message")
+				messageItem := map[string]any{
+					"type":    "message",
+					"role":    role,
+					"content": []any{},
+				}
 				if role == "system" {
-					msg, _ = sjson.Set(msg, "role", "developer")
-				} else {
-					msg, _ = sjson.Set(msg, "role", role)
+					messageItem["role"] = "developer"
 				}
 
-				msg, _ = sjson.SetRaw(msg, "content", `[]`)
-
-				// Handle regular content
-				c := m.Get("content")
-				if c.Exists() && c.Type == gjson.String && c.String() != "" {
-					// Single string content
+				contentParts := make([]any, 0)
+				if content, ok := jsonutil.String(message, "content"); ok && content != "" {
 					partType := "input_text"
 					if role == "assistant" {
 						partType = "output_text"
 					}
-					part := `{}`
-					part, _ = sjson.Set(part, "type", partType)
-					part, _ = sjson.Set(part, "text", c.String())
-					msg, _ = sjson.SetRaw(msg, "content.-1", part)
-				} else if c.Exists() && c.IsArray() {
-					items := c.Array()
-					for j := 0; j < len(items); j++ {
-						it := items[j]
-						t := it.Get("type").String()
-						switch t {
+					contentParts = append(contentParts, map[string]any{
+						"type": partType,
+						"text": content,
+					})
+				} else if contentArray, ok := jsonutil.Array(message, "content"); ok {
+					for _, itemValue := range contentArray {
+						item, ok := itemValue.(map[string]any)
+						if !ok {
+							continue
+						}
+						itemType, _ := jsonutil.String(item, "type")
+						switch itemType {
 						case "text":
 							partType := "input_text"
 							if role == "assistant" {
 								partType = "output_text"
 							}
-							part := `{}`
-							part, _ = sjson.Set(part, "type", partType)
-							part, _ = sjson.Set(part, "text", it.Get("text").String())
-							msg, _ = sjson.SetRaw(msg, "content.-1", part)
+							text, _ := jsonutil.String(item, "text")
+							contentParts = append(contentParts, map[string]any{
+								"type": partType,
+								"text": text,
+							})
 						case "image_url":
-							// Map image inputs to input_image for Responses API
-							if role == "user" {
-								part := `{}`
-								part, _ = sjson.Set(part, "type", "input_image")
-								if u := it.Get("image_url.url"); u.Exists() {
-									part, _ = sjson.Set(part, "image_url", u.String())
-								}
-								msg, _ = sjson.SetRaw(msg, "content.-1", part)
+							if role != "user" {
+								continue
 							}
+							imageURL := ""
+							if imageURLValue, ok := jsonutil.Object(item, "image_url"); ok {
+								imageURL, _ = jsonutil.String(imageURLValue, "url")
+							}
+							if imageURL == "" {
+								imageURL, _ = jsonutil.String(item, "image_url")
+							}
+							if imageURL == "" {
+								continue
+							}
+							contentParts = append(contentParts, map[string]any{
+								"type":      "input_image",
+								"image_url": imageURL,
+							})
 						case "file":
-							if role == "user" {
-								fileData := it.Get("file.file_data").String()
-								filename := it.Get("file.filename").String()
-								if fileData != "" {
-									part := `{}`
-									part, _ = sjson.Set(part, "type", "input_file")
-									part, _ = sjson.Set(part, "file_data", fileData)
-									if filename != "" {
-										part, _ = sjson.Set(part, "filename", filename)
-									}
-									msg, _ = sjson.SetRaw(msg, "content.-1", part)
-								}
+							if role != "user" {
+								continue
 							}
+							fileObject, ok := jsonutil.Object(item, "file")
+							if !ok {
+								continue
+							}
+							fileData, _ := jsonutil.String(fileObject, "file_data")
+							if fileData == "" {
+								continue
+							}
+							part := map[string]any{
+								"type":      "input_file",
+								"file_data": fileData,
+							}
+							if filename, ok := jsonutil.String(fileObject, "filename"); ok && filename != "" {
+								part["filename"] = filename
+							}
+							contentParts = append(contentParts, part)
 						}
 					}
 				}
 
-				// Don't emit empty assistant messages when only tool_calls
-				// are present — Responses API needs function_call items
-				// directly, otherwise call_id matching fails (#2132).
-				if role != "assistant" || len(gjson.Get(msg, "content").Array()) > 0 {
-					out, _ = sjson.SetRaw(out, "input.-1", msg)
+				messageItem["content"] = contentParts
+				if role != "assistant" || len(contentParts) > 0 {
+					inputItems = append(inputItems, messageItem)
 				}
 
-				// Handle tool calls for assistant messages as separate top-level objects
 				if role == "assistant" {
-					toolCalls := m.Get("tool_calls")
-					if toolCalls.Exists() && toolCalls.IsArray() {
-						toolCallsArr := toolCalls.Array()
-						for j := 0; j < len(toolCallsArr); j++ {
-							tc := toolCallsArr[j]
-							if tc.Get("type").String() == "function" {
-								// Create function_call as top-level object
-								funcCall := `{}`
-								funcCall, _ = sjson.Set(funcCall, "type", "function_call")
-								funcCall, _ = sjson.Set(funcCall, "call_id", tc.Get("id").String())
-								{
-									name := tc.Get("function.name").String()
-									if short, ok := originalToolNameMap[name]; ok {
-										name = short
-									} else {
-										name = shortenNameIfNeeded(name)
-									}
-									funcCall, _ = sjson.Set(funcCall, "name", name)
-								}
-								funcCall, _ = sjson.Set(funcCall, "arguments", tc.Get("function.arguments").String())
-								out, _ = sjson.SetRaw(out, "input.-1", funcCall)
+					if toolCalls, ok := jsonutil.Array(message, "tool_calls"); ok {
+						for _, toolCallValue := range toolCalls {
+							toolCall, ok := toolCallValue.(map[string]any)
+							if !ok {
+								continue
 							}
+							toolType, _ := jsonutil.String(toolCall, "type")
+							if toolType != "function" {
+								continue
+							}
+							function, ok := jsonutil.Object(toolCall, "function")
+							if !ok {
+								continue
+							}
+							name, _ := jsonutil.String(function, "name")
+							if short, ok := originalToolNameMap[name]; ok {
+								name = short
+							} else {
+								name = shortenNameIfNeeded(name)
+							}
+							arguments, _ := jsonutil.String(function, "arguments")
+							callID, _ := jsonutil.String(toolCall, "id")
+
+							inputItems = append(inputItems, map[string]any{
+								"type":      "function_call",
+								"call_id":   callID,
+								"name":      name,
+								"arguments": arguments,
+							})
 						}
 					}
 				}
 			}
 		}
 	}
+	outRoot["input"] = inputItems
 
-	// Map response_format and text settings to Responses API text.format
-	rf := gjson.GetBytes(rawJSON, "response_format")
-	text := gjson.GetBytes(rawJSON, "text")
-	if rf.Exists() {
-		// Always create text object when response_format provided
-		if !gjson.Get(out, "text").Exists() {
-			out, _ = sjson.SetRaw(out, "text", `{}`)
-		}
-
-		rft := rf.Get("type").String()
-		switch rft {
+	if responseFormat, ok := jsonutil.Object(root, "response_format"); ok {
+		textRoot := map[string]any{}
+		responseFormatType, _ := jsonutil.String(responseFormat, "type")
+		switch responseFormatType {
 		case "text":
-			out, _ = sjson.Set(out, "text.format.type", "text")
+			textRoot["format"] = map[string]any{"type": "text"}
 		case "json_schema":
-			js := rf.Get("json_schema")
-			if js.Exists() {
-				out, _ = sjson.Set(out, "text.format.type", "json_schema")
-				if v := js.Get("name"); v.Exists() {
-					out, _ = sjson.Set(out, "text.format.name", v.Value())
+			if jsonSchema, ok := jsonutil.Object(responseFormat, "json_schema"); ok {
+				format := map[string]any{"type": "json_schema"}
+				if value, ok := jsonutil.Get(jsonSchema, "name"); ok {
+					format["name"] = value
 				}
-				if v := js.Get("strict"); v.Exists() {
-					out, _ = sjson.Set(out, "text.format.strict", v.Value())
+				if value, ok := jsonutil.Get(jsonSchema, "strict"); ok {
+					format["strict"] = value
 				}
-				if v := js.Get("schema"); v.Exists() {
-					out, _ = sjson.SetRaw(out, "text.format.schema", v.Raw)
+				if value, ok := jsonutil.Get(jsonSchema, "schema"); ok {
+					format["schema"] = value
 				}
+				textRoot["format"] = format
 			}
 		}
-
-		// Map verbosity if provided
-		if text.Exists() {
-			if v := text.Get("verbosity"); v.Exists() {
-				out, _ = sjson.Set(out, "text.verbosity", v.Value())
+		if textConfig, ok := jsonutil.Object(root, "text"); ok {
+			if value, ok := jsonutil.Get(textConfig, "verbosity"); ok {
+				textRoot["verbosity"] = value
 			}
 		}
-	} else if text.Exists() {
-		// If only text.verbosity present (no response_format), map verbosity
-		if v := text.Get("verbosity"); v.Exists() {
-			if !gjson.Get(out, "text").Exists() {
-				out, _ = sjson.SetRaw(out, "text", `{}`)
-			}
-			out, _ = sjson.Set(out, "text.verbosity", v.Value())
+		if len(textRoot) > 0 {
+			outRoot["text"] = textRoot
+		}
+	} else if textConfig, ok := jsonutil.Object(root, "text"); ok {
+		if value, ok := jsonutil.Get(textConfig, "verbosity"); ok {
+			outRoot["text"] = map[string]any{"verbosity": value}
 		}
 	}
 
-	// Map tools (flatten function fields)
-	tools := gjson.GetBytes(rawJSON, "tools")
-	if tools.IsArray() && len(tools.Array()) > 0 {
-		out, _ = sjson.SetRaw(out, "tools", `[]`)
-		arr := tools.Array()
-		for i := 0; i < len(arr); i++ {
-			t := arr[i]
-			toolType := t.Get("type").String()
-			// Pass through built-in tools (e.g. {"type":"web_search"}) directly for the Responses API.
-			// Only "function" needs structural conversion because Chat Completions nests details under "function".
-			if toolType != "" && toolType != "function" && t.IsObject() {
-				out, _ = sjson.SetRaw(out, "tools.-1", t.Raw)
+	if tools, ok := jsonutil.Array(root, "tools"); ok && len(tools) > 0 {
+		outTools := make([]any, 0, len(tools))
+		for _, toolValue := range tools {
+			tool, ok := toolValue.(map[string]any)
+			if !ok {
 				continue
 			}
+			toolType, _ := jsonutil.String(tool, "type")
+			if toolType != "" && toolType != "function" {
+				outTools = append(outTools, tool)
+				continue
+			}
+			if toolType != "function" {
+				continue
+			}
+			function, ok := jsonutil.Object(tool, "function")
+			if !ok {
+				continue
+			}
+			item := map[string]any{
+				"type": "function",
+			}
+			if name, ok := jsonutil.String(function, "name"); ok && name != "" {
+				if short, ok := originalToolNameMap[name]; ok {
+					name = short
+				} else {
+					name = shortenNameIfNeeded(name)
+				}
+				item["name"] = name
+			}
+			if value, ok := jsonutil.Get(function, "description"); ok {
+				item["description"] = value
+			}
+			if value, ok := jsonutil.Get(function, "parameters"); ok {
+				item["parameters"] = value
+			}
+			if value, ok := jsonutil.Get(function, "strict"); ok {
+				item["strict"] = value
+			}
+			outTools = append(outTools, item)
+		}
+		if len(outTools) > 0 {
+			outRoot["tools"] = outTools
+		}
+	}
 
-			if toolType == "function" {
-				item := `{}`
-				item, _ = sjson.Set(item, "type", "function")
-				fn := t.Get("function")
-				if fn.Exists() {
-					if v := fn.Get("name"); v.Exists() {
-						name := v.String()
+	if toolChoiceValue, ok := jsonutil.Get(root, "tool_choice"); ok {
+		switch typed := toolChoiceValue.(type) {
+		case string:
+			outRoot["tool_choice"] = typed
+		case map[string]any:
+			toolChoiceType, _ := jsonutil.String(typed, "type")
+			if toolChoiceType == "function" {
+				choice := map[string]any{
+					"type": "function",
+				}
+				if function, ok := jsonutil.Object(typed, "function"); ok {
+					if name, ok := jsonutil.String(function, "name"); ok && name != "" {
 						if short, ok := originalToolNameMap[name]; ok {
 							name = short
 						} else {
 							name = shortenNameIfNeeded(name)
 						}
-						item, _ = sjson.Set(item, "name", name)
-					}
-					if v := fn.Get("description"); v.Exists() {
-						item, _ = sjson.Set(item, "description", v.Value())
-					}
-					if v := fn.Get("parameters"); v.Exists() {
-						item, _ = sjson.SetRaw(item, "parameters", v.Raw)
-					}
-					if v := fn.Get("strict"); v.Exists() {
-						item, _ = sjson.Set(item, "strict", v.Value())
+						choice["name"] = name
 					}
 				}
-				out, _ = sjson.SetRaw(out, "tools.-1", item)
+				outRoot["tool_choice"] = choice
+			} else if toolChoiceType != "" {
+				outRoot["tool_choice"] = typed
 			}
 		}
 	}
 
-	// Map tool_choice when present.
-	// Chat Completions: "tool_choice" can be a string ("auto"/"none") or an object (e.g. {"type":"function","function":{"name":"..."}}).
-	// Responses API: keep built-in tool choices as-is; flatten function choice to {"type":"function","name":"..."}.
-	if tc := gjson.GetBytes(rawJSON, "tool_choice"); tc.Exists() {
-		switch {
-		case tc.Type == gjson.String:
-			out, _ = sjson.Set(out, "tool_choice", tc.String())
-		case tc.IsObject():
-			tcType := tc.Get("type").String()
-			if tcType == "function" {
-				name := tc.Get("function.name").String()
-				if name != "" {
-					if short, ok := originalToolNameMap[name]; ok {
-						name = short
-					} else {
-						name = shortenNameIfNeeded(name)
-					}
-				}
-				choice := `{}`
-				choice, _ = sjson.Set(choice, "type", "function")
-				if name != "" {
-					choice, _ = sjson.Set(choice, "name", name)
-				}
-				out, _ = sjson.SetRaw(out, "tool_choice", choice)
-			} else if tcType != "" {
-				// Built-in tool choices (e.g. {"type":"web_search"}) are already Responses-compatible.
-				out, _ = sjson.SetRaw(out, "tool_choice", tc.Raw)
-			}
-		}
-	}
-
-	out, _ = sjson.Set(out, "store", false)
-	return []byte(out)
+	return jsonutil.MarshalOrOriginal(inputRawJSON, outRoot)
 }
 
 // shortenNameIfNeeded applies the simple shortening rule for a single name.

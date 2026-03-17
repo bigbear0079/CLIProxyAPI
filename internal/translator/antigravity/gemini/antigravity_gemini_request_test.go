@@ -4,11 +4,10 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/tidwall/gjson"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 )
 
 func TestConvertGeminiRequestToAntigravity_PreserveValidSignature(t *testing.T) {
-	// Valid signature on functionCall should be preserved
 	validSignature := "abc123validSignature1234567890123456789012345678901234567890"
 	inputJSON := []byte(fmt.Sprintf(`{
 		"model": "gemini-3-pro-preview",
@@ -23,22 +22,14 @@ func TestConvertGeminiRequestToAntigravity_PreserveValidSignature(t *testing.T) 
 	}`, validSignature))
 
 	output := ConvertGeminiRequestToAntigravity("gemini-3-pro-preview", inputJSON, false)
-	outputStr := string(output)
+	root := mustParseAntigravityGeminiObject(t, output)
 
-	// Check that valid thoughtSignature is preserved
-	parts := gjson.Get(outputStr, "request.contents.0.parts").Array()
-	if len(parts) != 1 {
-		t.Fatalf("Expected 1 part, got %d", len(parts))
-	}
-
-	sig := parts[0].Get("thoughtSignature").String()
-	if sig != validSignature {
-		t.Errorf("Expected thoughtSignature '%s', got '%s'", validSignature, sig)
+	if got, _ := jsonutil.String(root, "request.contents.0.parts.0.thoughtSignature"); got != validSignature {
+		t.Fatalf("thoughtSignature = %q, want %q", got, validSignature)
 	}
 }
 
 func TestConvertGeminiRequestToAntigravity_AddSkipSentinelToFunctionCall(t *testing.T) {
-	// functionCall without signature should get skip_thought_signature_validator
 	inputJSON := []byte(`{
 		"model": "gemini-3-pro-preview",
 		"contents": [
@@ -52,18 +43,14 @@ func TestConvertGeminiRequestToAntigravity_AddSkipSentinelToFunctionCall(t *test
 	}`)
 
 	output := ConvertGeminiRequestToAntigravity("gemini-3-pro-preview", inputJSON, false)
-	outputStr := string(output)
+	root := mustParseAntigravityGeminiObject(t, output)
 
-	// Check that skip_thought_signature_validator is added to functionCall
-	sig := gjson.Get(outputStr, "request.contents.0.parts.0.thoughtSignature").String()
-	expectedSig := "skip_thought_signature_validator"
-	if sig != expectedSig {
-		t.Errorf("Expected skip sentinel '%s', got '%s'", expectedSig, sig)
+	if got, _ := jsonutil.String(root, "request.contents.0.parts.0.thoughtSignature"); got != "skip_thought_signature_validator" {
+		t.Fatalf("thoughtSignature = %q, want %q", got, "skip_thought_signature_validator")
 	}
 }
 
 func TestConvertGeminiRequestToAntigravity_ParallelFunctionCalls(t *testing.T) {
-	// Multiple functionCalls should all get skip_thought_signature_validator
 	inputJSON := []byte(`{
 		"model": "gemini-3-pro-preview",
 		"contents": [
@@ -78,27 +65,20 @@ func TestConvertGeminiRequestToAntigravity_ParallelFunctionCalls(t *testing.T) {
 	}`)
 
 	output := ConvertGeminiRequestToAntigravity("gemini-3-pro-preview", inputJSON, false)
-	outputStr := string(output)
+	root := mustParseAntigravityGeminiObject(t, output)
 
-	parts := gjson.Get(outputStr, "request.contents.0.parts").Array()
-	if len(parts) != 2 {
-		t.Fatalf("Expected 2 parts, got %d", len(parts))
+	parts, ok := jsonutil.Array(root, "request.contents.0.parts")
+	if !ok || len(parts) != 2 {
+		t.Fatalf("request.contents.0.parts = (%d, %v), want (2, true)", len(parts), ok)
 	}
-
-	expectedSig := "skip_thought_signature_validator"
-	for i, part := range parts {
-		sig := part.Get("thoughtSignature").String()
-		if sig != expectedSig {
-			t.Errorf("Part %d: Expected '%s', got '%s'", i, expectedSig, sig)
+	for i := range parts {
+		if got, _ := jsonutil.String(root, fmt.Sprintf("request.contents.0.parts.%d.thoughtSignature", i)); got != "skip_thought_signature_validator" {
+			t.Fatalf("part %d thoughtSignature = %q, want %q", i, got, "skip_thought_signature_validator")
 		}
 	}
 }
 
 func TestFixCLIToolResponse_PreservesFunctionResponseParts(t *testing.T) {
-	// When functionResponse contains a "parts" field with inlineData (from Claude
-	// translator's image embedding), fixCLIToolResponse should preserve it as-is.
-	// parseFunctionResponseRaw returns response.Raw for valid JSON objects,
-	// so extra fields like "parts" survive the pipeline.
 	input := `{
 		"model": "claude-opus-4-6-thinking",
 		"request": {
@@ -134,47 +114,21 @@ func TestFixCLIToolResponse_PreservesFunctionResponseParts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fixCLIToolResponse failed: %v", err)
 	}
+	root := mustParseAntigravityGeminiString(t, result)
 
-	// Find the function response content (role=function)
-	contents := gjson.Get(result, "request.contents").Array()
-	var funcContent gjson.Result
-	for _, c := range contents {
-		if c.Get("role").String() == "function" {
-			funcContent = c
-			break
-		}
+	funcContent := findAntigravityGeminiContentByRole(t, root, "function")
+	if got, _ := jsonutil.String(funcContent, "parts.0.functionResponse.parts.0.inlineData.mimeType"); got != "image/png" {
+		t.Fatalf("inlineData.mimeType = %q, want %q", got, "image/png")
 	}
-	if !funcContent.Exists() {
-		t.Fatal("function role content should exist in output")
+	if got, _ := jsonutil.String(funcContent, "parts.0.functionResponse.parts.0.inlineData.data"); got != "iVBOR" {
+		t.Fatalf("inlineData.data = %q, want %q", got, "iVBOR")
 	}
-
-	// The functionResponse should be preserved with its parts field
-	funcResp := funcContent.Get("parts.0.functionResponse")
-	if !funcResp.Exists() {
-		t.Fatal("functionResponse should exist in output")
-	}
-
-	// Verify the parts field with inlineData is preserved
-	inlineParts := funcResp.Get("parts").Array()
-	if len(inlineParts) != 1 {
-		t.Fatalf("Expected 1 inlineData part in functionResponse.parts, got %d", len(inlineParts))
-	}
-	if inlineParts[0].Get("inlineData.mimeType").String() != "image/png" {
-		t.Errorf("Expected mimeType 'image/png', got '%s'", inlineParts[0].Get("inlineData.mimeType").String())
-	}
-	if inlineParts[0].Get("inlineData.data").String() != "iVBOR" {
-		t.Errorf("Expected data 'iVBOR', got '%s'", inlineParts[0].Get("inlineData.data").String())
-	}
-
-	// Verify response.result is also preserved
-	if funcResp.Get("response.result").String() != "Screenshot taken" {
-		t.Errorf("Expected response.result 'Screenshot taken', got '%s'", funcResp.Get("response.result").String())
+	if got, _ := jsonutil.String(funcContent, "parts.0.functionResponse.response.result"); got != "Screenshot taken" {
+		t.Fatalf("response.result = %q, want %q", got, "Screenshot taken")
 	}
 }
 
 func TestFixCLIToolResponse_BackfillsEmptyFunctionResponseName(t *testing.T) {
-	// When the Amp client sends functionResponse with an empty name,
-	// fixCLIToolResponse should backfill it from the corresponding functionCall.
 	input := `{
 		"model": "gemini-3-pro-preview",
 		"request": {
@@ -199,27 +153,15 @@ func TestFixCLIToolResponse_BackfillsEmptyFunctionResponseName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fixCLIToolResponse failed: %v", err)
 	}
+	root := mustParseAntigravityGeminiString(t, result)
+	funcContent := findAntigravityGeminiContentByRole(t, root, "function")
 
-	contents := gjson.Get(result, "request.contents").Array()
-	var funcContent gjson.Result
-	for _, c := range contents {
-		if c.Get("role").String() == "function" {
-			funcContent = c
-			break
-		}
-	}
-	if !funcContent.Exists() {
-		t.Fatal("function role content should exist in output")
-	}
-
-	name := funcContent.Get("parts.0.functionResponse.name").String()
-	if name != "Bash" {
-		t.Errorf("Expected backfilled name 'Bash', got '%s'", name)
+	if got, _ := jsonutil.String(funcContent, "parts.0.functionResponse.name"); got != "Bash" {
+		t.Fatalf("functionResponse.name = %q, want %q", got, "Bash")
 	}
 }
 
 func TestFixCLIToolResponse_BackfillsMultipleEmptyNames(t *testing.T) {
-	// Parallel function calls: both responses have empty names.
 	input := `{
 		"model": "gemini-3-pro-preview",
 		"request": {
@@ -246,36 +188,22 @@ func TestFixCLIToolResponse_BackfillsMultipleEmptyNames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fixCLIToolResponse failed: %v", err)
 	}
+	root := mustParseAntigravityGeminiString(t, result)
+	funcContent := findAntigravityGeminiContentByRole(t, root, "function")
 
-	contents := gjson.Get(result, "request.contents").Array()
-	var funcContent gjson.Result
-	for _, c := range contents {
-		if c.Get("role").String() == "function" {
-			funcContent = c
-			break
-		}
+	parts, ok := jsonutil.Array(funcContent, "parts")
+	if !ok || len(parts) != 2 {
+		t.Fatalf("parts = (%d, %v), want (2, true)", len(parts), ok)
 	}
-	if !funcContent.Exists() {
-		t.Fatal("function role content should exist in output")
+	if got, _ := jsonutil.String(funcContent, "parts.0.functionResponse.name"); got != "Read" {
+		t.Fatalf("parts.0.functionResponse.name = %q, want %q", got, "Read")
 	}
-
-	parts := funcContent.Get("parts").Array()
-	if len(parts) != 2 {
-		t.Fatalf("Expected 2 function response parts, got %d", len(parts))
-	}
-
-	name0 := parts[0].Get("functionResponse.name").String()
-	name1 := parts[1].Get("functionResponse.name").String()
-	if name0 != "Read" {
-		t.Errorf("Expected first response name 'Read', got '%s'", name0)
-	}
-	if name1 != "Grep" {
-		t.Errorf("Expected second response name 'Grep', got '%s'", name1)
+	if got, _ := jsonutil.String(funcContent, "parts.1.functionResponse.name"); got != "Grep" {
+		t.Fatalf("parts.1.functionResponse.name = %q, want %q", got, "Grep")
 	}
 }
 
 func TestFixCLIToolResponse_PreservesExistingName(t *testing.T) {
-	// When functionResponse already has a valid name, it should be preserved.
 	input := `{
 		"model": "gemini-3-pro-preview",
 		"request": {
@@ -300,27 +228,15 @@ func TestFixCLIToolResponse_PreservesExistingName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fixCLIToolResponse failed: %v", err)
 	}
+	root := mustParseAntigravityGeminiString(t, result)
+	funcContent := findAntigravityGeminiContentByRole(t, root, "function")
 
-	contents := gjson.Get(result, "request.contents").Array()
-	var funcContent gjson.Result
-	for _, c := range contents {
-		if c.Get("role").String() == "function" {
-			funcContent = c
-			break
-		}
-	}
-	if !funcContent.Exists() {
-		t.Fatal("function role content should exist in output")
-	}
-
-	name := funcContent.Get("parts.0.functionResponse.name").String()
-	if name != "Bash" {
-		t.Errorf("Expected preserved name 'Bash', got '%s'", name)
+	if got, _ := jsonutil.String(funcContent, "parts.0.functionResponse.name"); got != "Bash" {
+		t.Fatalf("functionResponse.name = %q, want %q", got, "Bash")
 	}
 }
 
 func TestFixCLIToolResponse_MoreResponsesThanCalls(t *testing.T) {
-	// If there are more function responses than calls, unmatched extras are discarded by grouping.
 	input := `{
 		"model": "gemini-3-pro-preview",
 		"request": {
@@ -346,28 +262,15 @@ func TestFixCLIToolResponse_MoreResponsesThanCalls(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fixCLIToolResponse failed: %v", err)
 	}
+	root := mustParseAntigravityGeminiString(t, result)
+	funcContent := findAntigravityGeminiContentByRole(t, root, "function")
 
-	contents := gjson.Get(result, "request.contents").Array()
-	var funcContent gjson.Result
-	for _, c := range contents {
-		if c.Get("role").String() == "function" {
-			funcContent = c
-			break
-		}
-	}
-	if !funcContent.Exists() {
-		t.Fatal("function role content should exist in output")
-	}
-
-	// First response should be backfilled from the call
-	name0 := funcContent.Get("parts.0.functionResponse.name").String()
-	if name0 != "Bash" {
-		t.Errorf("Expected first response name 'Bash', got '%s'", name0)
+	if got, _ := jsonutil.String(funcContent, "parts.0.functionResponse.name"); got != "Bash" {
+		t.Fatalf("functionResponse.name = %q, want %q", got, "Bash")
 	}
 }
 
 func TestFixCLIToolResponse_MultipleGroupsFIFO(t *testing.T) {
-	// Two sequential function call groups should be matched FIFO.
 	input := `{
 		"model": "gemini-3-pro-preview",
 		"request": {
@@ -404,24 +307,71 @@ func TestFixCLIToolResponse_MultipleGroupsFIFO(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fixCLIToolResponse failed: %v", err)
 	}
+	root := mustParseAntigravityGeminiString(t, result)
+	funcContents := findAntigravityGeminiContentsByRole(t, root, "function")
 
-	contents := gjson.Get(result, "request.contents").Array()
-	var funcContents []gjson.Result
-	for _, c := range contents {
-		if c.Get("role").String() == "function" {
-			funcContents = append(funcContents, c)
+	if len(funcContents) != 2 {
+		t.Fatalf("function content count = %d, want %d", len(funcContents), 2)
+	}
+	if got, _ := jsonutil.String(funcContents[0], "parts.0.functionResponse.name"); got != "Read" {
+		t.Fatalf("first group name = %q, want %q", got, "Read")
+	}
+	if got, _ := jsonutil.String(funcContents[1], "parts.0.functionResponse.name"); got != "Grep" {
+		t.Fatalf("second group name = %q, want %q", got, "Grep")
+	}
+}
+
+func mustParseAntigravityGeminiObject(t *testing.T, payload []byte) map[string]any {
+	t.Helper()
+
+	root, errParse := jsonutil.ParseObjectBytes(payload)
+	if errParse != nil {
+		t.Fatalf("ParseObjectBytes returned error: %v\npayload: %s", errParse, string(payload))
+	}
+	return root
+}
+
+func mustParseAntigravityGeminiString(t *testing.T, payload string) map[string]any {
+	t.Helper()
+	return mustParseAntigravityGeminiObject(t, []byte(payload))
+}
+
+func findAntigravityGeminiContentByRole(t *testing.T, root map[string]any, role string) map[string]any {
+	t.Helper()
+
+	contents, ok := jsonutil.Array(root, "request.contents")
+	if !ok {
+		t.Fatalf("request.contents missing in output: %#v", root)
+	}
+	for _, contentValue := range contents {
+		content, ok := contentValue.(map[string]any)
+		if !ok {
+			continue
+		}
+		if gotRole, _ := jsonutil.String(content, "role"); gotRole == role {
+			return content
 		}
 	}
-	if len(funcContents) != 2 {
-		t.Fatalf("Expected 2 function contents, got %d", len(funcContents))
-	}
+	t.Fatalf("content with role %q not found in output: %#v", role, contents)
+	return nil
+}
 
-	name0 := funcContents[0].Get("parts.0.functionResponse.name").String()
-	name1 := funcContents[1].Get("parts.0.functionResponse.name").String()
-	if name0 != "Read" {
-		t.Errorf("Expected first group name 'Read', got '%s'", name0)
+func findAntigravityGeminiContentsByRole(t *testing.T, root map[string]any, role string) []map[string]any {
+	t.Helper()
+
+	contents, ok := jsonutil.Array(root, "request.contents")
+	if !ok {
+		t.Fatalf("request.contents missing in output: %#v", root)
 	}
-	if name1 != "Grep" {
-		t.Errorf("Expected second group name 'Grep', got '%s'", name1)
+	matches := make([]map[string]any, 0)
+	for _, contentValue := range contents {
+		content, ok := contentValue.(map[string]any)
+		if !ok {
+			continue
+		}
+		if gotRole, _ := jsonutil.String(content, "role"); gotRole == role {
+			matches = append(matches, content)
+		}
 	}
+	return matches
 }

@@ -1,8 +1,6 @@
 package thinking
 
-import (
-	"github.com/tidwall/gjson"
-)
+import "encoding/json"
 
 // GetThinkingText extracts the thinking text from a content part.
 // Handles various formats:
@@ -10,32 +8,48 @@ import (
 // - Wrapped object: { "thinking": { "text": "text", "cache_control": {...} } }
 // - Gemini-style: { "thought": true, "text": "text" }
 // Returns the extracted text string.
-func GetThinkingText(part gjson.Result) string {
+func GetThinkingText(part any) string {
+	partObj, ok := part.(map[string]any)
+	if !ok {
+		return ""
+	}
+
 	// Try direct text field first (Gemini-style)
-	if text := part.Get("text"); text.Exists() && text.Type == gjson.String {
-		return text.String()
+	if text, okText := stringifyThinkingValue(partObj["text"]); okText {
+		return text
 	}
 
 	// Try thinking field
-	thinkingField := part.Get("thinking")
-	if !thinkingField.Exists() {
+	thinkingField, exists := partObj["thinking"]
+	if !exists {
 		return ""
 	}
 
 	// thinking is a string
-	if thinkingField.Type == gjson.String {
-		return thinkingField.String()
+	if text, okText := stringifyThinkingValue(thinkingField); okText {
+		return text
 	}
 
 	// thinking is an object with inner text/thinking
-	if thinkingField.IsObject() {
-		if inner := thinkingField.Get("text"); inner.Exists() && inner.Type == gjson.String {
-			return inner.String()
+	if thinkingObj, okThinkingObj := thinkingField.(map[string]any); okThinkingObj {
+		if inner, okInner := stringifyThinkingValue(thinkingObj["text"]); okInner {
+			return inner
 		}
-		if inner := thinkingField.Get("thinking"); inner.Exists() && inner.Type == gjson.String {
-			return inner.String()
+		if inner, okInner := stringifyThinkingValue(thinkingObj["thinking"]); okInner {
+			return inner
 		}
 	}
 
 	return ""
+}
+
+func stringifyThinkingValue(value any) (string, bool) {
+	switch typed := value.(type) {
+	case string:
+		return typed, true
+	case json.Number:
+		return typed.String(), true
+	default:
+		return "", false
+	}
 }

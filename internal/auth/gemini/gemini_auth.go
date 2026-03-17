@@ -11,16 +11,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/browser"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -161,9 +162,14 @@ func (g *GeminiAuth) createTokenStorage(ctx context.Context, config *oauth2.Conf
 		return nil, fmt.Errorf("get user info request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
-	emailResult := gjson.GetBytes(bodyBytes, "email")
-	if emailResult.Exists() && emailResult.Type == gjson.String {
-		fmt.Printf("Authenticated user email: %s\n", emailResult.String())
+	bodyRoot, errParse := jsonutil.ParseObjectBytes(bodyBytes)
+	email, okEmail := "", false
+	if errParse == nil {
+		emailValue, _ := bodyRoot["email"]
+		email, okEmail = emailValue.(string)
+	}
+	if okEmail && strings.TrimSpace(email) != "" {
+		fmt.Printf("Authenticated user email: %s\n", email)
 	} else {
 		fmt.Println("Failed to get user email from token")
 	}
@@ -184,7 +190,7 @@ func (g *GeminiAuth) createTokenStorage(ctx context.Context, config *oauth2.Conf
 	ts := GeminiTokenStorage{
 		Token:     ifToken,
 		ProjectID: projectID,
-		Email:     emailResult.String(),
+		Email:     email,
 	}
 
 	return &ts, nil

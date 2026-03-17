@@ -29,13 +29,13 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
@@ -328,23 +328,35 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 			// Read file to get type field
 			full := filepath.Join(h.cfg.AuthDir, name)
 			if data, errRead := os.ReadFile(full); errRead == nil {
-				typeValue := gjson.GetBytes(data, "type").String()
-				emailValue := gjson.GetBytes(data, "email").String()
-				fileData["type"] = typeValue
-				fileData["email"] = emailValue
-				if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
-					switch pv.Type {
-					case gjson.Number:
-						fileData["priority"] = int(pv.Int())
-					case gjson.String:
-						if parsed, errAtoi := strconv.Atoi(strings.TrimSpace(pv.String())); errAtoi == nil {
-							fileData["priority"] = parsed
+				if root, errParse := jsonutil.ParseObjectBytes(data); errParse == nil {
+					if typeValue, ok := jsonutil.Get(root, "type"); ok {
+						if typeString, okType := typeValue.(string); okType {
+							fileData["type"] = typeString
 						}
 					}
-				}
-				if nv := gjson.GetBytes(data, "note"); nv.Exists() && nv.Type == gjson.String {
-					if trimmed := strings.TrimSpace(nv.String()); trimmed != "" {
-						fileData["note"] = trimmed
+					if emailValue, ok := jsonutil.Get(root, "email"); ok {
+						if emailString, okEmail := emailValue.(string); okEmail {
+							fileData["email"] = emailString
+						}
+					}
+					if priorityValue, ok := jsonutil.Get(root, "priority"); ok {
+						switch typed := priorityValue.(type) {
+						case json.Number:
+							if parsed, errInt := typed.Int64(); errInt == nil {
+								fileData["priority"] = int(parsed)
+							}
+						case string:
+							if parsed, errAtoi := strconv.Atoi(strings.TrimSpace(typed)); errAtoi == nil {
+								fileData["priority"] = parsed
+							}
+						}
+					}
+					if noteValue, ok := jsonutil.Get(root, "note"); ok {
+						if noteString, okNote := noteValue.(string); okNote {
+							if trimmed := strings.TrimSpace(noteString); trimmed != "" {
+								fileData["note"] = trimmed
+							}
+						}
 					}
 				}
 			}
@@ -1325,7 +1337,14 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 			return
 		}
 
-		email := gjson.GetBytes(bodyBytes, "email").String()
+		email := ""
+		if root, errParse := jsonutil.ParseObjectBytes(bodyBytes); errParse == nil {
+			if emailValue, ok := jsonutil.Get(root, "email"); ok {
+				if emailString, okEmail := emailValue.(string); okEmail {
+					email = emailString
+				}
+			}
+		}
 		if email != "" {
 			fmt.Printf("Authenticated user email: %s\n", email)
 		} else {
@@ -2465,9 +2484,13 @@ func checkCloudAPIIsEnabled(ctx context.Context, httpClient *http.Client, projec
 
 		if resp.StatusCode == http.StatusOK {
 			bodyBytes, _ := io.ReadAll(resp.Body)
-			if gjson.GetBytes(bodyBytes, "state").String() == "ENABLED" {
-				_ = resp.Body.Close()
-				continue
+			if root, errParse := jsonutil.ParseObjectBytes(bodyBytes); errParse == nil {
+				if stateValue, ok := jsonutil.Get(root, "state"); ok {
+					if stateString, okState := stateValue.(string); okState && stateString == "ENABLED" {
+						_ = resp.Body.Close()
+						continue
+					}
+				}
 			}
 		}
 		_ = resp.Body.Close()
@@ -2486,9 +2509,12 @@ func checkCloudAPIIsEnabled(ctx context.Context, httpClient *http.Client, projec
 
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		errMessage := string(bodyBytes)
-		errMessageResult := gjson.GetBytes(bodyBytes, "error.message")
-		if errMessageResult.Exists() {
-			errMessage = errMessageResult.String()
+		if root, errParse := jsonutil.ParseObjectBytes(bodyBytes); errParse == nil {
+			if errValue, ok := jsonutil.Get(root, "error.message"); ok {
+				if errString, okString := errValue.(string); okString && errString != "" {
+					errMessage = errString
+				}
+			}
 		}
 		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
 			_ = resp.Body.Close()

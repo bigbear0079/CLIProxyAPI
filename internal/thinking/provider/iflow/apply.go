@@ -11,10 +11,9 @@ package iflow
 import (
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // Applier implements thinking.ProviderApplier for iFlow models.
@@ -112,22 +111,18 @@ func configToBoolean(config thinking.ThinkingConfig) bool {
 // Note: clear_thinking is only set for GLM models when thinking is enabled.
 func applyEnableThinking(body []byte, config thinking.ThinkingConfig, setClearThinking bool) []byte {
 	enableThinking := configToBoolean(config)
-
-	if len(body) == 0 || !gjson.ValidBytes(body) {
-		body = []byte(`{}`)
-	}
-
-	result, _ := sjson.SetBytes(body, "chat_template_kwargs.enable_thinking", enableThinking)
+	root := jsonutil.ParseObjectBytesOrEmpty(body)
 
 	// clear_thinking is a GLM-only knob, strip it for other models.
-	result, _ = sjson.DeleteBytes(result, "chat_template_kwargs.clear_thinking")
+	_ = jsonutil.Set(root, "chat_template_kwargs.enable_thinking", enableThinking)
+	_ = jsonutil.Delete(root, "chat_template_kwargs.clear_thinking")
 
 	// clear_thinking only needed when thinking is enabled
 	if enableThinking && setClearThinking {
-		result, _ = sjson.SetBytes(result, "chat_template_kwargs.clear_thinking", false)
+		_ = jsonutil.Set(root, "chat_template_kwargs.clear_thinking", false)
 	}
 
-	return result
+	return jsonutil.MarshalOrOriginal(body, root)
 }
 
 // applyMiniMax applies thinking configuration for MiniMax models.
@@ -137,14 +132,9 @@ func applyEnableThinking(body []byte, config thinking.ThinkingConfig, setClearTh
 //	{"reasoning_split": true/false}
 func applyMiniMax(body []byte, config thinking.ThinkingConfig) []byte {
 	reasoningSplit := configToBoolean(config)
-
-	if len(body) == 0 || !gjson.ValidBytes(body) {
-		body = []byte(`{}`)
-	}
-
-	result, _ := sjson.SetBytes(body, "reasoning_split", reasoningSplit)
-
-	return result
+	root := jsonutil.ParseObjectBytesOrEmpty(body)
+	_ = jsonutil.Set(root, "reasoning_split", reasoningSplit)
+	return jsonutil.MarshalOrOriginal(body, root)
 }
 
 // isEnableThinkingModel determines if the model uses chat_template_kwargs.enable_thinking format.

@@ -1,6 +1,7 @@
 package amp
 
 import (
+	"encoding/json"
 	"testing"
 )
 
@@ -11,9 +12,7 @@ func TestRewriteModelInResponse_TopLevel(t *testing.T) {
 	result := rw.rewriteModelInResponse(input)
 
 	expected := `{"id":"resp_1","model":"gpt-5.2-codex","output":[]}`
-	if string(result) != expected {
-		t.Errorf("expected %s, got %s", expected, string(result))
-	}
+	assertJSONEqual(t, result, []byte(expected))
 }
 
 func TestRewriteModelInResponse_ResponseModel(t *testing.T) {
@@ -23,9 +22,7 @@ func TestRewriteModelInResponse_ResponseModel(t *testing.T) {
 	result := rw.rewriteModelInResponse(input)
 
 	expected := `{"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.2-codex","status":"completed"}}`
-	if string(result) != expected {
-		t.Errorf("expected %s, got %s", expected, string(result))
-	}
+	assertJSONEqual(t, result, []byte(expected))
 }
 
 func TestRewriteModelInResponse_ResponseCreated(t *testing.T) {
@@ -35,9 +32,7 @@ func TestRewriteModelInResponse_ResponseCreated(t *testing.T) {
 	result := rw.rewriteModelInResponse(input)
 
 	expected := `{"type":"response.created","response":{"id":"resp_1","model":"gpt-5.2-codex","status":"in_progress"}}`
-	if string(result) != expected {
-		t.Errorf("expected %s, got %s", expected, string(result))
-	}
+	assertJSONEqual(t, result, []byte(expected))
 }
 
 func TestRewriteModelInResponse_NoModelField(t *testing.T) {
@@ -69,9 +64,10 @@ func TestRewriteStreamChunk_SSEWithResponseModel(t *testing.T) {
 	result := rw.rewriteStreamChunk(chunk)
 
 	expected := "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.2-codex\",\"status\":\"completed\"}}\n\n"
-	if string(result) != expected {
-		t.Errorf("expected %s, got %s", expected, string(result))
+	if string(result[:6]) != "data: " {
+		t.Fatalf("expected SSE prefix, got %s", string(result))
 	}
+	assertJSONEqual(t, bytesBetween(result, []byte("data: "), []byte("\n\n")), bytesBetween([]byte(expected), []byte("data: "), []byte("\n\n")))
 }
 
 func TestRewriteStreamChunk_MultipleEvents(t *testing.T) {
@@ -95,9 +91,7 @@ func TestRewriteStreamChunk_MessageModel(t *testing.T) {
 	result := rw.rewriteStreamChunk(chunk)
 
 	expected := "data: {\"message\":{\"model\":\"claude-opus-4.5\",\"role\":\"assistant\"}}\n\n"
-	if string(result) != expected {
-		t.Errorf("expected %s, got %s", expected, string(result))
-	}
+	assertJSONEqual(t, bytesBetween(result, []byte("data: "), []byte("\n\n")), bytesBetween([]byte(expected), []byte("data: "), []byte("\n\n")))
 }
 
 func contains(data, substr []byte) bool {
@@ -107,4 +101,46 @@ func contains(data, substr []byte) bool {
 		}
 	}
 	return false
+}
+
+func bytesBetween(data, prefix, suffix []byte) []byte {
+	start := 0
+	if len(prefix) > 0 {
+		start = len(prefix)
+	}
+	end := len(data)
+	if len(suffix) > 0 {
+		end -= len(suffix)
+	}
+	if start > end {
+		return nil
+	}
+	return data[start:end]
+}
+
+func assertJSONEqual(t *testing.T, got, want []byte) {
+	t.Helper()
+
+	var gotValue any
+	if err := json.Unmarshal(got, &gotValue); err != nil {
+		t.Fatalf("json.Unmarshal got error: %v; payload=%s", err, string(got))
+	}
+
+	var wantValue any
+	if err := json.Unmarshal(want, &wantValue); err != nil {
+		t.Fatalf("json.Unmarshal want error: %v; payload=%s", err, string(want))
+	}
+
+	gotJSON, errGot := json.Marshal(gotValue)
+	if errGot != nil {
+		t.Fatalf("json.Marshal got error: %v", errGot)
+	}
+	wantJSON, errWant := json.Marshal(wantValue)
+	if errWant != nil {
+		t.Fatalf("json.Marshal want error: %v", errWant)
+	}
+
+	if string(gotJSON) != string(wantJSON) {
+		t.Fatalf("expected %s, got %s", string(wantJSON), string(gotJSON))
+	}
 }

@@ -6,9 +6,8 @@
 package geminiCLI
 
 import (
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/codex/gemini"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // ConvertGeminiCLIRequestToCodex parses and transforms a Gemini CLI API request into Codex API format.
@@ -28,14 +27,20 @@ import (
 // Returns:
 //   - []byte: The transformed request data in Codex API format
 func ConvertGeminiCLIRequestToCodex(modelName string, inputRawJSON []byte, stream bool) []byte {
-	rawJSON := inputRawJSON
-
-	rawJSON = []byte(gjson.GetBytes(rawJSON, "request").Raw)
-	rawJSON, _ = sjson.SetBytes(rawJSON, "model", modelName)
-	if gjson.GetBytes(rawJSON, "systemInstruction").Exists() {
-		rawJSON, _ = sjson.SetRawBytes(rawJSON, "system_instruction", []byte(gjson.GetBytes(rawJSON, "systemInstruction").Raw))
-		rawJSON, _ = sjson.DeleteBytes(rawJSON, "systemInstruction")
+	root, errParse := jsonutil.ParseObjectBytes(inputRawJSON)
+	if errParse != nil {
+		return ConvertGeminiRequestToCodex(modelName, inputRawJSON, stream)
 	}
+	requestRoot, ok := jsonutil.Object(root, "request")
+	if !ok {
+		return ConvertGeminiRequestToCodex(modelName, inputRawJSON, stream)
+	}
+	requestRoot["model"] = modelName
+	if systemInstruction, ok := requestRoot["systemInstruction"]; ok {
+		requestRoot["system_instruction"] = systemInstruction
+		delete(requestRoot, "systemInstruction")
+	}
+	rawJSON := jsonutil.MarshalOrOriginal(inputRawJSON, requestRoot)
 
 	return ConvertGeminiRequestToCodex(modelName, rawJSON, stream)
 }

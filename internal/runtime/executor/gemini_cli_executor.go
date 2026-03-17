@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/geminicli"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -25,8 +26,6 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
@@ -542,7 +541,7 @@ func (e *GeminiCLIExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.
 		}
 		appendAPIResponseChunk(ctx, e.cfg, data)
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			count := gjson.GetBytes(data, "totalTokens").Int()
+			count, _ := jsonInt64FieldBytes(data, "totalTokens")
 			translated := sdktranslator.TranslateTokenCount(respCtx, to, from, count, data)
 			return cliproxyexecutor.Response{Payload: []byte(translated), Headers: resp.Header.Clone()}, nil
 		}
@@ -766,70 +765,86 @@ func cliPreviewFallbackOrder(model string) []string {
 	}
 }
 
-// setJSONField sets a top-level JSON field on a byte slice payload via sjson.
+// setJSONField sets a top-level JSON field on a byte slice payload.
 func setJSONField(body []byte, key, value string) []byte {
 	if key == "" {
 		return body
 	}
-	updated, err := sjson.SetBytes(body, key, value)
-	if err != nil {
-		return body
-	}
-	return updated
+	return setJSONFieldBytes(body, key, value)
 }
 
-// deleteJSONField removes a top-level key if present (best-effort) via sjson.
+// deleteJSONField removes a top-level key if present (best-effort).
 func deleteJSONField(body []byte, key string) []byte {
 	if key == "" || len(body) == 0 {
 		return body
 	}
-	updated, err := sjson.DeleteBytes(body, key)
-	if err != nil {
-		return body
-	}
-	return updated
+	return deleteJSONFieldBytes(body, key)
 }
 
 func fixGeminiCLIImageAspectRatio(modelName string, rawJSON []byte) []byte {
-	if modelName == "gemini-2.5-flash-image-preview" {
-		aspectRatioResult := gjson.GetBytes(rawJSON, "request.generationConfig.imageConfig.aspectRatio")
-		if aspectRatioResult.Exists() {
-			contents := gjson.GetBytes(rawJSON, "request.contents")
-			contentArray := contents.Array()
-			if len(contentArray) > 0 {
-				hasInlineData := false
-			loopContent:
-				for i := 0; i < len(contentArray); i++ {
-					parts := contentArray[i].Get("parts").Array()
-					for j := 0; j < len(parts); j++ {
-						if parts[j].Get("inlineData").Exists() {
-							hasInlineData = true
-							break loopContent
-						}
-					}
+	if modelName != "gemini-2.5-flash-image-preview" {
+		return rawJSON
+	}
+	root, errParse := jsonutil.ParseObjectBytes(rawJSON)
+	if errParse != nil {
+		return rawJSON
+	}
+	aspectRatio := jsonStringField(root, "request.generationConfig.imageConfig.aspectRatio")
+	if aspectRatio == "" {
+		return rawJSON
+	}
+	contentsValue, okContents := jsonutil.Get(root, "request.contents")
+	if okContents {
+		contentArray, okArray := contentsValue.([]any)
+		if okArray && len(contentArray) > 0 {
+			hasInlineData := false
+		loopContent:
+			for i := range contentArray {
+				content, okContent := contentArray[i].(map[string]any)
+				if !okContent {
+					continue
 				}
-
-				if !hasInlineData {
-					emptyImageBase64ed, _ := util.CreateWhiteImageBase64(aspectRatioResult.String())
-					emptyImagePart := `{"inlineData":{"mime_type":"image/png","data":""}}`
-					emptyImagePart, _ = sjson.Set(emptyImagePart, "inlineData.data", emptyImageBase64ed)
-					newPartsJson := `[]`
-					newPartsJson, _ = sjson.SetRaw(newPartsJson, "-1", `{"text": "Based on the following requirements, create an image within the uploaded picture. The new content *MUST* completely cover the entire area of the original picture, maintaining its exact proportions, and *NO* blank areas should appear."}`)
-					newPartsJson, _ = sjson.SetRaw(newPartsJson, "-1", emptyImagePart)
-
-					parts := contentArray[0].Get("parts").Array()
-					for j := 0; j < len(parts); j++ {
-						newPartsJson, _ = sjson.SetRaw(newPartsJson, "-1", parts[j].Raw)
+				partsValue, okParts := content["parts"].([]any)
+				if !okParts {
+					continue
+				}
+				for j := range partsValue {
+					part, okPart := partsValue[j].(map[string]any)
+					if !okPart {
+						continue
 					}
-
-					rawJSON, _ = sjson.SetRawBytes(rawJSON, "request.contents.0.parts", []byte(newPartsJson))
-					rawJSON, _ = sjson.SetRawBytes(rawJSON, "request.generationConfig.responseModalities", []byte(`["IMAGE", "TEXT"]`))
+					if _, okInline := part["inlineData"]; okInline {
+						hasInlineData = true
+						break loopContent
+					}
 				}
 			}
-			rawJSON, _ = sjson.DeleteBytes(rawJSON, "request.generationConfig.imageConfig")
+
+			if !hasInlineData {
+				emptyImageBase64ed, _ := util.CreateWhiteImageBase64(aspectRatio)
+				if firstContent, okFirst := contentArray[0].(map[string]any); okFirst {
+					if partsValue, okParts := firstContent["parts"].([]any); okParts {
+						newParts := []any{
+							map[string]any{
+								"text": "Based on the following requirements, create an image within the uploaded picture. The new content *MUST* completely cover the entire area of the original picture, maintaining its exact proportions, and *NO* blank areas should appear.",
+							},
+							map[string]any{
+								"inlineData": map[string]any{
+									"mime_type": "image/png",
+									"data":      emptyImageBase64ed,
+								},
+							},
+						}
+						newParts = append(newParts, partsValue...)
+						firstContent["parts"] = newParts
+						_ = jsonutil.Set(root, "request.generationConfig.responseModalities", []any{"IMAGE", "TEXT"})
+					}
+				}
+			}
 		}
 	}
-	return rawJSON
+	_ = jsonutil.Delete(root, "request.generationConfig.imageConfig")
+	return jsonutil.MarshalOrOriginal(rawJSON, root)
 }
 
 func newGeminiStatusErr(statusCode int, body []byte) statusErr {
@@ -846,34 +861,48 @@ func newGeminiStatusErr(statusCode int, body []byte) statusErr {
 // The error response contains a RetryInfo.retryDelay field in the format "0.847655010s".
 // Returns the parsed duration or an error if it cannot be determined.
 func parseRetryDelay(errorBody []byte) (*time.Duration, error) {
+	root, errParse := jsonutil.ParseObjectBytes(errorBody)
+	if errParse != nil {
+		return nil, fmt.Errorf("no RetryInfo found")
+	}
 	// Try to parse the retryDelay from the error response
 	// Format: error.details[].retryDelay where @type == "type.googleapis.com/google.rpc.RetryInfo"
-	details := gjson.GetBytes(errorBody, "error.details")
-	if details.Exists() && details.IsArray() {
-		for _, detail := range details.Array() {
-			typeVal := detail.Get("@type").String()
-			if typeVal == "type.googleapis.com/google.rpc.RetryInfo" {
-				retryDelay := detail.Get("retryDelay").String()
-				if retryDelay != "" {
-					// Parse duration string like "0.847655010s"
-					duration, err := time.ParseDuration(retryDelay)
-					if err != nil {
-						return nil, fmt.Errorf("failed to parse duration")
+	detailsValue, okDetails := jsonutil.Get(root, "error.details")
+	if okDetails {
+		if details, okArray := detailsValue.([]any); okArray {
+			for _, detailValue := range details {
+				detail, okDetail := detailValue.(map[string]any)
+				if !okDetail {
+					continue
+				}
+				typeVal := jsonStringField(detail, "@type")
+				if typeVal == "type.googleapis.com/google.rpc.RetryInfo" {
+					retryDelay := jsonStringField(detail, "retryDelay")
+					if retryDelay != "" {
+						// Parse duration string like "0.847655010s"
+						duration, err := time.ParseDuration(retryDelay)
+						if err != nil {
+							return nil, fmt.Errorf("failed to parse duration")
+						}
+						return &duration, nil
 					}
-					return &duration, nil
 				}
 			}
-		}
 
-		// Fallback: try ErrorInfo.metadata.quotaResetDelay (e.g., "373.801628ms")
-		for _, detail := range details.Array() {
-			typeVal := detail.Get("@type").String()
-			if typeVal == "type.googleapis.com/google.rpc.ErrorInfo" {
-				quotaResetDelay := detail.Get("metadata.quotaResetDelay").String()
-				if quotaResetDelay != "" {
-					duration, err := time.ParseDuration(quotaResetDelay)
-					if err == nil {
-						return &duration, nil
+			// Fallback: try ErrorInfo.metadata.quotaResetDelay (e.g., "373.801628ms")
+			for _, detailValue := range details {
+				detail, okDetail := detailValue.(map[string]any)
+				if !okDetail {
+					continue
+				}
+				typeVal := jsonStringField(detail, "@type")
+				if typeVal == "type.googleapis.com/google.rpc.ErrorInfo" {
+					quotaResetDelay := jsonStringField(detail, "metadata.quotaResetDelay")
+					if quotaResetDelay != "" {
+						duration, err := time.ParseDuration(quotaResetDelay)
+						if err == nil {
+							return &duration, nil
+						}
 					}
 				}
 			}
@@ -881,13 +910,14 @@ func parseRetryDelay(errorBody []byte) (*time.Duration, error) {
 	}
 
 	// Fallback: parse from error.message "Your quota will reset after Xs."
-	message := gjson.GetBytes(errorBody, "error.message").String()
+	message := jsonStringField(root, "error.message")
 	if message != "" {
 		re := regexp.MustCompile(`after\s+(\d+)s\.?`)
 		if matches := re.FindStringSubmatch(message); len(matches) > 1 {
 			seconds, err := strconv.Atoi(matches[1])
 			if err == nil {
-				return new(time.Duration(seconds) * time.Second), nil
+				duration := time.Duration(seconds) * time.Second
+				return &duration, nil
 			}
 		}
 	}

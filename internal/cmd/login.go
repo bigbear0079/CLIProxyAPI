@@ -20,11 +20,11 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/gemini"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 )
 
 const (
@@ -634,7 +634,7 @@ func checkCloudAPIIsEnabled(ctx context.Context, httpClient *http.Client, projec
 
 		if resp.StatusCode == http.StatusOK {
 			bodyBytes, _ := io.ReadAll(resp.Body)
-			if gjson.GetBytes(bodyBytes, "state").String() == "ENABLED" {
+			if bodyRoot, errParse := jsonutil.ParseObjectBytes(bodyBytes); errParse == nil && strings.EqualFold(jsonValueString(bodyRoot["state"]), "ENABLED") {
 				_ = resp.Body.Close()
 				continue
 			}
@@ -655,9 +655,12 @@ func checkCloudAPIIsEnabled(ctx context.Context, httpClient *http.Client, projec
 
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		errMessage := string(bodyBytes)
-		errMessageResult := gjson.GetBytes(bodyBytes, "error.message")
-		if errMessageResult.Exists() {
-			errMessage = errMessageResult.String()
+		if bodyRoot, errParse := jsonutil.ParseObjectBytes(bodyBytes); errParse == nil {
+			if errorValue, okError := jsonutil.Get(bodyRoot, "error.message"); okError {
+				if errorMessage := jsonValueString(errorValue); errorMessage != "" {
+					errMessage = errorMessage
+				}
+			}
 		}
 		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
 			_ = resp.Body.Close()
@@ -672,6 +675,17 @@ func checkCloudAPIIsEnabled(ctx context.Context, httpClient *http.Client, projec
 		return false, fmt.Errorf("project activation required: %s", errMessage)
 	}
 	return true, nil
+}
+
+func jsonValueString(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case json.Number:
+		return typed.String()
+	default:
+		return fmt.Sprint(typed)
+	}
 }
 
 func updateAuthRecord(record *cliproxyauth.Auth, storage *gemini.GeminiTokenStorage) {

@@ -24,6 +24,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
@@ -31,8 +32,6 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 const (
@@ -539,13 +538,13 @@ attemptLoop:
 }
 
 func (e *AntigravityExecutor) convertStreamToNonStream(stream []byte) []byte {
-	responseTemplate := ""
+	var responseTemplate map[string]any
 	var traceID string
 	var finishReason string
 	var modelVersion string
 	var responseID string
 	var role string
-	var usageRaw string
+	var usageValue map[string]any
 	parts := make([]map[string]interface{}, 0)
 	var pendingKind string
 	var pendingText strings.Builder
@@ -584,21 +583,24 @@ func (e *AntigravityExecutor) convertStreamToNonStream(stream []byte) []byte {
 		pendingThoughtSig = ""
 	}
 
-	normalizePart := func(partResult gjson.Result) map[string]interface{} {
+	normalizePart := func(part map[string]any) map[string]interface{} {
 		var m map[string]interface{}
-		_ = json.Unmarshal([]byte(partResult.Raw), &m)
+		partBytes, errMarshal := json.Marshal(part)
+		if errMarshal == nil {
+			_ = json.Unmarshal(partBytes, &m)
+		}
 		if m == nil {
 			m = map[string]interface{}{}
 		}
-		sig := partResult.Get("thoughtSignature").String()
+		sig, _ := jsonutil.String(part, "thoughtSignature")
 		if sig == "" {
-			sig = partResult.Get("thought_signature").String()
+			sig, _ = jsonutil.String(part, "thought_signature")
 		}
 		if sig != "" {
 			m["thoughtSignature"] = sig
 			delete(m, "thought_signature")
 		}
-		if inlineData, ok := m["inline_data"]; ok {
+		if inlineData, ok := part["inline_data"]; ok {
 			m["inlineData"] = inlineData
 			delete(m, "inline_data")
 		}
@@ -607,55 +609,62 @@ func (e *AntigravityExecutor) convertStreamToNonStream(stream []byte) []byte {
 
 	for _, line := range bytes.Split(stream, []byte("\n")) {
 		trimmed := bytes.TrimSpace(line)
-		if len(trimmed) == 0 || !gjson.ValidBytes(trimmed) {
+		if len(trimmed) == 0 {
 			continue
 		}
 
-		root := gjson.ParseBytes(trimmed)
-		responseNode := root.Get("response")
-		if !responseNode.Exists() {
-			if root.Get("candidates").Exists() {
+		root, errParse := jsonutil.ParseObjectBytes(trimmed)
+		if errParse != nil {
+			continue
+		}
+		responseNode, okResponse := jsonutil.Object(root, "response")
+		if !okResponse {
+			if jsonutil.Exists(root, "candidates") {
 				responseNode = root
 			} else {
 				continue
 			}
 		}
-		responseTemplate = responseNode.Raw
+		responseTemplate = responseNode
 
-		if traceResult := root.Get("traceId"); traceResult.Exists() && traceResult.String() != "" {
-			traceID = traceResult.String()
-		}
-
-		if roleResult := responseNode.Get("candidates.0.content.role"); roleResult.Exists() {
-			role = roleResult.String()
+		if traceResult, okTrace := jsonutil.String(root, "traceId"); okTrace && traceResult != "" {
+			traceID = traceResult
 		}
 
-		if finishResult := responseNode.Get("candidates.0.finishReason"); finishResult.Exists() && finishResult.String() != "" {
-			finishReason = finishResult.String()
+		if roleResult, okRole := jsonutil.String(responseNode, "candidates.0.content.role"); okRole {
+			role = roleResult
 		}
 
-		if modelResult := responseNode.Get("modelVersion"); modelResult.Exists() && modelResult.String() != "" {
-			modelVersion = modelResult.String()
-		}
-		if responseIDResult := responseNode.Get("responseId"); responseIDResult.Exists() && responseIDResult.String() != "" {
-			responseID = responseIDResult.String()
-		}
-		if usageResult := responseNode.Get("usageMetadata"); usageResult.Exists() {
-			usageRaw = usageResult.Raw
-		} else if usageMetadataResult := root.Get("usageMetadata"); usageMetadataResult.Exists() {
-			usageRaw = usageMetadataResult.Raw
+		if finishResult, okFinish := jsonutil.String(responseNode, "candidates.0.finishReason"); okFinish && finishResult != "" {
+			finishReason = finishResult
 		}
 
-		if partsResult := responseNode.Get("candidates.0.content.parts"); partsResult.IsArray() {
-			for _, part := range partsResult.Array() {
-				hasFunctionCall := part.Get("functionCall").Exists()
-				hasInlineData := part.Get("inlineData").Exists() || part.Get("inline_data").Exists()
-				sig := part.Get("thoughtSignature").String()
-				if sig == "" {
-					sig = part.Get("thought_signature").String()
+		if modelResult, okModel := jsonutil.String(responseNode, "modelVersion"); okModel && modelResult != "" {
+			modelVersion = modelResult
+		}
+		if responseIDResult, okResponseID := jsonutil.String(responseNode, "responseId"); okResponseID && responseIDResult != "" {
+			responseID = responseIDResult
+		}
+		if usageResult, okUsage := jsonutil.Object(responseNode, "usageMetadata"); okUsage {
+			usageValue = usageResult
+		} else if usageMetadataResult, okUsageMeta := jsonutil.Object(root, "usageMetadata"); okUsageMeta {
+			usageValue = usageMetadataResult
+		}
+
+		if partsResult, okParts := jsonutil.Array(responseNode, "candidates.0.content.parts"); okParts {
+			for _, partValue := range partsResult {
+				part, okPart := partValue.(map[string]any)
+				if !okPart {
+					continue
 				}
-				text := part.Get("text").String()
-				thought := part.Get("thought").Bool()
+				hasFunctionCall := jsonutil.Exists(part, "functionCall")
+				hasInlineData := jsonutil.Exists(part, "inlineData") || jsonutil.Exists(part, "inline_data")
+				sig, _ := jsonutil.String(part, "thoughtSignature")
+				if sig == "" {
+					sig, _ = jsonutil.String(part, "thought_signature")
+				}
+				text, _ := jsonutil.String(part, "text")
+				thought, _ := jsonutil.Bool(part, "thought")
 
 				if hasFunctionCall || hasInlineData {
 					flushPending()
@@ -663,7 +672,7 @@ func (e *AntigravityExecutor) convertStreamToNonStream(stream []byte) []byte {
 					continue
 				}
 
-				if thought || part.Get("text").Exists() {
+				if thought || jsonutil.Exists(part, "text") {
 					kind := "text"
 					if thought {
 						kind = "thought"
@@ -686,38 +695,53 @@ func (e *AntigravityExecutor) convertStreamToNonStream(stream []byte) []byte {
 	}
 	flushPending()
 
-	if responseTemplate == "" {
-		responseTemplate = `{"candidates":[{"content":{"role":"model","parts":[]}}]}`
+	if responseTemplate == nil {
+		responseTemplate = map[string]any{
+			"candidates": []any{
+				map[string]any{
+					"content": map[string]any{
+						"role":  "model",
+						"parts": []any{},
+					},
+				},
+			},
+		}
 	}
 
-	partsJSON, _ := json.Marshal(parts)
-	responseTemplate, _ = sjson.SetRaw(responseTemplate, "candidates.0.content.parts", string(partsJSON))
+	partsJSON := make([]any, 0, len(parts))
+	for _, part := range parts {
+		partsJSON = append(partsJSON, part)
+	}
+	_ = jsonutil.Set(responseTemplate, "candidates.0.content.parts", partsJSON)
 	if role != "" {
-		responseTemplate, _ = sjson.Set(responseTemplate, "candidates.0.content.role", role)
+		_ = jsonutil.Set(responseTemplate, "candidates.0.content.role", role)
 	}
 	if finishReason != "" {
-		responseTemplate, _ = sjson.Set(responseTemplate, "candidates.0.finishReason", finishReason)
+		_ = jsonutil.Set(responseTemplate, "candidates.0.finishReason", finishReason)
 	}
 	if modelVersion != "" {
-		responseTemplate, _ = sjson.Set(responseTemplate, "modelVersion", modelVersion)
+		_ = jsonutil.Set(responseTemplate, "modelVersion", modelVersion)
 	}
 	if responseID != "" {
-		responseTemplate, _ = sjson.Set(responseTemplate, "responseId", responseID)
+		_ = jsonutil.Set(responseTemplate, "responseId", responseID)
 	}
-	if usageRaw != "" {
-		responseTemplate, _ = sjson.SetRaw(responseTemplate, "usageMetadata", usageRaw)
-	} else if !gjson.Get(responseTemplate, "usageMetadata").Exists() {
-		responseTemplate, _ = sjson.Set(responseTemplate, "usageMetadata.promptTokenCount", 0)
-		responseTemplate, _ = sjson.Set(responseTemplate, "usageMetadata.candidatesTokenCount", 0)
-		responseTemplate, _ = sjson.Set(responseTemplate, "usageMetadata.totalTokenCount", 0)
+	if usageValue != nil {
+		responseTemplate["usageMetadata"] = usageValue
+	} else if !jsonutil.Exists(responseTemplate, "usageMetadata") {
+		responseTemplate["usageMetadata"] = map[string]any{
+			"promptTokenCount":     0,
+			"candidatesTokenCount": 0,
+			"totalTokenCount":      0,
+		}
 	}
 
-	output := `{"response":{},"traceId":""}`
-	output, _ = sjson.SetRaw(output, "response", responseTemplate)
-	if traceID != "" {
-		output, _ = sjson.Set(output, "traceId", traceID)
+	output := map[string]any{
+		"response": responseTemplate,
 	}
-	return []byte(output)
+	if traceID != "" {
+		output["traceId"] = traceID
+	}
+	return jsonutil.MarshalOrOriginal(nil, output)
 }
 
 // ExecuteStream performs a streaming request to the Antigravity API.
@@ -1041,7 +1065,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 		appendAPIResponseChunk(ctx, e.cfg, bodyBytes)
 
 		if httpResp.StatusCode >= http.StatusOK && httpResp.StatusCode < http.StatusMultipleChoices {
-			count := gjson.GetBytes(bodyBytes, "totalTokens").Int()
+			count, _ := jsonutil.Int64(jsonutil.ParseObjectBytesOrEmpty(bodyBytes), "totalTokens")
 			translated := sdktranslator.TranslateTokenCount(respCtx, to, from, count, bodyBytes)
 			return cliproxyexecutor.Response{Payload: []byte(translated), Headers: httpResp.Header.Clone()}, nil
 		}
@@ -1247,12 +1271,16 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		}
 	}
 	payload = geminiToAntigravity(modelName, payload, projectID)
-	payload, _ = sjson.SetBytes(payload, "model", modelName)
+	payloadRoot := jsonutil.ParseObjectBytesOrEmpty(payload)
+	payloadRoot["model"] = modelName
+	payload = jsonutil.MarshalOrOriginal(payload, payloadRoot)
 
 	useAntigravitySchema := strings.Contains(modelName, "claude") || strings.Contains(modelName, "gemini-3-pro") || strings.Contains(modelName, "gemini-3.1-pro")
 	payloadStr := string(payload)
 	paths := make([]string, 0)
-	util.Walk(gjson.Parse(payloadStr), "", "parametersJsonSchema", &paths)
+	if root, errParse := jsonutil.ParseAnyBytes([]byte(payloadStr)); errParse == nil {
+		util.Walk(root, "", "parametersJsonSchema", &paths)
+	}
 	for _, p := range paths {
 		payloadStr, _ = util.RenameKey(payloadStr, p, p[:len(p)-len("parametersJsonSchema")]+"parameters")
 	}
@@ -1263,23 +1291,14 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		payloadStr = util.CleanJSONSchemaForGemini(payloadStr)
 	}
 
-	// if useAntigravitySchema {
-	// 	systemInstructionPartsResult := gjson.Get(payloadStr, "request.systemInstruction.parts")
-	// 	payloadStr, _ = sjson.Set(payloadStr, "request.systemInstruction.role", "user")
-	// 	payloadStr, _ = sjson.Set(payloadStr, "request.systemInstruction.parts.0.text", systemInstruction)
-	// 	payloadStr, _ = sjson.Set(payloadStr, "request.systemInstruction.parts.1.text", fmt.Sprintf("Please ignore following [ignore]%s[/ignore]", systemInstruction))
-
-	// 	if systemInstructionPartsResult.Exists() && systemInstructionPartsResult.IsArray() {
-	// 		for _, partResult := range systemInstructionPartsResult.Array() {
-	// 			payloadStr, _ = sjson.SetRaw(payloadStr, "request.systemInstruction.parts.-1", partResult.Raw)
-	// 		}
-	// 	}
-	// }
-
 	if strings.Contains(modelName, "claude") {
-		payloadStr, _ = sjson.Set(payloadStr, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+		payloadRoot = jsonutil.ParseObjectBytesOrEmpty([]byte(payloadStr))
+		_ = jsonutil.Set(payloadRoot, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+		payloadStr = string(jsonutil.MarshalOrOriginal([]byte(payloadStr), payloadRoot))
 	} else {
-		payloadStr, _ = sjson.Delete(payloadStr, "request.generationConfig.maxOutputTokens")
+		payloadRoot = jsonutil.ParseObjectBytesOrEmpty([]byte(payloadStr))
+		_ = jsonutil.Delete(payloadRoot, "request.generationConfig.maxOutputTokens")
+		payloadStr = string(jsonutil.MarshalOrOriginal([]byte(payloadStr), payloadRoot))
 	}
 
 	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), strings.NewReader(payloadStr))
@@ -1499,8 +1518,9 @@ func resolveCustomAntigravityBaseURL(auth *cliproxyauth.Auth) string {
 }
 
 func geminiToAntigravity(modelName string, payload []byte, projectID string) []byte {
-	template, _ := sjson.Set(string(payload), "model", modelName)
-	template, _ = sjson.Set(template, "userAgent", "antigravity")
+	template := jsonutil.ParseObjectBytesOrEmpty(payload)
+	template["model"] = modelName
+	template["userAgent"] = "antigravity"
 
 	isImageModel := strings.Contains(modelName, "image")
 
@@ -1510,28 +1530,28 @@ func geminiToAntigravity(modelName string, payload []byte, projectID string) []b
 	} else {
 		reqType = "agent"
 	}
-	template, _ = sjson.Set(template, "requestType", reqType)
+	template["requestType"] = reqType
 
 	// Use real project ID from auth if available, otherwise generate random (legacy fallback)
 	if projectID != "" {
-		template, _ = sjson.Set(template, "project", projectID)
+		template["project"] = projectID
 	} else {
-		template, _ = sjson.Set(template, "project", generateProjectID())
+		template["project"] = generateProjectID()
 	}
 
 	if isImageModel {
-		template, _ = sjson.Set(template, "requestId", generateImageGenRequestID())
+		template["requestId"] = generateImageGenRequestID()
 	} else {
-		template, _ = sjson.Set(template, "requestId", generateRequestID())
-		template, _ = sjson.Set(template, "request.sessionId", generateStableSessionID(payload))
+		template["requestId"] = generateRequestID()
+		_ = jsonutil.Set(template, "request.sessionId", generateStableSessionID(payload))
 	}
 
-	template, _ = sjson.Delete(template, "request.safetySettings")
-	if toolConfig := gjson.Get(template, "toolConfig"); toolConfig.Exists() && !gjson.Get(template, "request.toolConfig").Exists() {
-		template, _ = sjson.SetRaw(template, "request.toolConfig", toolConfig.Raw)
-		template, _ = sjson.Delete(template, "toolConfig")
+	_ = jsonutil.Delete(template, "request.safetySettings")
+	if toolConfig, okToolConfig := jsonutil.Get(template, "toolConfig"); okToolConfig && !jsonutil.Exists(template, "request.toolConfig") {
+		_ = jsonutil.Set(template, "request.toolConfig", toolConfig)
+		_ = jsonutil.Delete(template, "toolConfig")
 	}
-	return []byte(template)
+	return jsonutil.MarshalOrOriginal(payload, template)
 }
 
 func generateRequestID() string {
@@ -1550,11 +1570,16 @@ func generateSessionID() string {
 }
 
 func generateStableSessionID(payload []byte) string {
-	contents := gjson.GetBytes(payload, "request.contents")
-	if contents.IsArray() {
-		for _, content := range contents.Array() {
-			if content.Get("role").String() == "user" {
-				text := content.Get("parts.0.text").String()
+	root := jsonutil.ParseObjectBytesOrEmpty(payload)
+	if contents, okContents := jsonutil.Array(root, "request.contents"); okContents {
+		for _, contentValue := range contents {
+			content, okContent := contentValue.(map[string]any)
+			if !okContent {
+				continue
+			}
+			role, _ := jsonutil.String(content, "role")
+			if role == "user" {
+				text, _ := jsonutil.String(content, "parts.0.text")
 				if text != "" {
 					h := sha256.Sum256([]byte(text))
 					n := int64(binary.BigEndian.Uint64(h[:8])) & 0x7FFFFFFFFFFFFFFF

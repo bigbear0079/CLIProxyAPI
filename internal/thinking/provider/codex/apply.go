@@ -7,10 +7,9 @@
 package codex
 
 import (
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // Applier implements thinking.ProviderApplier for Codex models.
@@ -54,13 +53,13 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		return body, nil
 	}
 
-	if len(body) == 0 || !gjson.ValidBytes(body) {
-		body = []byte(`{}`)
-	}
+	root := jsonutil.ParseObjectBytesOrEmpty(body)
 
 	if config.Mode == thinking.ModeLevel {
-		result, _ := sjson.SetBytes(body, "reasoning.effort", string(config.Level))
-		return result, nil
+		if errSet := jsonutil.Set(root, "reasoning.effort", string(config.Level)); errSet != nil {
+			return body, nil
+		}
+		return jsonutil.MarshalOrOriginal(body, root), nil
 	}
 
 	effort := ""
@@ -80,14 +79,14 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		return body, nil
 	}
 
-	result, _ := sjson.SetBytes(body, "reasoning.effort", effort)
-	return result, nil
+	if errSet := jsonutil.Set(root, "reasoning.effort", effort); errSet != nil {
+		return body, nil
+	}
+	return jsonutil.MarshalOrOriginal(body, root), nil
 }
 
 func applyCompatibleCodex(body []byte, config thinking.ThinkingConfig) ([]byte, error) {
-	if len(body) == 0 || !gjson.ValidBytes(body) {
-		body = []byte(`{}`)
-	}
+	root := jsonutil.ParseObjectBytesOrEmpty(body)
 
 	var effort string
 	switch config.Mode {
@@ -115,6 +114,8 @@ func applyCompatibleCodex(body []byte, config thinking.ThinkingConfig) ([]byte, 
 		return body, nil
 	}
 
-	result, _ := sjson.SetBytes(body, "reasoning.effort", effort)
-	return result, nil
+	if errSet := jsonutil.Set(root, "reasoning.effort", effort); errSet != nil {
+		return body, nil
+	}
+	return jsonutil.MarshalOrOriginal(body, root), nil
 }

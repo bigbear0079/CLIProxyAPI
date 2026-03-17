@@ -22,6 +22,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -29,8 +30,6 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 
 	"github.com/gin-gonic/gin"
 )
@@ -115,7 +114,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = setPayloadModel(body, baseModel)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -281,7 +280,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = setPayloadModel(body, baseModel)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -468,7 +467,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	// Use streaming translation to preserve function calling, except for claude.
 	stream := from != to
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = setPayloadModel(body, baseModel)
 
 	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
 		body = checkSystemInstructions(body)
@@ -559,7 +558,8 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		return cliproxyexecutor.Response{}, err
 	}
 	appendAPIResponseChunk(ctx, e.cfg, data)
-	count := gjson.GetBytes(data, "input_tokens").Int()
+	count64, _ := jsonutil.Int64(jsonutil.ParseObjectBytesOrEmpty(data), "input_tokens")
+	count := count64
 	out := sdktranslator.TranslateTokenCount(ctx, to, from, count, data)
 	return cliproxyexecutor.Response{Payload: []byte(out), Headers: resp.Header.Clone()}, nil
 }
@@ -601,41 +601,65 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 // extractAndRemoveBetas extracts the "betas" array from the body and removes it.
 // Returns the extracted betas as a string slice and the modified body.
 func extractAndRemoveBetas(body []byte) ([]string, []byte) {
-	betasResult := gjson.GetBytes(body, "betas")
-	if !betasResult.Exists() {
+	root, ok := parsePayloadObject(body)
+	if !ok {
 		return nil, body
 	}
+
+	betasValue, exists := root["betas"]
+	if !exists {
+		return nil, body
+	}
+
 	var betas []string
-	if betasResult.IsArray() {
-		for _, item := range betasResult.Array() {
-			if s := strings.TrimSpace(item.String()); s != "" {
+	if betasArray, okArray := betasValue.([]any); okArray {
+		for _, item := range betasArray {
+			s, okString := item.(string)
+			if !okString {
+				continue
+			}
+			if s = strings.TrimSpace(s); s != "" {
 				betas = append(betas, s)
 			}
 		}
-	} else if s := strings.TrimSpace(betasResult.String()); s != "" {
+	} else if s, okString := betasValue.(string); okString && strings.TrimSpace(s) != "" {
+		s = strings.TrimSpace(s)
 		betas = append(betas, s)
 	}
-	body, _ = sjson.DeleteBytes(body, "betas")
-	return betas, body
+
+	delete(root, "betas")
+	return betas, marshalPayloadObject(body, root)
 }
 
 // disableThinkingIfToolChoiceForced checks if tool_choice forces tool use and disables thinking.
 // Anthropic API does not allow thinking when tool_choice is set to "any" or a specific tool.
 // See: https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking#important-considerations
 func disableThinkingIfToolChoiceForced(body []byte) []byte {
-	toolChoiceType := gjson.GetBytes(body, "tool_choice.type").String()
+	root, ok := parsePayloadObject(body)
+	if !ok {
+		return body
+	}
+
+	toolChoice, ok := asObject(root["tool_choice"])
+	if !ok {
+		return body
+	}
+
+	toolChoiceType, _ := toolChoice["type"].(string)
 	// "auto" is allowed with thinking, but "any" or "tool" (specific tool) are not
 	if toolChoiceType == "any" || toolChoiceType == "tool" {
 		// Remove thinking configuration entirely to avoid API error
-		body, _ = sjson.DeleteBytes(body, "thinking")
+		delete(root, "thinking")
 		// Adaptive thinking may also set output_config.effort; remove it to avoid
 		// leaking thinking controls when tool_choice forces tool use.
-		body, _ = sjson.DeleteBytes(body, "output_config.effort")
-		if oc := gjson.GetBytes(body, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
-			body, _ = sjson.DeleteBytes(body, "output_config")
+		if outputConfig, okOutputConfig := asObject(root["output_config"]); okOutputConfig {
+			delete(outputConfig, "effort")
+			if len(outputConfig) == 0 {
+				delete(root, "output_config")
+			}
 		}
 	}
-	return body
+	return marshalPayloadObject(body, root)
 }
 
 type compositeReadCloser struct {
@@ -941,6 +965,12 @@ func applyClaudeToolPrefix(body []byte, prefix string) []byte {
 		return body
 	}
 
+	root, ok := parsePayloadObject(body)
+	if !ok {
+		return body
+	}
+	modified := false
+
 	// Collect built-in tool names (those with a non-empty "type" field) so we can
 	// skip them consistently in both tools and message history.
 	builtinTools := map[string]bool{}
@@ -948,167 +978,214 @@ func applyClaudeToolPrefix(body []byte, prefix string) []byte {
 		builtinTools[name] = true
 	}
 
-	if tools := gjson.GetBytes(body, "tools"); tools.Exists() && tools.IsArray() {
-		tools.ForEach(func(index, tool gjson.Result) bool {
+	if tools, okTools := asArray(root["tools"]); okTools {
+		for _, tool := range tools {
+			toolObj, okTool := asObject(tool)
+			if !okTool {
+				continue
+			}
 			// Skip built-in tools (web_search, code_execution, etc.) which have
 			// a "type" field and require their name to remain unchanged.
-			if tool.Get("type").Exists() && tool.Get("type").String() != "" {
-				if n := tool.Get("name").String(); n != "" {
+			if toolType, okType := toolObj["type"].(string); okType && toolType != "" {
+				if n, okName := toolObj["name"].(string); okName && n != "" {
 					builtinTools[n] = true
 				}
-				return true
+				continue
 			}
-			name := tool.Get("name").String()
+			name, _ := toolObj["name"].(string)
 			if name == "" || strings.HasPrefix(name, prefix) {
-				return true
+				continue
 			}
-			path := fmt.Sprintf("tools.%d.name", index.Int())
-			body, _ = sjson.SetBytes(body, path, prefix+name)
-			return true
-		})
-	}
-
-	if gjson.GetBytes(body, "tool_choice.type").String() == "tool" {
-		name := gjson.GetBytes(body, "tool_choice.name").String()
-		if name != "" && !strings.HasPrefix(name, prefix) && !builtinTools[name] {
-			body, _ = sjson.SetBytes(body, "tool_choice.name", prefix+name)
+			toolObj["name"] = prefix + name
+			modified = true
 		}
 	}
 
-	if messages := gjson.GetBytes(body, "messages"); messages.Exists() && messages.IsArray() {
-		messages.ForEach(func(msgIndex, msg gjson.Result) bool {
-			content := msg.Get("content")
-			if !content.Exists() || !content.IsArray() {
-				return true
-			}
-			content.ForEach(func(contentIndex, part gjson.Result) bool {
-				partType := part.Get("type").String()
-				switch partType {
-				case "tool_use":
-					name := part.Get("name").String()
-					if name == "" || strings.HasPrefix(name, prefix) || builtinTools[name] {
-						return true
-					}
-					path := fmt.Sprintf("messages.%d.content.%d.name", msgIndex.Int(), contentIndex.Int())
-					body, _ = sjson.SetBytes(body, path, prefix+name)
-				case "tool_reference":
-					toolName := part.Get("tool_name").String()
-					if toolName == "" || strings.HasPrefix(toolName, prefix) || builtinTools[toolName] {
-						return true
-					}
-					path := fmt.Sprintf("messages.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int())
-					body, _ = sjson.SetBytes(body, path, prefix+toolName)
-				case "tool_result":
-					// Handle nested tool_reference blocks inside tool_result.content[]
-					nestedContent := part.Get("content")
-					if nestedContent.Exists() && nestedContent.IsArray() {
-						nestedContent.ForEach(func(nestedIndex, nestedPart gjson.Result) bool {
-							if nestedPart.Get("type").String() == "tool_reference" {
-								nestedToolName := nestedPart.Get("tool_name").String()
-								if nestedToolName != "" && !strings.HasPrefix(nestedToolName, prefix) && !builtinTools[nestedToolName] {
-									nestedPath := fmt.Sprintf("messages.%d.content.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int(), nestedIndex.Int())
-									body, _ = sjson.SetBytes(body, nestedPath, prefix+nestedToolName)
-								}
-							}
-							return true
-						})
-					}
-				}
-				return true
-			})
-			return true
-		})
+	if toolChoice, okToolChoice := asObject(root["tool_choice"]); okToolChoice {
+		toolChoiceType, _ := toolChoice["type"].(string)
+		name, _ := toolChoice["name"].(string)
+		if toolChoiceType == "tool" && name != "" && !strings.HasPrefix(name, prefix) && !builtinTools[name] {
+			toolChoice["name"] = prefix + name
+			modified = true
+		}
 	}
 
-	return body
+	if messages, okMessages := asArray(root["messages"]); okMessages {
+		for _, msg := range messages {
+			msgObj, okMsg := asObject(msg)
+			if !okMsg {
+				continue
+			}
+			content, okContent := asArray(msgObj["content"])
+			if !okContent {
+				continue
+			}
+			for _, part := range content {
+				partObj, okPart := asObject(part)
+				if !okPart {
+					continue
+				}
+				partType, _ := partObj["type"].(string)
+				switch partType {
+				case "tool_use":
+					name, _ := partObj["name"].(string)
+					if name == "" || strings.HasPrefix(name, prefix) || builtinTools[name] {
+						continue
+					}
+					partObj["name"] = prefix + name
+					modified = true
+				case "tool_reference":
+					toolName, _ := partObj["tool_name"].(string)
+					if toolName == "" || strings.HasPrefix(toolName, prefix) || builtinTools[toolName] {
+						continue
+					}
+					partObj["tool_name"] = prefix + toolName
+					modified = true
+				case "tool_result":
+					nestedContent, okNested := asArray(partObj["content"])
+					if !okNested {
+						continue
+					}
+					for _, nestedPart := range nestedContent {
+						nestedPartObj, okNestedPart := asObject(nestedPart)
+						if !okNestedPart {
+							continue
+						}
+						nestedType, _ := nestedPartObj["type"].(string)
+						if nestedType != "tool_reference" {
+							continue
+						}
+						nestedToolName, _ := nestedPartObj["tool_name"].(string)
+						if nestedToolName == "" || strings.HasPrefix(nestedToolName, prefix) || builtinTools[nestedToolName] {
+							continue
+						}
+						nestedPartObj["tool_name"] = prefix + nestedToolName
+						modified = true
+					}
+				}
+			}
+		}
+	}
+
+	if !modified {
+		return body
+	}
+	return marshalPayloadObject(body, root)
 }
 
 func stripClaudeToolPrefixFromResponse(body []byte, prefix string) []byte {
 	if prefix == "" {
 		return body
 	}
-	content := gjson.GetBytes(body, "content")
-	if !content.Exists() || !content.IsArray() {
+
+	root, ok := parsePayloadObject(body)
+	if !ok {
 		return body
 	}
-	content.ForEach(func(index, part gjson.Result) bool {
-		partType := part.Get("type").String()
+
+	content, ok := asArray(root["content"])
+	if !ok {
+		return body
+	}
+
+	modified := false
+	for _, part := range content {
+		partObj, okPart := asObject(part)
+		if !okPart {
+			continue
+		}
+		partType, _ := partObj["type"].(string)
 		switch partType {
 		case "tool_use":
-			name := part.Get("name").String()
+			name, _ := partObj["name"].(string)
 			if !strings.HasPrefix(name, prefix) {
-				return true
+				continue
 			}
-			path := fmt.Sprintf("content.%d.name", index.Int())
-			body, _ = sjson.SetBytes(body, path, strings.TrimPrefix(name, prefix))
+			partObj["name"] = strings.TrimPrefix(name, prefix)
+			modified = true
 		case "tool_reference":
-			toolName := part.Get("tool_name").String()
+			toolName, _ := partObj["tool_name"].(string)
 			if !strings.HasPrefix(toolName, prefix) {
-				return true
+				continue
 			}
-			path := fmt.Sprintf("content.%d.tool_name", index.Int())
-			body, _ = sjson.SetBytes(body, path, strings.TrimPrefix(toolName, prefix))
+			partObj["tool_name"] = strings.TrimPrefix(toolName, prefix)
+			modified = true
 		case "tool_result":
-			// Handle nested tool_reference blocks inside tool_result.content[]
-			nestedContent := part.Get("content")
-			if nestedContent.Exists() && nestedContent.IsArray() {
-				nestedContent.ForEach(func(nestedIndex, nestedPart gjson.Result) bool {
-					if nestedPart.Get("type").String() == "tool_reference" {
-						nestedToolName := nestedPart.Get("tool_name").String()
-						if strings.HasPrefix(nestedToolName, prefix) {
-							nestedPath := fmt.Sprintf("content.%d.content.%d.tool_name", index.Int(), nestedIndex.Int())
-							body, _ = sjson.SetBytes(body, nestedPath, strings.TrimPrefix(nestedToolName, prefix))
-						}
-					}
-					return true
-				})
+			nestedContent, okNested := asArray(partObj["content"])
+			if !okNested {
+				continue
+			}
+			for _, nestedPart := range nestedContent {
+				nestedPartObj, okNestedPart := asObject(nestedPart)
+				if !okNestedPart {
+					continue
+				}
+				nestedType, _ := nestedPartObj["type"].(string)
+				if nestedType != "tool_reference" {
+					continue
+				}
+				nestedToolName, _ := nestedPartObj["tool_name"].(string)
+				if !strings.HasPrefix(nestedToolName, prefix) {
+					continue
+				}
+				nestedPartObj["tool_name"] = strings.TrimPrefix(nestedToolName, prefix)
+				modified = true
 			}
 		}
-		return true
-	})
-	return body
+	}
+
+	if !modified {
+		return body
+	}
+	return marshalPayloadObject(body, root)
 }
 
 func stripClaudeToolPrefixFromStreamLine(line []byte, prefix string) []byte {
 	if prefix == "" {
 		return line
 	}
+
 	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
-		return line
-	}
-	contentBlock := gjson.GetBytes(payload, "content_block")
-	if !contentBlock.Exists() {
+	if len(payload) == 0 {
 		return line
 	}
 
-	blockType := contentBlock.Get("type").String()
-	var updated []byte
-	var err error
+	root, ok := parsePayloadObject(payload)
+	if !ok {
+		return line
+	}
 
+	contentBlock, ok := asObject(root["content_block"])
+	if !ok {
+		return line
+	}
+
+	modified := false
+	blockType, _ := contentBlock["type"].(string)
 	switch blockType {
 	case "tool_use":
-		name := contentBlock.Get("name").String()
+		name, _ := contentBlock["name"].(string)
 		if !strings.HasPrefix(name, prefix) {
 			return line
 		}
-		updated, err = sjson.SetBytes(payload, "content_block.name", strings.TrimPrefix(name, prefix))
-		if err != nil {
-			return line
-		}
+		contentBlock["name"] = strings.TrimPrefix(name, prefix)
+		modified = true
 	case "tool_reference":
-		toolName := contentBlock.Get("tool_name").String()
+		toolName, _ := contentBlock["tool_name"].(string)
 		if !strings.HasPrefix(toolName, prefix) {
 			return line
 		}
-		updated, err = sjson.SetBytes(payload, "content_block.tool_name", strings.TrimPrefix(toolName, prefix))
-		if err != nil {
-			return line
-		}
+		contentBlock["tool_name"] = strings.TrimPrefix(toolName, prefix)
+		modified = true
 	default:
 		return line
 	}
 
+	if !modified {
+		return line
+	}
+
+	updated := marshalPayloadObject(payload, root)
 	trimmed := bytes.TrimSpace(line)
 	if bytes.HasPrefix(trimmed, []byte("data:")) {
 		return append([]byte("data: "), updated...)
@@ -1190,15 +1267,21 @@ func injectFakeUserID(payload []byte, apiKey string, useCache bool) []byte {
 		return generateFakeUserID()
 	}
 
-	metadata := gjson.GetBytes(payload, "metadata")
-	if !metadata.Exists() {
-		payload, _ = sjson.SetBytes(payload, "metadata.user_id", generateID())
+	root, ok := parsePayloadObject(payload)
+	if !ok {
 		return payload
 	}
 
-	existingUserID := gjson.GetBytes(payload, "metadata.user_id").String()
+	metadata, ok := asObject(root["metadata"])
+	if !ok {
+		metadata = map[string]any{}
+		root["metadata"] = metadata
+	}
+
+	existingUserID, _ := metadata["user_id"].(string)
 	if existingUserID == "" || !isValidUserID(existingUserID) {
-		payload, _ = sjson.SetBytes(payload, "metadata.user_id", generateID())
+		metadata["user_id"] = generateID()
+		return marshalPayloadObject(payload, root)
 	}
 	return payload
 }
@@ -1226,55 +1309,70 @@ func generateBillingHeader(payload []byte) string {
 //	system[1]: agent identifier (no cache_control)
 //	system[2..]: user system messages (cache_control added when missing)
 func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
-	system := gjson.GetBytes(payload, "system")
+	root, ok := parsePayloadObject(payload)
+	if !ok {
+		return payload
+	}
+
+	systemValue, hasSystem := root["system"]
 
 	billingText := generateBillingHeader(payload)
-	billingBlock := fmt.Sprintf(`{"type":"text","text":"%s"}`, billingText)
+	billingBlock := map[string]any{
+		"type": "text",
+		"text": billingText,
+	}
 	// No cache_control on the agent block. It is a cloaking artifact with zero cache
 	// value (the last system block is what actually triggers caching of all system content).
 	// Including any cache_control here creates an intra-system TTL ordering violation
 	// when the client's system blocks use ttl='1h' (prompt-caching-scope-2026-01-05 beta
 	// forbids 1h blocks after 5m blocks, and a no-TTL block defaults to 5m).
-	agentBlock := `{"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."}`
+	agentBlock := map[string]any{
+		"type": "text",
+		"text": "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+	}
 
 	if strictMode {
 		// Strict mode: billing header + agent identifier only
-		result := "[" + billingBlock + "," + agentBlock + "]"
-		payload, _ = sjson.SetRawBytes(payload, "system", []byte(result))
-		return payload
+		root["system"] = []any{billingBlock, agentBlock}
+		return marshalPayloadObject(payload, root)
 	}
 
 	// Non-strict mode: billing header + agent identifier + user system messages
 	// Skip if already injected
-	firstText := gjson.GetBytes(payload, "system.0.text").String()
+	firstText, _ := jsonutil.String(root, "system.0.text")
 	if strings.HasPrefix(firstText, "x-anthropic-billing-header:") {
 		return payload
 	}
 
-	result := "[" + billingBlock + "," + agentBlock
-	if system.IsArray() {
-		system.ForEach(func(_, part gjson.Result) bool {
-			if part.Get("type").String() == "text" {
-				// Add cache_control to user system messages if not present.
-				// Do NOT add ttl — let it inherit the default (5m) to avoid
-				// TTL ordering violations with the prompt-caching-scope-2026-01-05 beta.
-				partJSON := part.Raw
-				if !part.Get("cache_control").Exists() {
-					partJSON, _ = sjson.Set(partJSON, "cache_control.type", "ephemeral")
-				}
-				result += "," + partJSON
+	newSystem := []any{billingBlock, agentBlock}
+	if system, okSystem := systemValue.([]any); okSystem {
+		for _, part := range system {
+			partObj, okPart := asObject(part)
+			if !okPart {
+				continue
 			}
-			return true
+			partType, _ := partObj["type"].(string)
+			if partType != "text" {
+				continue
+			}
+			// Add cache_control to user system messages if not present.
+			// Do NOT add ttl — let it inherit the default (5m) to avoid
+			// TTL ordering violations with the prompt-caching-scope-2026-01-05 beta.
+			if _, exists := partObj["cache_control"]; !exists {
+				partObj["cache_control"] = map[string]any{"type": "ephemeral"}
+			}
+			newSystem = append(newSystem, partObj)
+		}
+	} else if systemText, okString := systemValue.(string); hasSystem && okString && systemText != "" {
+		newSystem = append(newSystem, map[string]any{
+			"type":          "text",
+			"text":          systemText,
+			"cache_control": map[string]any{"type": "ephemeral"},
 		})
-	} else if system.Type == gjson.String && system.String() != "" {
-		partJSON := `{"type":"text","cache_control":{"type":"ephemeral"}}`
-		partJSON, _ = sjson.Set(partJSON, "text", system.String())
-		result += "," + partJSON
 	}
-	result += "]"
 
-	payload, _ = sjson.SetRawBytes(payload, "system", []byte(result))
-	return payload
+	root["system"] = newSystem
+	return marshalPayloadObject(payload, root)
 }
 
 // applyCloaking applies cloaking transformations to the payload based on config and client.
@@ -1367,48 +1465,11 @@ func ensureCacheControl(payload []byte) []byte {
 }
 
 func countCacheControls(payload []byte) int {
-	count := 0
-
-	// Check system
-	system := gjson.GetBytes(payload, "system")
-	if system.IsArray() {
-		system.ForEach(func(_, item gjson.Result) bool {
-			if item.Get("cache_control").Exists() {
-				count++
-			}
-			return true
-		})
+	root, ok := parsePayloadObject(payload)
+	if !ok {
+		return 0
 	}
-
-	// Check tools
-	tools := gjson.GetBytes(payload, "tools")
-	if tools.IsArray() {
-		tools.ForEach(func(_, item gjson.Result) bool {
-			if item.Get("cache_control").Exists() {
-				count++
-			}
-			return true
-		})
-	}
-
-	// Check messages
-	messages := gjson.GetBytes(payload, "messages")
-	if messages.IsArray() {
-		messages.ForEach(func(_, msg gjson.Result) bool {
-			content := msg.Get("content")
-			if content.IsArray() {
-				content.ForEach(func(_, item gjson.Result) bool {
-					if item.Get("cache_control").Exists() {
-						count++
-					}
-					return true
-				})
-			}
-			return true
-		})
-	}
-
-	return count
+	return countCacheControlsMap(root)
 }
 
 func parsePayloadObject(payload []byte) (map[string]any, bool) {
@@ -1431,6 +1492,15 @@ func marshalPayloadObject(original []byte, root map[string]any) []byte {
 		return original
 	}
 	return out
+}
+
+func setPayloadModel(payload []byte, model string) []byte {
+	root, ok := parsePayloadObject(payload)
+	if !ok {
+		return payload
+	}
+	root["model"] = model
+	return marshalPayloadObject(payload, root)
 }
 
 func asObject(v any) (map[string]any, bool) {
@@ -1737,38 +1807,55 @@ func enforceCacheControlLimit(payload []byte, maxBlocks int) []byte {
 // - There are at least 2 user turns in the conversation
 // - No message content already has cache_control
 func injectMessagesCacheControl(payload []byte) []byte {
-	messages := gjson.GetBytes(payload, "messages")
-	if !messages.Exists() || !messages.IsArray() {
+	root, ok := parsePayloadObject(payload)
+	if !ok {
+		return payload
+	}
+
+	messages, ok := asArray(root["messages"])
+	if !ok {
 		return payload
 	}
 
 	// Check if ANY message content already has cache_control
 	hasCacheControlInMessages := false
-	messages.ForEach(func(_, msg gjson.Result) bool {
-		content := msg.Get("content")
-		if content.IsArray() {
-			content.ForEach(func(_, item gjson.Result) bool {
-				if item.Get("cache_control").Exists() {
-					hasCacheControlInMessages = true
-					return false
-				}
-				return true
-			})
+	for _, msg := range messages {
+		msgObj, okMsg := asObject(msg)
+		if !okMsg {
+			continue
 		}
-		return !hasCacheControlInMessages
-	})
+		content, okContent := asArray(msgObj["content"])
+		if okContent {
+			for _, item := range content {
+				itemObj, okItem := asObject(item)
+				if okItem {
+					if _, exists := itemObj["cache_control"]; exists {
+						hasCacheControlInMessages = true
+						break
+					}
+				}
+			}
+		}
+		if hasCacheControlInMessages {
+			break
+		}
+	}
 	if hasCacheControlInMessages {
 		return payload
 	}
 
 	// Find all user message indices
 	var userMsgIndices []int
-	messages.ForEach(func(index gjson.Result, msg gjson.Result) bool {
-		if msg.Get("role").String() == "user" {
-			userMsgIndices = append(userMsgIndices, int(index.Int()))
+	for index, msg := range messages {
+		msgObj, okMsg := asObject(msg)
+		if !okMsg {
+			continue
 		}
-		return true
-	})
+		role, _ := msgObj["role"].(string)
+		if role == "user" {
+			userMsgIndices = append(userMsgIndices, index)
+		}
+	}
 
 	// Need at least 2 user turns to cache the second-to-last
 	if len(userMsgIndices) < 2 {
@@ -1778,138 +1865,130 @@ func injectMessagesCacheControl(payload []byte) []byte {
 	// Get the second-to-last user message index
 	secondToLastUserIdx := userMsgIndices[len(userMsgIndices)-2]
 
-	// Get the content of this message
-	contentPath := fmt.Sprintf("messages.%d.content", secondToLastUserIdx)
-	content := gjson.GetBytes(payload, contentPath)
+	msgObj, okMsg := asObject(messages[secondToLastUserIdx])
+	if !okMsg {
+		return payload
+	}
 
-	if content.IsArray() {
-		// Add cache_control to the last content block of this message
-		contentCount := int(content.Get("#").Int())
-		if contentCount > 0 {
-			cacheControlPath := fmt.Sprintf("messages.%d.content.%d.cache_control", secondToLastUserIdx, contentCount-1)
-			result, err := sjson.SetBytes(payload, cacheControlPath, map[string]string{"type": "ephemeral"})
-			if err != nil {
-				log.Warnf("failed to inject cache_control into messages: %v", err)
-				return payload
-			}
-			payload = result
+	contentValue, exists := msgObj["content"]
+	if !exists {
+		return payload
+	}
+
+	if content, okContent := contentValue.([]any); okContent {
+		contentCount := len(content)
+		if contentCount == 0 {
+			return payload
 		}
-	} else if content.Type == gjson.String {
-		// Convert string content to array with cache_control
-		text := content.String()
-		newContent := []map[string]interface{}{
-			{
+		lastContentObj, okLast := asObject(content[contentCount-1])
+		if !okLast {
+			log.Warn("failed to inject cache_control into messages: last content block is not an object")
+			return payload
+		}
+		lastContentObj["cache_control"] = map[string]any{"type": "ephemeral"}
+		return marshalPayloadObject(payload, root)
+	}
+
+	if text, okString := contentValue.(string); okString {
+		msgObj["content"] = []any{
+			map[string]any{
 				"type": "text",
 				"text": text,
-				"cache_control": map[string]string{
+				"cache_control": map[string]any{
 					"type": "ephemeral",
 				},
 			},
 		}
-		result, err := sjson.SetBytes(payload, contentPath, newContent)
-		if err != nil {
-			log.Warnf("failed to inject cache_control into message string content: %v", err)
-			return payload
-		}
-		payload = result
+		return marshalPayloadObject(payload, root)
 	}
 
 	return payload
 }
 
-// injectToolsCacheControl adds cache_control to the last tool in the tools array.
-// Per Anthropic docs: "The cache_control parameter on the last tool definition caches all tool definitions."
-// This only adds cache_control if NO tool in the array already has it.
 func injectToolsCacheControl(payload []byte) []byte {
-	tools := gjson.GetBytes(payload, "tools")
-	if !tools.Exists() || !tools.IsArray() {
+	root, ok := parsePayloadObject(payload)
+	if !ok {
 		return payload
 	}
 
-	toolCount := int(tools.Get("#").Int())
+	tools, ok := asArray(root["tools"])
+	if !ok {
+		return payload
+	}
+
+	toolCount := len(tools)
 	if toolCount == 0 {
 		return payload
 	}
 
 	// Check if ANY tool already has cache_control - if so, don't modify tools
-	hasCacheControlInTools := false
-	tools.ForEach(func(_, tool gjson.Result) bool {
-		if tool.Get("cache_control").Exists() {
-			hasCacheControlInTools = true
-			return false
+	for _, tool := range tools {
+		toolObj, okTool := asObject(tool)
+		if !okTool {
+			continue
 		}
-		return true
-	})
-	if hasCacheControlInTools {
-		return payload
+		if _, exists := toolObj["cache_control"]; exists {
+			return payload
+		}
 	}
 
-	// Add cache_control to the last tool
-	lastToolPath := fmt.Sprintf("tools.%d.cache_control", toolCount-1)
-	result, err := sjson.SetBytes(payload, lastToolPath, map[string]string{"type": "ephemeral"})
-	if err != nil {
-		log.Warnf("failed to inject cache_control into tools array: %v", err)
+	lastTool, okLastTool := asObject(tools[toolCount-1])
+	if !okLastTool {
+		log.Warn("failed to inject cache_control into tools array: last tool is not an object")
 		return payload
 	}
-
-	return result
+	lastTool["cache_control"] = map[string]any{"type": "ephemeral"}
+	return marshalPayloadObject(payload, root)
 }
 
-// injectSystemCacheControl adds cache_control to the last element in the system prompt.
-// Converts string system prompts to array format if needed.
-// This only adds cache_control if NO system element already has it.
 func injectSystemCacheControl(payload []byte) []byte {
-	system := gjson.GetBytes(payload, "system")
-	if !system.Exists() {
+	root, ok := parsePayloadObject(payload)
+	if !ok {
 		return payload
 	}
 
-	if system.IsArray() {
-		count := int(system.Get("#").Int())
+	systemValue, exists := root["system"]
+	if !exists {
+		return payload
+	}
+
+	if system, okArray := systemValue.([]any); okArray {
+		count := len(system)
 		if count == 0 {
 			return payload
 		}
 
 		// Check if ANY system element already has cache_control
-		hasCacheControlInSystem := false
-		system.ForEach(func(_, item gjson.Result) bool {
-			if item.Get("cache_control").Exists() {
-				hasCacheControlInSystem = true
-				return false
+		for _, item := range system {
+			itemObj, okItem := asObject(item)
+			if !okItem {
+				continue
 			}
-			return true
-		})
-		if hasCacheControlInSystem {
-			return payload
+			if _, exists := itemObj["cache_control"]; exists {
+				return payload
+			}
 		}
 
-		// Add cache_control to the last system element
-		lastSystemPath := fmt.Sprintf("system.%d.cache_control", count-1)
-		result, err := sjson.SetBytes(payload, lastSystemPath, map[string]string{"type": "ephemeral"})
-		if err != nil {
-			log.Warnf("failed to inject cache_control into system array: %v", err)
+		lastSystem, okLastSystem := asObject(system[count-1])
+		if !okLastSystem {
+			log.Warn("failed to inject cache_control into system array: last system block is not an object")
 			return payload
 		}
-		payload = result
-	} else if system.Type == gjson.String {
-		// Convert string system prompt to array with cache_control
-		// "system": "text" -> "system": [{"type": "text", "text": "text", "cache_control": {"type": "ephemeral"}}]
-		text := system.String()
-		newSystem := []map[string]interface{}{
-			{
+		lastSystem["cache_control"] = map[string]any{"type": "ephemeral"}
+		return marshalPayloadObject(payload, root)
+	}
+
+	if text, okString := systemValue.(string); okString {
+		root["system"] = []any{
+			map[string]any{
 				"type": "text",
 				"text": text,
-				"cache_control": map[string]string{
+				"cache_control": map[string]any{
 					"type": "ephemeral",
 				},
 			},
 		}
-		result, err := sjson.SetBytes(payload, "system", newSystem)
-		if err != nil {
-			log.Warnf("failed to inject cache_control into system string: %v", err)
-			return payload
-		}
-		payload = result
+		return marshalPayloadObject(payload, root)
 	}
 
 	return payload

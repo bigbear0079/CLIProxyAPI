@@ -12,27 +12,26 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/testjson"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 func TestApplyClaudeToolPrefix(t *testing.T) {
 	input := []byte(`{"tools":[{"name":"alpha"},{"name":"proxy_bravo"}],"tool_choice":{"type":"tool","name":"charlie"},"messages":[{"role":"assistant","content":[{"type":"tool_use","name":"delta","id":"t1","input":{}}]}]}`)
 	out := applyClaudeToolPrefix(input, "proxy_")
 
-	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "proxy_alpha" {
+	if got := testjson.GetBytes(out, "tools.0.name").String(); got != "proxy_alpha" {
 		t.Fatalf("tools.0.name = %q, want %q", got, "proxy_alpha")
 	}
-	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "proxy_bravo" {
+	if got := testjson.GetBytes(out, "tools.1.name").String(); got != "proxy_bravo" {
 		t.Fatalf("tools.1.name = %q, want %q", got, "proxy_bravo")
 	}
-	if got := gjson.GetBytes(out, "tool_choice.name").String(); got != "proxy_charlie" {
+	if got := testjson.GetBytes(out, "tool_choice.name").String(); got != "proxy_charlie" {
 		t.Fatalf("tool_choice.name = %q, want %q", got, "proxy_charlie")
 	}
-	if got := gjson.GetBytes(out, "messages.0.content.0.name").String(); got != "proxy_delta" {
+	if got := testjson.GetBytes(out, "messages.0.content.0.name").String(); got != "proxy_delta" {
 		t.Fatalf("messages.0.content.0.name = %q, want %q", got, "proxy_delta")
 	}
 }
@@ -41,10 +40,10 @@ func TestApplyClaudeToolPrefix_WithToolReference(t *testing.T) {
 	input := []byte(`{"tools":[{"name":"alpha"}],"messages":[{"role":"user","content":[{"type":"tool_reference","tool_name":"beta"},{"type":"tool_reference","tool_name":"proxy_gamma"}]}]}`)
 	out := applyClaudeToolPrefix(input, "proxy_")
 
-	if got := gjson.GetBytes(out, "messages.0.content.0.tool_name").String(); got != "proxy_beta" {
+	if got := testjson.GetBytes(out, "messages.0.content.0.tool_name").String(); got != "proxy_beta" {
 		t.Fatalf("messages.0.content.0.tool_name = %q, want %q", got, "proxy_beta")
 	}
-	if got := gjson.GetBytes(out, "messages.0.content.1.tool_name").String(); got != "proxy_gamma" {
+	if got := testjson.GetBytes(out, "messages.0.content.1.tool_name").String(); got != "proxy_gamma" {
 		t.Fatalf("messages.0.content.1.tool_name = %q, want %q", got, "proxy_gamma")
 	}
 }
@@ -53,10 +52,10 @@ func TestApplyClaudeToolPrefix_SkipsBuiltinTools(t *testing.T) {
 	input := []byte(`{"tools":[{"type":"web_search_20250305","name":"web_search"},{"name":"my_custom_tool","input_schema":{"type":"object"}}]}`)
 	out := applyClaudeToolPrefix(input, "proxy_")
 
-	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "web_search" {
+	if got := testjson.GetBytes(out, "tools.0.name").String(); got != "web_search" {
 		t.Fatalf("built-in tool name should not be prefixed: tools.0.name = %q, want %q", got, "web_search")
 	}
-	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "proxy_my_custom_tool" {
+	if got := testjson.GetBytes(out, "tools.1.name").String(); got != "proxy_my_custom_tool" {
 		t.Fatalf("custom tool should be prefixed: tools.1.name = %q, want %q", got, "proxy_my_custom_tool")
 	}
 }
@@ -76,16 +75,16 @@ func TestApplyClaudeToolPrefix_BuiltinToolSkipped(t *testing.T) {
 	}`)
 	out := applyClaudeToolPrefix(body, "proxy_")
 
-	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "web_search" {
+	if got := testjson.GetBytes(out, "tools.0.name").String(); got != "web_search" {
 		t.Fatalf("tools.0.name = %q, want %q", got, "web_search")
 	}
-	if got := gjson.GetBytes(out, "messages.0.content.0.name").String(); got != "web_search" {
+	if got := testjson.GetBytes(out, "messages.0.content.0.name").String(); got != "web_search" {
 		t.Fatalf("messages.0.content.0.name = %q, want %q", got, "web_search")
 	}
-	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "proxy_Read" {
+	if got := testjson.GetBytes(out, "tools.1.name").String(); got != "proxy_Read" {
 		t.Fatalf("tools.1.name = %q, want %q", got, "proxy_Read")
 	}
-	if got := gjson.GetBytes(out, "messages.0.content.1.name").String(); got != "proxy_Read" {
+	if got := testjson.GetBytes(out, "messages.0.content.1.name").String(); got != "proxy_Read" {
 		t.Fatalf("messages.0.content.1.name = %q, want %q", got, "proxy_Read")
 	}
 }
@@ -103,10 +102,10 @@ func TestApplyClaudeToolPrefix_KnownBuiltinInHistoryOnly(t *testing.T) {
 	}`)
 	out := applyClaudeToolPrefix(body, "proxy_")
 
-	if got := gjson.GetBytes(out, "messages.0.content.0.name").String(); got != "web_search" {
+	if got := testjson.GetBytes(out, "messages.0.content.0.name").String(); got != "web_search" {
 		t.Fatalf("messages.0.content.0.name = %q, want %q", got, "web_search")
 	}
-	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "proxy_Read" {
+	if got := testjson.GetBytes(out, "tools.0.name").String(); got != "proxy_Read" {
 		t.Fatalf("tools.0.name = %q, want %q", got, "proxy_Read")
 	}
 }
@@ -123,16 +122,16 @@ func TestApplyClaudeToolPrefix_CustomToolsPrefixed(t *testing.T) {
 	}`)
 	out := applyClaudeToolPrefix(body, "proxy_")
 
-	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "proxy_Read" {
+	if got := testjson.GetBytes(out, "tools.0.name").String(); got != "proxy_Read" {
 		t.Fatalf("tools.0.name = %q, want %q", got, "proxy_Read")
 	}
-	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "proxy_Write" {
+	if got := testjson.GetBytes(out, "tools.1.name").String(); got != "proxy_Write" {
 		t.Fatalf("tools.1.name = %q, want %q", got, "proxy_Write")
 	}
-	if got := gjson.GetBytes(out, "messages.0.content.0.name").String(); got != "proxy_Read" {
+	if got := testjson.GetBytes(out, "messages.0.content.0.name").String(); got != "proxy_Read" {
 		t.Fatalf("messages.0.content.0.name = %q, want %q", got, "proxy_Read")
 	}
-	if got := gjson.GetBytes(out, "messages.0.content.1.name").String(); got != "proxy_Write" {
+	if got := testjson.GetBytes(out, "messages.0.content.1.name").String(); got != "proxy_Write" {
 		t.Fatalf("messages.0.content.1.name = %q, want %q", got, "proxy_Write")
 	}
 }
@@ -147,7 +146,7 @@ func TestApplyClaudeToolPrefix_ToolChoiceBuiltin(t *testing.T) {
 	}`)
 	out := applyClaudeToolPrefix(body, "proxy_")
 
-	if got := gjson.GetBytes(out, "tool_choice.name").String(); got != "web_search" {
+	if got := testjson.GetBytes(out, "tool_choice.name").String(); got != "web_search" {
 		t.Fatalf("tool_choice.name = %q, want %q", got, "web_search")
 	}
 }
@@ -156,10 +155,10 @@ func TestStripClaudeToolPrefixFromResponse(t *testing.T) {
 	input := []byte(`{"content":[{"type":"tool_use","name":"proxy_alpha","id":"t1","input":{}},{"type":"tool_use","name":"bravo","id":"t2","input":{}}]}`)
 	out := stripClaudeToolPrefixFromResponse(input, "proxy_")
 
-	if got := gjson.GetBytes(out, "content.0.name").String(); got != "alpha" {
+	if got := testjson.GetBytes(out, "content.0.name").String(); got != "alpha" {
 		t.Fatalf("content.0.name = %q, want %q", got, "alpha")
 	}
-	if got := gjson.GetBytes(out, "content.1.name").String(); got != "bravo" {
+	if got := testjson.GetBytes(out, "content.1.name").String(); got != "bravo" {
 		t.Fatalf("content.1.name = %q, want %q", got, "bravo")
 	}
 }
@@ -168,10 +167,10 @@ func TestStripClaudeToolPrefixFromResponse_WithToolReference(t *testing.T) {
 	input := []byte(`{"content":[{"type":"tool_reference","tool_name":"proxy_alpha"},{"type":"tool_reference","tool_name":"bravo"}]}`)
 	out := stripClaudeToolPrefixFromResponse(input, "proxy_")
 
-	if got := gjson.GetBytes(out, "content.0.tool_name").String(); got != "alpha" {
+	if got := testjson.GetBytes(out, "content.0.tool_name").String(); got != "alpha" {
 		t.Fatalf("content.0.tool_name = %q, want %q", got, "alpha")
 	}
-	if got := gjson.GetBytes(out, "content.1.tool_name").String(); got != "bravo" {
+	if got := testjson.GetBytes(out, "content.1.tool_name").String(); got != "bravo" {
 		t.Fatalf("content.1.tool_name = %q, want %q", got, "bravo")
 	}
 }
@@ -184,7 +183,7 @@ func TestStripClaudeToolPrefixFromStreamLine(t *testing.T) {
 	if bytes.HasPrefix(payload, []byte("data:")) {
 		payload = bytes.TrimSpace(payload[len("data:"):])
 	}
-	if got := gjson.GetBytes(payload, "content_block.name").String(); got != "alpha" {
+	if got := testjson.GetBytes(payload, "content_block.name").String(); got != "alpha" {
 		t.Fatalf("content_block.name = %q, want %q", got, "alpha")
 	}
 }
@@ -197,7 +196,7 @@ func TestStripClaudeToolPrefixFromStreamLine_WithToolReference(t *testing.T) {
 	if bytes.HasPrefix(payload, []byte("data:")) {
 		payload = bytes.TrimSpace(payload[len("data:"):])
 	}
-	if got := gjson.GetBytes(payload, "content_block.tool_name").String(); got != "beta" {
+	if got := testjson.GetBytes(payload, "content_block.tool_name").String(); got != "beta" {
 		t.Fatalf("content_block.tool_name = %q, want %q", got, "beta")
 	}
 }
@@ -205,7 +204,7 @@ func TestStripClaudeToolPrefixFromStreamLine_WithToolReference(t *testing.T) {
 func TestApplyClaudeToolPrefix_NestedToolReference(t *testing.T) {
 	input := []byte(`{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":[{"type":"tool_reference","tool_name":"mcp__nia__manage_resource"}]}]}]}`)
 	out := applyClaudeToolPrefix(input, "proxy_")
-	got := gjson.GetBytes(out, "messages.0.content.0.content.0.tool_name").String()
+	got := testjson.GetBytes(out, "messages.0.content.0.content.0.tool_name").String()
 	if got != "proxy_mcp__nia__manage_resource" {
 		t.Fatalf("nested tool_reference tool_name = %q, want %q", got, "proxy_mcp__nia__manage_resource")
 	}
@@ -218,8 +217,8 @@ func TestClaudeExecutor_ReusesUserIDAcrossModelsWhenCacheEnabled(t *testing.T) {
 	var requestModels []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		userID := gjson.GetBytes(body, "metadata.user_id").String()
-		model := gjson.GetBytes(body, "model").String()
+		userID := testjson.GetBytes(body, "metadata.user_id").String()
+		model := testjson.GetBytes(body, "model").String()
 		userIDs = append(userIDs, userID)
 		requestModels = append(requestModels, model)
 		t.Logf("HTTP Server received request: model=%s, user_id=%s, url=%s", model, userID, r.URL.String())
@@ -251,7 +250,7 @@ func TestClaudeExecutor_ReusesUserIDAcrossModelsWhenCacheEnabled(t *testing.T) {
 	models := []string{"claude-3-5-sonnet", "claude-3-5-haiku"}
 	for _, model := range models {
 		t.Logf("Sending request for model: %s", model)
-		modelPayload, _ := sjson.SetBytes(payload, "model", model)
+		modelPayload, _ := testjson.SetBytes(payload, "model", model)
 		if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 			Model:   model,
 			Payload: modelPayload,
@@ -285,7 +284,7 @@ func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
 	var userIDs []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		userIDs = append(userIDs, gjson.GetBytes(body, "metadata.user_id").String())
+		userIDs = append(userIDs, testjson.GetBytes(body, "metadata.user_id").String())
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-3-5-sonnet","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
 	}))
@@ -327,7 +326,7 @@ func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
 func TestStripClaudeToolPrefixFromResponse_NestedToolReference(t *testing.T) {
 	input := []byte(`{"content":[{"type":"tool_result","tool_use_id":"toolu_123","content":[{"type":"tool_reference","tool_name":"proxy_mcp__nia__manage_resource"}]}]}`)
 	out := stripClaudeToolPrefixFromResponse(input, "proxy_")
-	got := gjson.GetBytes(out, "content.0.content.0.tool_name").String()
+	got := testjson.GetBytes(out, "content.0.content.0.tool_name").String()
 	if got != "mcp__nia__manage_resource" {
 		t.Fatalf("nested tool_reference tool_name = %q, want %q", got, "mcp__nia__manage_resource")
 	}
@@ -337,7 +336,7 @@ func TestApplyClaudeToolPrefix_NestedToolReferenceWithStringContent(t *testing.T
 	// tool_result.content can be a string - should not be processed
 	input := []byte(`{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":"plain string result"}]}]}`)
 	out := applyClaudeToolPrefix(input, "proxy_")
-	got := gjson.GetBytes(out, "messages.0.content.0.content").String()
+	got := testjson.GetBytes(out, "messages.0.content.0.content").String()
 	if got != "plain string result" {
 		t.Fatalf("string content should remain unchanged = %q", got)
 	}
@@ -346,7 +345,7 @@ func TestApplyClaudeToolPrefix_NestedToolReferenceWithStringContent(t *testing.T
 func TestApplyClaudeToolPrefix_SkipsBuiltinToolReference(t *testing.T) {
 	input := []byte(`{"tools":[{"type":"web_search_20250305","name":"web_search"}],"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"tool_reference","tool_name":"web_search"}]}]}]}`)
 	out := applyClaudeToolPrefix(input, "proxy_")
-	got := gjson.GetBytes(out, "messages.0.content.0.content.0.tool_name").String()
+	got := testjson.GetBytes(out, "messages.0.content.0.content.0.tool_name").String()
 	if got != "web_search" {
 		t.Fatalf("built-in tool_reference should not be prefixed, got %q", got)
 	}
@@ -361,10 +360,10 @@ func TestNormalizeCacheControlTTL_DowngradesLaterOneHourBlocks(t *testing.T) {
 
 	out := normalizeCacheControlTTL(payload)
 
-	if got := gjson.GetBytes(out, "tools.0.cache_control.ttl").String(); got != "1h" {
+	if got := testjson.GetBytes(out, "tools.0.cache_control.ttl").String(); got != "1h" {
 		t.Fatalf("tools.0.cache_control.ttl = %q, want %q", got, "1h")
 	}
-	if gjson.GetBytes(out, "messages.0.content.0.cache_control.ttl").Exists() {
+	if testjson.GetBytes(out, "messages.0.content.0.cache_control.ttl").Exists() {
 		t.Fatalf("messages.0.content.0.cache_control.ttl should be removed after a default-5m block")
 	}
 }
@@ -400,13 +399,13 @@ func TestEnforceCacheControlLimit_StripsNonLastToolBeforeMessages(t *testing.T) 
 	if got := countCacheControls(out); got != 4 {
 		t.Fatalf("cache_control count = %d, want 4", got)
 	}
-	if gjson.GetBytes(out, "tools.0.cache_control").Exists() {
+	if testjson.GetBytes(out, "tools.0.cache_control").Exists() {
 		t.Fatalf("tools.0.cache_control should be removed first (non-last tool)")
 	}
-	if !gjson.GetBytes(out, "tools.1.cache_control").Exists() {
+	if !testjson.GetBytes(out, "tools.1.cache_control").Exists() {
 		t.Fatalf("tools.1.cache_control (last tool) should be preserved")
 	}
-	if !gjson.GetBytes(out, "messages.0.content.0.cache_control").Exists() || !gjson.GetBytes(out, "messages.1.content.0.cache_control").Exists() {
+	if !testjson.GetBytes(out, "messages.0.content.0.cache_control").Exists() || !testjson.GetBytes(out, "messages.1.content.0.cache_control").Exists() {
 		t.Fatalf("message cache_control blocks should be preserved when non-last tool removal is enough")
 	}
 }
@@ -427,10 +426,10 @@ func TestEnforceCacheControlLimit_ToolOnlyPayloadStillRespectsLimit(t *testing.T
 	if got := countCacheControls(out); got != 4 {
 		t.Fatalf("cache_control count = %d, want 4", got)
 	}
-	if gjson.GetBytes(out, "tools.0.cache_control").Exists() {
+	if testjson.GetBytes(out, "tools.0.cache_control").Exists() {
 		t.Fatalf("tools.0.cache_control should be removed to satisfy max=4")
 	}
-	if !gjson.GetBytes(out, "tools.4.cache_control").Exists() {
+	if !testjson.GetBytes(out, "tools.4.cache_control").Exists() {
 		t.Fatalf("last tool cache_control should be preserved when possible")
 	}
 }
@@ -489,7 +488,7 @@ func hasTTLOrderingViolation(payload []byte) bool {
 	seen5m := false
 	violates := false
 
-	checkCC := func(cc gjson.Result) {
+	checkCC := func(cc testjson.Result) {
 		if !cc.Exists() || violates {
 			return
 		}
@@ -503,28 +502,28 @@ func hasTTLOrderingViolation(payload []byte) bool {
 		}
 	}
 
-	tools := gjson.GetBytes(payload, "tools")
+	tools := testjson.GetBytes(payload, "tools")
 	if tools.IsArray() {
-		tools.ForEach(func(_, tool gjson.Result) bool {
+		tools.ForEach(func(_, tool testjson.Result) bool {
 			checkCC(tool.Get("cache_control"))
 			return !violates
 		})
 	}
 
-	system := gjson.GetBytes(payload, "system")
+	system := testjson.GetBytes(payload, "system")
 	if system.IsArray() {
-		system.ForEach(func(_, item gjson.Result) bool {
+		system.ForEach(func(_, item testjson.Result) bool {
 			checkCC(item.Get("cache_control"))
 			return !violates
 		})
 	}
 
-	messages := gjson.GetBytes(payload, "messages")
+	messages := testjson.GetBytes(payload, "messages")
 	if messages.IsArray() {
-		messages.ForEach(func(_, msg gjson.Result) bool {
+		messages.ForEach(func(_, msg testjson.Result) bool {
 			content := msg.Get("content")
 			if content.IsArray() {
-				content.ForEach(func(_, item gjson.Result) bool {
+				content.ForEach(func(_, item testjson.Result) bool {
 					checkCC(item.Get("cache_control"))
 					return !violates
 				})
@@ -987,7 +986,7 @@ func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 
 	out := checkSystemInstructionsWithMode(payload, false)
 
-	system := gjson.GetBytes(out, "system")
+	system := testjson.GetBytes(out, "system")
 	if !system.IsArray() {
 		t.Fatalf("system should be an array, got %s", system.Type)
 	}
@@ -1017,7 +1016,7 @@ func TestCheckSystemInstructionsWithMode_StringSystemStrict(t *testing.T) {
 
 	out := checkSystemInstructionsWithMode(payload, true)
 
-	blocks := gjson.GetBytes(out, "system").Array()
+	blocks := testjson.GetBytes(out, "system").Array()
 	if len(blocks) != 2 {
 		t.Fatalf("strict mode should produce 2 blocks, got %d", len(blocks))
 	}
@@ -1029,7 +1028,7 @@ func TestCheckSystemInstructionsWithMode_EmptyStringSystemIgnored(t *testing.T) 
 
 	out := checkSystemInstructionsWithMode(payload, false)
 
-	blocks := gjson.GetBytes(out, "system").Array()
+	blocks := testjson.GetBytes(out, "system").Array()
 	if len(blocks) != 2 {
 		t.Fatalf("empty string system should produce 2 blocks, got %d", len(blocks))
 	}
@@ -1041,7 +1040,7 @@ func TestCheckSystemInstructionsWithMode_ArraySystemStillWorks(t *testing.T) {
 
 	out := checkSystemInstructionsWithMode(payload, false)
 
-	blocks := gjson.GetBytes(out, "system").Array()
+	blocks := testjson.GetBytes(out, "system").Array()
 	if len(blocks) != 3 {
 		t.Fatalf("expected 3 system blocks, got %d", len(blocks))
 	}
@@ -1056,7 +1055,7 @@ func TestCheckSystemInstructionsWithMode_StringWithSpecialChars(t *testing.T) {
 
 	out := checkSystemInstructionsWithMode(payload, false)
 
-	blocks := gjson.GetBytes(out, "system").Array()
+	blocks := testjson.GetBytes(out, "system").Array()
 	if len(blocks) != 3 {
 		t.Fatalf("expected 3 system blocks, got %d", len(blocks))
 	}

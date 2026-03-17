@@ -3,7 +3,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/tidwall/gjson"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/testjson"
 )
 
 func TestNormalizeKimiToolMessageLinks_UsesCallIDFallback(t *testing.T) {
@@ -19,7 +19,7 @@ func TestNormalizeKimiToolMessageLinks_UsesCallIDFallback(t *testing.T) {
 		t.Fatalf("normalizeKimiToolMessageLinks() error = %v", err)
 	}
 
-	got := gjson.GetBytes(out, "messages.1.tool_call_id").String()
+	got := testjson.GetBytes(out, "messages.1.tool_call_id").String()
 	if got != "list_directory:1" {
 		t.Fatalf("messages.1.tool_call_id = %q, want %q", got, "list_directory:1")
 	}
@@ -38,7 +38,7 @@ func TestNormalizeKimiToolMessageLinks_InferSinglePendingID(t *testing.T) {
 		t.Fatalf("normalizeKimiToolMessageLinks() error = %v", err)
 	}
 
-	got := gjson.GetBytes(out, "messages.1.tool_call_id").String()
+	got := testjson.GetBytes(out, "messages.1.tool_call_id").String()
 	if got != "call_123" {
 		t.Fatalf("messages.1.tool_call_id = %q, want %q", got, "call_123")
 	}
@@ -60,8 +60,8 @@ func TestNormalizeKimiToolMessageLinks_AmbiguousMissingIDIsNotInferred(t *testin
 		t.Fatalf("normalizeKimiToolMessageLinks() error = %v", err)
 	}
 
-	if gjson.GetBytes(out, "messages.1.tool_call_id").Exists() {
-		t.Fatalf("messages.1.tool_call_id should be absent for ambiguous case, got %q", gjson.GetBytes(out, "messages.1.tool_call_id").String())
+	if testjson.GetBytes(out, "messages.1.tool_call_id").Exists() {
+		t.Fatalf("messages.1.tool_call_id should be absent for ambiguous case, got %q", testjson.GetBytes(out, "messages.1.tool_call_id").String())
 	}
 }
 
@@ -78,7 +78,7 @@ func TestNormalizeKimiToolMessageLinks_PreservesExistingToolCallID(t *testing.T)
 		t.Fatalf("normalizeKimiToolMessageLinks() error = %v", err)
 	}
 
-	got := gjson.GetBytes(out, "messages.1.tool_call_id").String()
+	got := testjson.GetBytes(out, "messages.1.tool_call_id").String()
 	if got != "call_1" {
 		t.Fatalf("messages.1.tool_call_id = %q, want %q", got, "call_1")
 	}
@@ -97,7 +97,7 @@ func TestNormalizeKimiToolMessageLinks_InheritsPreviousReasoningForAssistantTool
 		t.Fatalf("normalizeKimiToolMessageLinks() error = %v", err)
 	}
 
-	got := gjson.GetBytes(out, "messages.1.reasoning_content").String()
+	got := testjson.GetBytes(out, "messages.1.reasoning_content").String()
 	if got != "previous reasoning" {
 		t.Fatalf("messages.1.reasoning_content = %q, want %q", got, "previous reasoning")
 	}
@@ -115,7 +115,7 @@ func TestNormalizeKimiToolMessageLinks_InsertsFallbackReasoningWhenMissing(t *te
 		t.Fatalf("normalizeKimiToolMessageLinks() error = %v", err)
 	}
 
-	reasoning := gjson.GetBytes(out, "messages.0.reasoning_content")
+	reasoning := testjson.GetBytes(out, "messages.0.reasoning_content")
 	if !reasoning.Exists() {
 		t.Fatalf("messages.0.reasoning_content should exist")
 	}
@@ -136,7 +136,7 @@ func TestNormalizeKimiToolMessageLinks_UsesContentAsReasoningFallback(t *testing
 		t.Fatalf("normalizeKimiToolMessageLinks() error = %v", err)
 	}
 
-	got := gjson.GetBytes(out, "messages.0.reasoning_content").String()
+	got := testjson.GetBytes(out, "messages.0.reasoning_content").String()
 	if got != "first line\nsecond line" {
 		t.Fatalf("messages.0.reasoning_content = %q, want %q", got, "first line\nsecond line")
 	}
@@ -154,7 +154,7 @@ func TestNormalizeKimiToolMessageLinks_ReplacesEmptyReasoningContent(t *testing.
 		t.Fatalf("normalizeKimiToolMessageLinks() error = %v", err)
 	}
 
-	got := gjson.GetBytes(out, "messages.0.reasoning_content").String()
+	got := testjson.GetBytes(out, "messages.0.reasoning_content").String()
 	if got != "assistant summary" {
 		t.Fatalf("messages.0.reasoning_content = %q, want %q", got, "assistant summary")
 	}
@@ -172,7 +172,7 @@ func TestNormalizeKimiToolMessageLinks_PreservesExistingAssistantReasoning(t *te
 		t.Fatalf("normalizeKimiToolMessageLinks() error = %v", err)
 	}
 
-	got := gjson.GetBytes(out, "messages.0.reasoning_content").String()
+	got := testjson.GetBytes(out, "messages.0.reasoning_content").String()
 	if got != "keep me" {
 		t.Fatalf("messages.0.reasoning_content = %q, want %q", got, "keep me")
 	}
@@ -193,13 +193,13 @@ func TestNormalizeKimiToolMessageLinks_RepairsIDsAndReasoningTogether(t *testing
 		t.Fatalf("normalizeKimiToolMessageLinks() error = %v", err)
 	}
 
-	if got := gjson.GetBytes(out, "messages.1.tool_call_id").String(); got != "call_1" {
+	if got := testjson.GetBytes(out, "messages.1.tool_call_id").String(); got != "call_1" {
 		t.Fatalf("messages.1.tool_call_id = %q, want %q", got, "call_1")
 	}
-	if got := gjson.GetBytes(out, "messages.3.tool_call_id").String(); got != "call_2" {
+	if got := testjson.GetBytes(out, "messages.3.tool_call_id").String(); got != "call_2" {
 		t.Fatalf("messages.3.tool_call_id = %q, want %q", got, "call_2")
 	}
-	if got := gjson.GetBytes(out, "messages.2.reasoning_content").String(); got != "r1" {
+	if got := testjson.GetBytes(out, "messages.2.reasoning_content").String(); got != "r1" {
 		t.Fatalf("messages.2.reasoning_content = %q, want %q", got, "r1")
 	}
 }

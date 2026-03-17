@@ -18,10 +18,10 @@ import (
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/jsonutil"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 )
 
 // ClaudeCodeAPIHandler contains the handlers for Claude API endpoints.
@@ -77,8 +77,8 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 	}
 
 	// Check if the client requested a streaming response.
-	streamResult := gjson.GetBytes(rawJSON, "stream")
-	if !streamResult.Exists() || streamResult.Type == gjson.False {
+	root, errParse := jsonutil.ParseObjectBytes(rawJSON)
+	if errParse != nil || !claudeJSONBool(root, "stream") {
 		h.handleNonStreamingResponse(c, rawJSON)
 	} else {
 		h.handleStreamingResponse(c, rawJSON)
@@ -110,7 +110,10 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 	alt := h.GetAlt(c)
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 
-	modelName := gjson.GetBytes(rawJSON, "model").String()
+	modelName := ""
+	if root, errParse := jsonutil.ParseObjectBytes(rawJSON); errParse == nil {
+		modelName = claudeJSONString(root, "model")
+	}
 
 	resp, upstreamHeaders, errMsg := h.ExecuteCountWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
 	if errMsg != nil {
@@ -164,7 +167,10 @@ func (h *ClaudeCodeAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSO
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 
-	modelName := gjson.GetBytes(rawJSON, "model").String()
+	modelName := ""
+	if root, errParse := jsonutil.ParseObjectBytes(rawJSON); errParse == nil {
+		modelName = claudeJSONString(root, "model")
+	}
 
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
 	stopKeepAlive()
@@ -221,7 +227,10 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		return
 	}
 
-	modelName := gjson.GetBytes(rawJSON, "model").String()
+	modelName := ""
+	if root, errParse := jsonutil.ParseObjectBytes(rawJSON); errParse == nil {
+		modelName = claudeJSONString(root, "model")
+	}
 
 	// Create a cancellable context for the backend client request
 	// This allows proper cleanup and cancellation of ongoing requests
@@ -324,4 +333,28 @@ func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claud
 			Message: msg.Error.Error(),
 		},
 	}
+}
+
+func claudeJSONString(root map[string]any, path string) string {
+	value, ok := jsonutil.Get(root, path)
+	if !ok || value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case json.Number:
+		return typed.String()
+	default:
+		return fmt.Sprint(typed)
+	}
+}
+
+func claudeJSONBool(root map[string]any, path string) bool {
+	value, ok := jsonutil.Get(root, path)
+	if !ok {
+		return false
+	}
+	typed, ok := value.(bool)
+	return ok && typed
 }
